@@ -183,20 +183,40 @@ def obtain_sensor2top(nusc,
 
 
 
-def load_point_cloud_from_prediction(prediction, image_paths=None):
+def load_point_cloud_from_prediction(
+    prediction, 
+    image_paths=None,
+    max_depth=None,
+    conf_thresh_percentile=None,
+):
     """
     Load point cloud from prediction results.
     Keeps points in their own camera coordinate systems (doesn't transform to world).
     Tracks which points belong to which camera.
+    Applies filtering for sky, far objects, and low confidence.
     
     IMPORTANT: prediction.depth[i] corresponds to image[i] in the ORIGINAL input order.
     The model may reorder views internally for reference view selection, but the final
     output is restored to match the original input order (see restore_original_order in
     vision_transformer.py and InputProcessor documentation).
     
+    Available Prediction attributes:
+        - depth: np.ndarray (N, H, W) - Main depth output
+        - sky: np.ndarray | None (N, H, W) - Sky mask (boolean, True=sky, False=non-sky)
+        - conf: np.ndarray | None (N, H, W) - Confidence map (higher = more reliable)
+        - extrinsics: np.ndarray | None (N, 4, 4) - Camera extrinsics
+        - intrinsics: np.ndarray | None (N, 3, 3) - Camera intrinsics
+        - processed_images: np.ndarray | None (N, H, W, 3) - Processed images
+        - gaussians: Gaussians | None - 3D Gaussian Splats (if infer_gs=True)
+        - aux: dict[str, Any] - Auxiliary features (feat_layer_X if export_feat_layers set)
+        - is_metric: int - Whether depth is metric
+        - scale_factor: Optional[float] - Metric scale factor
+    
     Args:
         prediction: Model prediction object
         image_paths: List of (camera_name, image_path) tuples in the SAME ORDER as passed to model.inference()
+        max_depth: Maximum depth threshold to filter far objects/infinity (in meters, None = no limit)
+        conf_thresh_percentile: Lower percentile for confidence threshold (None = no filtering)
     
     Returns: 
         Dictionary with:
@@ -219,6 +239,19 @@ def load_point_cloud_from_prediction(prediction, image_paths=None):
             print(f"  Number of depth maps: {len(prediction.depth)}")
             if len(prediction.depth) != len(image_paths):
                 print(f"  WARNING: Mismatch! Depth maps ({len(prediction.depth)}) != Input images ({len(image_paths)})")
+        
+        # Compute confidence threshold if needed
+        conf_thresh = None
+        if conf_thresh_percentile is not None and hasattr(prediction, 'conf') and prediction.conf is not None:
+            # Compute confidence threshold similar to GLB export
+            # Note: prediction.sky is the sky mask from the model (boolean array, True = sky)
+            sky = getattr(prediction, 'sky', None)
+            if sky is not None and (~sky).sum() > 10:
+                conf_pixels = prediction.conf[~sky]
+            else:
+                conf_pixels = prediction.conf.flatten()
+            conf_thresh = np.percentile(conf_pixels, conf_thresh_percentile)
+            print(f"  Confidence threshold (percentile {conf_thresh_percentile}): {conf_thresh:.4f}")
         
         for i in range(len(prediction.depth)):
             depth = prediction.depth[i]
@@ -252,6 +285,30 @@ def load_point_cloud_from_prediction(prediction, image_paths=None):
             
             # Filter valid points
             valid = depth.flatten() > 0
+            valid = valid & np.isfinite(depth.flatten())
+            
+            # Filter by maximum depth (far objects/infinity)
+            if max_depth is not None:
+                valid = valid & (depth.flatten() <= max_depth)
+                print(f"    Filtered by max_depth ({max_depth}m): {valid.sum()} valid points")
+            
+            # Filter by confidence threshold
+            if conf_thresh is not None and hasattr(prediction, 'conf') and prediction.conf is not None:
+                conf_i = prediction.conf[i].flatten()
+                valid = valid & (conf_i >= conf_thresh)
+                print(f"    Filtered by confidence (>= {conf_thresh:.4f}): {valid.sum()} valid points")
+            
+            # Filter sky regions if sky prediction is available
+            # Note: prediction.sky is a boolean mask from the model (True = sky, False = non-sky)
+            # The model outputs sky predictions which are converted to boolean in OutputProcessor
+            sky = getattr(prediction, 'sky', None)
+            if sky is not None:
+                sky_i = sky[i].flatten()
+                # Keep non-sky regions (sky is boolean: False = non-sky, True = sky)
+                non_sky = ~sky_i
+                valid = valid & non_sky
+                print(f"    Filtered sky regions: {valid.sum()} valid points (removed {sky_i.sum()} sky pixels)")
+            
             points_cam_valid = points_cam[valid]
             
             # Store points for this camera (in camera coordinates)
@@ -434,6 +491,11 @@ def run_inference_for_frame(
     max_points=1_000_000,
     display=True,
     nusc_info=None,
+    sky_depth_def=98.0,
+    conf_thresh_percentile=40.0,
+    filter_black_bg=False,
+    filter_white_bg=False,
+    max_depth=None,
 ):
     """Run inference for a single sample and optionally display point cloud."""
     print(f"\n{'='*60}")
@@ -458,6 +520,16 @@ def run_inference_for_frame(
     
     
     try:
+        # Prepare export_kwargs for GLB export filtering options
+        export_kwargs = {}
+        if "glb" in export_format:
+            export_kwargs["glb"] = {
+                "sky_depth_def": sky_depth_def,
+                "conf_thresh_percentile": conf_thresh_percentile,
+                "filter_black_bg": filter_black_bg,
+                "filter_white_bg": filter_white_bg,
+            }
+        
         # Run inference (no extrinsics/intrinsics - model estimates them!)
         prediction = model.inference(
             image=image_files,
@@ -466,6 +538,7 @@ def run_inference_for_frame(
             ref_view_strategy=ref_view_strategy,
             use_ray_pose=use_ray_pose,
             num_max_points=max_points,
+            export_kwargs=export_kwargs if export_kwargs else None,
         )
         
         print(f"✓ Successfully processed sample {sample_token}")
@@ -477,7 +550,13 @@ def run_inference_for_frame(
             camera_thread = display_camera_images_threaded(image_paths, sample_token)
             
             # Load point clouds from prediction (points stay in camera coordinates)
-            pcd_data = load_point_cloud_from_prediction(prediction, image_paths)
+            # Apply filtering for sky, confidence, and max depth
+            pcd_data = load_point_cloud_from_prediction(
+                prediction, 
+                image_paths,
+                max_depth=max_depth,
+                conf_thresh_percentile=conf_thresh_percentile,
+            )
             
             if pcd_data and pcd_data['points_by_camera']:
                 # Transform each camera's points from camera coordinates to LiDAR coordinates
@@ -618,6 +697,35 @@ def main():
         action="store_true",
         help="Skip point cloud visualization (default: display point clouds)",
     )
+    # Depth filtering options
+    parser.add_argument(
+        "--sky_depth_def",
+        type=float,
+        default=98.0,
+        help="[GLB] Percentile used to fill sky pixels with plausible depth values (default: 98.0)",
+    )
+    parser.add_argument(
+        "--conf_thresh_percentile",
+        type=float,
+        default=40.0,
+        help="[GLB] Lower percentile for adaptive confidence threshold (default: 40.0)",
+    )
+    parser.add_argument(
+        "--filter_black_bg",
+        action="store_true",
+        help="[GLB] Filter near-black background pixels (default: False)",
+    )
+    parser.add_argument(
+        "--filter_white_bg",
+        action="store_true",
+        help="[GLB] Filter near-white background pixels (default: False)",
+    )
+    parser.add_argument(
+        "--max_depth",
+        type=float,
+        default=None,
+        help="Maximum depth threshold to filter far objects/infinity (in meters, default: None = no limit)",
+    )
 
     args = parser.parse_args()
 
@@ -721,6 +829,11 @@ def main():
             max_points=args.max_points,
             display=not args.no_display,
             nusc_info=nusc_info,
+            sky_depth_def=args.sky_depth_def,
+            conf_thresh_percentile=args.conf_thresh_percentile,
+            filter_black_bg=args.filter_black_bg,
+            filter_white_bg=args.filter_white_bg,
+            max_depth=args.max_depth,
         )
         
         if success:
