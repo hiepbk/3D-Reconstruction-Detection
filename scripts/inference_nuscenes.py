@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """
 Inference script for nuScenes-format datasets
-Uses LIDAR_TOP as reference to find closest camera timestamps and generates point clouds.
+Iterates through nusc.sample to process each sample and generates point clouds.
 
 Usage:
     python scripts/inference_nuscenes.py --data_dir /path/to/nuscenes --output_dir /path/to/output
 """
 
 import argparse
-import glob
 import os
 import sys
 import threading
-from pathlib import Path
 
 import numpy as np
 import open3d as o3d
 import torch
 import cv2
-import matplotlib.pyplot as plt
 from depth_anything_3.api import DepthAnything3
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
@@ -27,10 +24,14 @@ from pyquaternion import Quaternion
 CAM_TYPES = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
 
 
-def get_nusc_info(nusc, timestamp_int):
+def get_nusc_info(nusc, sample):
     """
-    Get nuScenes information for all cameras.
+    Get nuScenes information for all cameras from a sample.
     Extracts camera-to-LiDAR transformations for all cameras in the sample.
+    
+    Args:
+        nusc: NuScenes dataset object
+        sample: Sample dictionary from nusc.sample
     
     Returns:
         nusc_info: Dictionary with transformations for each camera and gt_lidar_boxes
@@ -39,28 +40,19 @@ def get_nusc_info(nusc, timestamp_int):
         'gt_lidar_boxes': None,
     }
     
-    # Find sample_data tokens with matching timestamp
-    sample_data_tokens = nusc.field2token('sample_data', 'timestamp', timestamp_int)
-    
-    print(f"sample_data_tokens: {sample_data_tokens}")
-    
-    # Get first sample_data and find sample
-    sample_data = nusc.get('sample_data', sample_data_tokens[0])
-    sample = nusc.get('sample', sample_data['sample_token'])
     lidar_token = sample['data']['LIDAR_TOP']
-    
-    # Get lidar calibrated sensor and ego pose
-    lidar_cs_record = nusc.get('calibrated_sensor', sample_data['calibrated_sensor_token'])
-    lidar_pose_record = nusc.get('ego_pose', sample_data['ego_pose_token'])
+    sd_rec = nusc.get('sample_data', lidar_token)
+    cs_record = nusc.get('calibrated_sensor', sd_rec['calibrated_sensor_token'])
+    pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token'])
     
     # Get boxes in lidar coordinates
     _, gt_lidar_boxes, _ = nusc.get_sample_data(lidar_token)
     
     # Extract transformation matrices for LiDAR
-    l2e_r = lidar_cs_record['rotation']
-    l2e_t = lidar_cs_record['translation']
-    e2g_r = lidar_pose_record['rotation']
-    e2g_t = lidar_pose_record['translation']
+    l2e_r = cs_record['rotation']
+    l2e_t = cs_record['translation']
+    e2g_r = pose_record['rotation']
+    e2g_t = pose_record['translation']
     l2e_r_mat = Quaternion(l2e_r).rotation_matrix
     e2g_r_mat = Quaternion(e2g_r).rotation_matrix
 
@@ -80,6 +72,52 @@ def get_nusc_info(nusc, timestamp_int):
     
     nusc_info['gt_lidar_boxes'] = gt_lidar_boxes
     return nusc_info
+
+
+def get_camera_images_from_sample(nusc, sample, data_dir):
+    """
+    Get camera image paths from a sample in CAM_TYPES order.
+    
+    Args:
+        nusc: NuScenes dataset object
+        sample: Sample dictionary from nusc.sample
+        data_dir: Root directory of nuScenes dataset
+    
+    Returns:
+        List of (camera_name, image_path) tuples in CAM_TYPES order
+    """
+    image_paths = []
+    
+    # Normalize data_dir
+    data_dir = os.path.normpath(data_dir)
+    data_dir_basename = os.path.basename(data_dir)
+    
+    for camera_type in CAM_TYPES:
+        if camera_type in sample['data']:
+            cam_token = sample['data'][camera_type]
+            cam_path, _, _ = nusc.get_sample_data(cam_token)
+            cam_path = os.path.normpath(cam_path)
+            
+            # Check if path is absolute
+            if os.path.isabs(cam_path):
+                final_path = cam_path
+            else:
+                # Relative path - check if it already starts with data_dir or data_dir basename
+                # to avoid duplication (e.g., "data/nuscenes_mini/..." when data_dir is "data/nuscenes_mini")
+                if cam_path.startswith(data_dir + os.sep) or cam_path == data_dir:
+                    # Path already includes full data_dir, use as-is
+                    final_path = os.path.abspath(cam_path)
+                elif cam_path.startswith(data_dir_basename + os.sep):
+                    # Path starts with data_dir basename (e.g., "data/nuscenes_mini/...")
+                    # Use as-is relative to current directory
+                    final_path = os.path.abspath(cam_path)
+                else:
+                    # True relative path, join with data_dir
+                    final_path = os.path.abspath(os.path.join(data_dir, cam_path))
+            
+            image_paths.append((camera_type, final_path))
+    
+    return image_paths
 
 
 def obtain_sensor2top(nusc,
@@ -141,129 +179,6 @@ def obtain_sensor2top(nusc,
 
 
 
-def find_lidar_timestamps(data_dir):
-    """Extract timestamps from LIDAR_TOP folder."""
-    lidar_dir = os.path.join(data_dir, "samples", "LIDAR_TOP")
-    if not os.path.exists(lidar_dir):
-        raise ValueError(f"LIDAR_TOP directory not found: {lidar_dir}")
-    
-    lidar_files = glob.glob(os.path.join(lidar_dir, "*.bin"))
-    timestamps = []
-    for lidar_file in sorted(lidar_files):
-        timestamp = os.path.splitext(os.path.basename(lidar_file))[0]
-        timestamps.append(timestamp)
-    
-    return sorted(timestamps)
-
-
-def find_camera_folders(data_dir):
-    """Find all camera folders in the samples directory."""
-    samples_dir = os.path.join(data_dir, "samples")
-    if not os.path.exists(samples_dir):
-        raise ValueError(f"Samples directory not found: {samples_dir}")
-    
-    camera_folders = []
-    # for item in os.listdir(samples_dir):
-    for item in CAM_TYPES:
-        item_path = os.path.join(samples_dir, item)
-        # if os.path.isdir(item_path) and item.startswith("CAM_"):
-        if os.path.isdir(item_path):
-            camera_folders.append((item, item_path))
-    return camera_folders
-            
-    
-
-
-def extract_timestamp_from_filename(filename, camera_name):
-    """
-    Extract timestamp from filename.
-    Handles two formats:
-    1. timestamp.jpg (just timestamp)
-    2. CAM_FRONT_timestamp.jpg (camera_name_timestamp)
-    
-    Returns: timestamp as string or None if not found
-    """
-    base_name = os.path.splitext(filename)[0]
-    
-    # Try format: camera_name_timestamp
-    prefix = f"{camera_name}_"
-    if base_name.startswith(prefix):
-        timestamp = base_name[len(prefix):]
-        # Verify it's a valid timestamp (numeric)
-        if timestamp.isdigit():
-            return timestamp
-    
-    # Try format: just timestamp (numeric only)
-    if base_name.isdigit():
-        return base_name
-    
-    return None
-
-
-def find_closest_timestamp(target_timestamp, camera_path, camera_name, image_extensions=("*.jpg", "*.jpeg", "*.png")):
-    """
-    Find the closest image timestamp to the target timestamp in a camera folder.
-    Handles filenames in format: timestamp.jpg or CAM_NAME_timestamp.jpg
-    
-    Returns: (closest_timestamp, image_path) or (None, None) if no images found
-    """
-    # Find all images in this camera folder
-    image_files = []
-    for ext in image_extensions:
-        image_files.extend(glob.glob(os.path.join(camera_path, ext)))
-    
-    if not image_files:
-        return None, None
-    
-    # Extract timestamps and find closest
-    timestamps = []
-    for img_path in image_files:
-        filename = os.path.basename(img_path)
-        timestamp_str = extract_timestamp_from_filename(filename, camera_name)
-        
-        if timestamp_str:
-            try:
-                timestamp_int = int(timestamp_str)
-                timestamps.append((timestamp_int, img_path))
-            except ValueError:
-                continue
-    
-    if not timestamps:
-        return None, None
-    
-    # Find closest timestamp
-    target_ts = int(target_timestamp)
-    closest = min(timestamps, key=lambda x: abs(x[0] - target_ts))
-    
-    return str(closest[0]), closest[1]
-
-
-def group_images_by_lidar_frame(data_dir, lidar_timestamps, camera_folders):
-    """
-    For each lidar timestamp, find closest camera images.
-    Returns: list of (frame_timestamp, list of (camera_name, image_path))
-    Ensures consistent camera ordering based on CAM_TYPES.
-    """
-    frame_groups = []
-    
-    # Create a mapping from camera name to path for quick lookup
-    camera_path_map = {name: path for name, path in camera_folders}
-    
-    for frame_timestamp in lidar_timestamps:
-        frame_images = []
-        
-        # Process cameras in a consistent order (CAM_TYPES order)
-        for camera_name in CAM_TYPES:
-            if camera_name in camera_path_map:
-                camera_path = camera_path_map[camera_name]
-                closest_ts, image_path = find_closest_timestamp(frame_timestamp, camera_path, camera_name)
-                if image_path:
-                    frame_images.append((camera_name, image_path))
-        
-        if frame_images:  # Only add if we found at least one camera image
-            frame_groups.append((frame_timestamp, frame_images))
-    
-    return frame_groups
 
 
 
@@ -351,13 +266,13 @@ def load_point_cloud_from_prediction(prediction, image_paths=None):
     return result
 
 
-def display_camera_images(image_paths, frame_timestamp):
+def display_camera_images(image_paths, sample_token):
     """
     Display CAM_FRONT and CAM_BACK images side by side using OpenCV (thread-safe).
     
     Args:
         image_paths: List of (camera_name, image_path) tuples
-        frame_timestamp: Frame timestamp for window title
+        sample_token: Sample token for window title
     """
     # Find CAM_FRONT and CAM_BACK images (in order)
     cam_front_path = None
@@ -417,7 +332,7 @@ def display_camera_images(image_paths, frame_timestamp):
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
     
     # Display window
-    window_name = f'Camera Images - Frame {frame_timestamp}'
+    window_name = f'Camera Images - Sample {sample_token[:8]}'
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1600, 800)
     cv2.imshow(window_name, combined)
@@ -426,26 +341,26 @@ def display_camera_images(image_paths, frame_timestamp):
     cv2.destroyWindow(window_name)
 
 
-def display_camera_images_threaded(image_paths, frame_timestamp):
+def display_camera_images_threaded(image_paths, sample_token):
     """
     Display camera images in a separate thread (for simultaneous windows).
     
     Args:
         image_paths: List of (camera_name, image_path) tuples
-        frame_timestamp: Frame timestamp for window title
+        sample_token: Sample token for window title
     """
     def _display():
-        display_camera_images(image_paths, frame_timestamp)
+        display_camera_images(image_paths, sample_token)
     
     thread = threading.Thread(target=_display, daemon=False)
     thread.start()
     return thread
 
 
-def display_point_cloud(pcd, frame_timestamp, gt_lidar_boxes=None):
+def display_point_cloud(pcd, sample_token, gt_lidar_boxes=None):
     """Display point cloud using open3d."""
     if pcd is None or len(pcd.points) == 0:
-        print(f"  Warning: No point cloud to display for frame {frame_timestamp}")
+        print(f"  Warning: No point cloud to display for sample {sample_token}")
         return
     
     print(f"  Displaying point cloud with {len(pcd.points)} points...")
@@ -453,7 +368,7 @@ def display_point_cloud(pcd, frame_timestamp, gt_lidar_boxes=None):
     
     # Create visualization window
     vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name=f"Point Cloud - Frame {frame_timestamp}", width=1920, height=1080)
+    vis.create_window(window_name=f"Point Cloud - Sample {sample_token[:8]}", width=1920, height=1080)
     vis.add_geometry(pcd)
     
     # Set up view
@@ -509,7 +424,7 @@ def display_point_cloud_threaded(pcd, frame_timestamp, gt_lidar_boxes=None):
 
 def run_inference_for_frame(
     model,
-    frame_timestamp,
+    sample_token,
     image_paths,
     output_dir,
     device,
@@ -520,30 +435,23 @@ def run_inference_for_frame(
     display=True,
     nusc_info=None,
 ):
-    """Run inference for a single frame and optionally display point cloud."""
+    """Run inference for a single sample and optionally display point cloud."""
     print(f"\n{'='*60}")
-    print(f"Processing frame timestamp: {frame_timestamp}")
+    print(f"Processing sample token: {sample_token}")
     print(f"Number of images: {len(image_paths)}")
     print(f"Cameras: {[name for name, _ in image_paths]}")
     print(f"{'='*60}")
     
-    # Sort to ensure consistent order based on CAM_TYPES
-    # This ensures cameras are always in the same order
-    camera_path_map = {name: path for name, path in image_paths}
-    sorted_paths = []
-    for cam_type in CAM_TYPES:
-        if cam_type in camera_path_map:
-            sorted_paths.append((cam_type, camera_path_map[cam_type]))
-    
+    # image_paths is already in CAM_TYPES order from get_camera_images_from_sample
     # Extract just the image paths in consistent order
-    image_files = [path for _, path in sorted_paths]
-    camera_order = [name for name, _ in sorted_paths]
+    image_files = [path for _, path in image_paths]
+    camera_order = [name for name, _ in image_paths]
     
     print(f"  Camera order: {camera_order}")
     print(f"  Number of images for inference: {len(image_files)}")
     
-    # Create output directory for this frame
-    frame_output_dir = os.path.join(output_dir, frame_timestamp)
+    # Create output directory for this sample
+    frame_output_dir = os.path.join(output_dir, sample_token)
     os.makedirs(frame_output_dir, exist_ok=True)
     
     
@@ -560,16 +468,16 @@ def run_inference_for_frame(
             num_max_points=max_points,
         )
         
-        print(f"✓ Successfully processed frame {frame_timestamp}")
+        print(f"✓ Successfully processed sample {sample_token}")
         print(f"  Output directory: {frame_output_dir}")
         
         # Display camera images and point cloud simultaneously
         if display:
             # Display camera images (CAM_FRONT and CAM_BACK) in a separate thread (OpenCV is thread-safe)
-            camera_thread = display_camera_images_threaded(image_paths, frame_timestamp)
+            camera_thread = display_camera_images_threaded(image_paths, sample_token)
             
             # Load point clouds from prediction (points stay in camera coordinates)
-            pcd_data = load_point_cloud_from_prediction(prediction, sorted_paths)
+            pcd_data = load_point_cloud_from_prediction(prediction, image_paths)
             
             if pcd_data and pcd_data['points_by_camera']:
                 # Transform each camera's points from camera coordinates to LiDAR coordinates
@@ -617,7 +525,7 @@ def run_inference_for_frame(
                     
                     # Display point cloud in MAIN thread (Open3D/Qt requires main thread)
                     print(f"  Both windows are open. Close both windows to continue...")
-                    display_point_cloud(pcd, frame_timestamp, nusc_info['gt_lidar_boxes'])
+                    display_point_cloud(pcd, sample_token, nusc_info['gt_lidar_boxes'])
                 else:
                     print(f"  Warning: No valid points to display")
             else:
@@ -629,7 +537,7 @@ def run_inference_for_frame(
         return True, prediction
         
     except Exception as e:
-        print(f"✗ Error processing frame {frame_timestamp}: {e}")
+        print(f"✗ Error processing sample {sample_token}: {e}")
         import traceback
         traceback.print_exc()
         return False, None
@@ -637,7 +545,7 @@ def run_inference_for_frame(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Depth Anything 3 Inference for nuScenes-format datasets (LIDAR-based frame grouping)"
+        description="Depth Anything 3 Inference for nuScenes-format datasets (sample-based iteration)"
     )
     parser.add_argument(
         "--data_dir",
@@ -688,16 +596,22 @@ def main():
         help="Maximum number of points in point cloud (default: 1000000)",
     )
     parser.add_argument(
-        "--frame_index",
+        "--sample_index",
         type=int,
         default=None,
-        help="Process only a specific frame by index (0-based, e.g., 0 for first frame, optional)",
+        help="Process only a specific sample by index (0-based, e.g., 0 for first sample, optional)",
     )
     parser.add_argument(
-        "--max_frames",
+        "--max_samples",
         type=int,
         default=None,
-        help="Maximum number of frames to process (optional, processes all if not specified)",
+        help="Maximum number of samples to process (optional, processes all if not specified)",
+    )
+    parser.add_argument(
+        "--version",
+        type=str,
+        default="v1.0-trainval",
+        help="NuScenes dataset version (default: v1.0-trainval)",
     )
     parser.add_argument(
         "--no_display",
@@ -721,7 +635,7 @@ def main():
         args.device = "cpu"
 
     print(f"\n{'='*60}")
-    print("Depth Anything 3 - nuScenes Inference (LIDAR-based)")
+    print("Depth Anything 3 - nuScenes Inference (Sample-based)")
     print(f"{'='*60}")
     print(f"Data directory: {args.data_dir}")
     print(f"Output directory: {args.output_dir}")
@@ -731,35 +645,30 @@ def main():
     print(f"Display point clouds: {not args.no_display}")
     print(f"{'='*60}\n")
 
-    # Find LIDAR timestamps (frame references)
-    print("Extracting frame timestamps from LIDAR_TOP...")
-    lidar_timestamps = find_lidar_timestamps(args.data_dir)
-    print(f"Found {len(lidar_timestamps)} lidar frames")
+    # Initialize NuScenes dataset
+    print(f"Loading NuScenes dataset (version: {args.version})...")
+    try:
+        nusc = NuScenes(version=args.version, dataroot=args.data_dir, verbose=True)
+        print(f"Loaded {len(nusc.sample)} samples")
+    except Exception as e:
+        print(f"Error loading NuScenes dataset: {e}")
+        sys.exit(1)
 
-    # Filter by specific frame index if requested
-    if args.frame_index is not None:
-        if args.frame_index < 0 or args.frame_index >= len(lidar_timestamps):
-            print(f"Error: Frame index {args.frame_index} is out of range (0-{len(lidar_timestamps)-1})")
+    # Get list of samples
+    samples = list(nusc.sample)
+    
+    # Filter by specific sample index if requested
+    if args.sample_index is not None:
+        if args.sample_index < 0 or args.sample_index >= len(samples):
+            print(f"Error: Sample index {args.sample_index} is out of range (0-{len(samples)-1})")
             sys.exit(1)
-        lidar_timestamps = [lidar_timestamps[args.frame_index]]
-        print(f"Processing frame at index {args.frame_index}: {lidar_timestamps[0]}")
+        samples = [samples[args.sample_index]]
+        print(f"Processing sample at index {args.sample_index}: {samples[0]['token']}")
 
-    # Limit number of frames if requested
-    if args.max_frames:
-        lidar_timestamps = lidar_timestamps[:args.max_frames]
-        print(f"Processing first {len(lidar_timestamps)} frames")
-
-    # Find camera folders
-    print("\nScanning camera folders...")
-    camera_folders = find_camera_folders(args.data_dir)
-    print(f"Found {len(camera_folders)} camera folders:")
-    for name, path in camera_folders:
-        print(f"  - {name}")
-
-    # Group images by lidar frames
-    print(f"\nGrouping camera images for {len(lidar_timestamps)} frames...")
-    frame_groups = group_images_by_lidar_frame(args.data_dir, lidar_timestamps, camera_folders)
-    print(f"Successfully grouped {len(frame_groups)} frames with camera images")
+    # Limit number of samples if requested
+    if args.max_samples:
+        samples = samples[:args.max_samples]
+        print(f"Processing first {len(samples)} samples")
 
     # Determine cache directory (ckpts folder in repository root)
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -778,30 +687,31 @@ def main():
         print(f"Error loading model: {e}")
         sys.exit(1)
 
-    # Process each frame
-    print(f"\nProcessing {len(frame_groups)} frame(s)...")
+    # Process each sample
+    print(f"\nProcessing {len(samples)} sample(s)...")
     successful = 0
     failed = 0
     
-    # using Nuscenes to utilize the bbox, we will visualize the bbox on the point cloud to verify the accuracy of the point cloud
-    
-    nusc = NuScenes(version='v1.0-trainval', dataroot=args.data_dir, verbose=True)
-    
-
-    
-    for i, (frame_timestamp, image_paths) in enumerate(frame_groups, 1):
-        print(f"\n[{i}/{len(frame_groups)}] Processing frame: {frame_timestamp}")
+    for i, sample in enumerate(samples, 1):
+        sample_token = sample['token']
+        print(f"\n[{i}/{len(samples)}] Processing sample: {sample_token}")
         
-        print(f"image_paths: {image_paths}")
+        # Get camera images from sample in CAM_TYPES order
+        image_paths = get_camera_images_from_sample(nusc, sample, args.data_dir)
         
-        timestamp_int = int(frame_timestamp)
+        if not image_paths:
+            print(f"  Warning: No camera images found for sample {sample_token}, skipping...")
+            failed += 1
+            continue
         
-        nusc_info = get_nusc_info(nusc, timestamp_int)
-
+        print(f"  Found {len(image_paths)} camera images")
+        
+        # Get nuScenes info (transformations, boxes, etc.)
+        nusc_info = get_nusc_info(nusc, sample)
     
         success, _ = run_inference_for_frame(
             model=model,
-            frame_timestamp=frame_timestamp,
+            sample_token=sample_token,
             image_paths=image_paths,
             output_dir=args.output_dir,
             device=args.device,
@@ -822,7 +732,7 @@ def main():
     print(f"\n{'='*60}")
     print("Processing Summary")
     print(f"{'='*60}")
-    print(f"Total frames: {len(frame_groups)}")
+    print(f"Total samples: {len(samples)}")
     print(f"Successful: {successful}")
     print(f"Failed: {failed}")
     print(f"Output directory: {args.output_dir}")
