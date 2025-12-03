@@ -547,6 +547,8 @@ def run_inference_for_frame(
     os.makedirs(frame_output_dir, exist_ok=True)
     
     
+    
+    
     try:
         # Run inference (no extrinsics/intrinsics - model estimates them!)
         prediction = model.inference(
