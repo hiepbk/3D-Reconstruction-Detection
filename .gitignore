@@ -1,0 +1,65 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+
+# Distribution / packaging
+workspace/
+build/
+dist/
+*.egg-info/
+.gradio/
+
+# Test/coverage
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/
+gallery*/
+debug*/
+DA3HF*/
+gradio_workspace/
+eval_workspace/
+FILTER*/
+input_images*/
+*.gradio/
+
+# Jupyter notebooks
+.ipynb_checkpoints
+
+# OS files
+.DS_Store
+
+.vscode
+src/debug_main.py
+temp*.png
+/outputs
+
+# Large files - checkpoints and models
+ckpts/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Results and outputs
+result/
+results/
+outputs/
+
+# Data directories
+data/
+*.h5
+*.hdf5
+
+# Large model files
+*.pkl
+*.pickle
