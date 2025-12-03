@@ -11,19 +11,31 @@ import argparse
 import glob
 import os
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
 import open3d as o3d
 import torch
+import cv2
+import matplotlib.pyplot as plt
 from depth_anything_3.api import DepthAnything3
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
 
+
+CAM_TYPES = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
+
+
 def get_nusc_info(nusc, timestamp_int):
+    """
+    Get nuScenes information for all cameras.
+    Extracts camera-to-LiDAR transformations for all cameras in the sample.
     
+    Returns:
+        nusc_info: Dictionary with transformations for each camera and gt_lidar_boxes
+    """
     nusc_info = {
-        'cam2lidar': None,
         'gt_lidar_boxes': None,
     }
     
@@ -34,54 +46,38 @@ def get_nusc_info(nusc, timestamp_int):
     
     # Get first sample_data and find sample
     sample_data = nusc.get('sample_data', sample_data_tokens[0])
-    
-    
-    
-    
     sample = nusc.get('sample', sample_data['sample_token'])
     lidar_token = sample['data']['LIDAR_TOP']
     
-
-    lidar_cs_record = nusc.get('calibrated_sensor',
-                            sample_data['calibrated_sensor_token'])
-    pose_record = nusc.get('ego_pose', sample_data['ego_pose_token'])
-        
-    
+    # Get lidar calibrated sensor and ego pose
+    lidar_cs_record = nusc.get('calibrated_sensor', sample_data['calibrated_sensor_token'])
+    lidar_pose_record = nusc.get('ego_pose', sample_data['ego_pose_token'])
     
     # Get boxes in lidar coordinates
     _, gt_lidar_boxes, _ = nusc.get_sample_data(lidar_token)
     
-    
-    # info = {
-    #     'lidar_path': lidar_path,
-    #     'token': sample['token'],
-    #     'sweeps': [],
-    #     'cams': dict(),
-    #     'lidar2ego_translation': cs_record['translation'],
-    #     'lidar2ego_rotation': cs_record['rotation'],
-    #     'ego2global_translation': pose_record['translation'],
-    #     'ego2global_rotation': pose_record['rotation'],
-    #     'timestamp': sample['timestamp'],
-    # }
-
+    # Extract transformation matrices for LiDAR
     l2e_r = lidar_cs_record['rotation']
     l2e_t = lidar_cs_record['translation']
-    e2g_r = pose_record['rotation']
-    e2g_t = pose_record['translation']
+    e2g_r = lidar_pose_record['rotation']
+    e2g_t = lidar_pose_record['translation']
     l2e_r_mat = Quaternion(l2e_r).rotation_matrix
     e2g_r_mat = Quaternion(e2g_r).rotation_matrix
 
-
-    camera_types = 'CAM_FRONT'
-    cam_token = sample['data'][camera_types]
-
-    cam_front_to_lidar = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat,
-                                    e2g_t, e2g_r_mat, camera_types)
-
+    # Extract transformations for ALL cameras
+    for camera_type in CAM_TYPES:
+        if camera_type in sample['data']:
+            cam_token = sample['data'][camera_type]
+            cam_to_lidar = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat,
+                                            e2g_t, e2g_r_mat, camera_type)
+            
+            # Store transformation for this camera
+            nusc_info[camera_type] = {
+                'cam2lidar_rotation': cam_to_lidar['sensor2lidar_rotation'],
+                'cam2lidar_translation': cam_to_lidar['sensor2lidar_translation'],
+            }
+            print(f"  Extracted transformation for {camera_type}")
     
-    
-    nusc_info['cam2lidar_rotation'] = cam_front_to_lidar['sensor2lidar_rotation']
-    nusc_info['cam2lidar_translation'] = cam_front_to_lidar['sensor2lidar_translation']
     nusc_info['gt_lidar_boxes'] = gt_lidar_boxes
     return nusc_info
 
@@ -167,12 +163,15 @@ def find_camera_folders(data_dir):
         raise ValueError(f"Samples directory not found: {samples_dir}")
     
     camera_folders = []
-    for item in os.listdir(samples_dir):
+    # for item in os.listdir(samples_dir):
+    for item in CAM_TYPES:
         item_path = os.path.join(samples_dir, item)
-        if os.path.isdir(item_path) and item.startswith("CAM_"):
+        # if os.path.isdir(item_path) and item.startswith("CAM_"):
+        if os.path.isdir(item_path):
             camera_folders.append((item, item_path))
+    return camera_folders
+            
     
-    return sorted(camera_folders)
 
 
 def extract_timestamp_from_filename(filename, camera_name):
@@ -243,16 +242,23 @@ def group_images_by_lidar_frame(data_dir, lidar_timestamps, camera_folders):
     """
     For each lidar timestamp, find closest camera images.
     Returns: list of (frame_timestamp, list of (camera_name, image_path))
+    Ensures consistent camera ordering based on CAM_TYPES.
     """
     frame_groups = []
+    
+    # Create a mapping from camera name to path for quick lookup
+    camera_path_map = {name: path for name, path in camera_folders}
     
     for frame_timestamp in lidar_timestamps:
         frame_images = []
         
-        for camera_name, camera_path in camera_folders:
-            closest_ts, image_path = find_closest_timestamp(frame_timestamp, camera_path, camera_name)
-            if image_path:
-                frame_images.append((camera_name, image_path))
+        # Process cameras in a consistent order (CAM_TYPES order)
+        for camera_name in CAM_TYPES:
+            if camera_name in camera_path_map:
+                camera_path = camera_path_map[camera_name]
+                closest_ts, image_path = find_closest_timestamp(frame_timestamp, camera_path, camera_name)
+                if image_path:
+                    frame_images.append((camera_name, image_path))
         
         if frame_images:  # Only add if we found at least one camera image
             frame_groups.append((frame_timestamp, frame_images))
@@ -260,53 +266,65 @@ def group_images_by_lidar_frame(data_dir, lidar_timestamps, camera_folders):
     return frame_groups
 
 
-def convert_points_cam_to_ego(points):
-    """
-    Convert points from camera coordinate system to ego coordinate system.
-    
-    Args:
-        points: numpy array of shape (N, 3) in camera coordinates
-    
-    Returns:
-        numpy array of shape (N, 3) in LiDAR coordinates
-    """
-    if points.shape[0] == 0:
-        return points
-    
-    # Rotation matrix from CAM to LIDAR (from mmdet3d)
-    rt_mat = np.array([[0, 0, 1],   # new x = old z (front)
-                       [-1, 0, 0],  # new y = -old x (left)
-                       [0, -1, 0]]) # new z = -old y (up)
-    
-    # Apply rotation: points_lidar = points_cam @ rt_mat.T
-    points_lidar = points @ rt_mat.T
-    
-    return points_lidar
 
 
-def load_point_cloud_from_prediction(prediction):
+def load_point_cloud_from_prediction(prediction, image_paths=None):
     """
     Load point cloud from prediction results.
-    Returns: open3d PointCloud object
+    Keeps points in their own camera coordinate systems (doesn't transform to world).
+    Tracks which points belong to which camera.
+    
+    IMPORTANT: prediction.depth[i] corresponds to image[i] in the ORIGINAL input order.
+    The model may reorder views internally for reference view selection, but the final
+    output is restored to match the original input order (see restore_original_order in
+    vision_transformer.py and InputProcessor documentation).
+    
+    Args:
+        prediction: Model prediction object
+        image_paths: List of (camera_name, image_path) tuples in the SAME ORDER as passed to model.inference()
+    
+    Returns: 
+        Dictionary with:
+        - 'points_by_camera': dict mapping camera_name -> points in camera coordinates
+        - 'colors_by_camera': dict mapping camera_name -> colors
+        - 'camera_order': list of camera names in order
     """
     
+    result = {
+        'points_by_camera': {},
+        'colors_by_camera': {},
+        'camera_order': []
+    }
+    
     # Generate point cloud from depth maps and camera parameters
-    if hasattr(prediction, 'depth') and hasattr(prediction, 'extrinsics') and hasattr(prediction, 'intrinsics'):
-        points_list = []
-        colors_list = []
+    if hasattr(prediction, 'depth') and hasattr(prediction, 'intrinsics'):
+        # Verify: prediction.depth[i] should correspond to image_paths[i] in original input order
+        if image_paths:
+            print(f"  Input camera order (passed to model): {[name for name, _ in image_paths]}")
+            print(f"  Number of depth maps: {len(prediction.depth)}")
+            if len(prediction.depth) != len(image_paths):
+                print(f"  WARNING: Mismatch! Depth maps ({len(prediction.depth)}) != Input images ({len(image_paths)})")
         
         for i in range(len(prediction.depth)):
             depth = prediction.depth[i]
             K = prediction.intrinsics[i]
-            ext_w2c = prediction.extrinsics[i]
             
-            # Convert to c2w
-            c2w = np.linalg.inv(np.vstack([ext_w2c, [0, 0, 0, 1]]))[:3, :]
+            # Get camera name for this depth map
+            # prediction.depth[i] corresponds to image_paths[i] in original input order
+            cam_name = None
+            if image_paths and i < len(image_paths):
+                cam_name = image_paths[i][0]
+                print(f"  Depth map [{i}] -> Camera: {cam_name} (matches input order)")
+            else:
+                cam_name = f"CAM_{i}"
+                print(f"  Depth map [{i}] -> Camera: {cam_name} (no input mapping)")
+            
+            result['camera_order'].append(cam_name)
             
             H, W = depth.shape
             u, v = np.meshgrid(np.arange(W), np.arange(H))
             
-            # Back-project to 3D
+            # Back-project to 3D in camera coordinates (keep in camera frame!)
             fx, fy = K[0, 0], K[1, 1]
             cx, cy = K[0, 2], K[1, 2]
             
@@ -314,39 +332,117 @@ def load_point_cloud_from_prediction(prediction):
             y = (v - cy) * depth / fy
             z = depth
             
-            # Transform to world coordinates
+            # Points are in camera coordinate system (NOT transformed to world)
             points_cam = np.stack([x.flatten(), y.flatten(), z.flatten()], axis=1)
-            points_world = (c2w @ np.hstack([points_cam, np.ones((points_cam.shape[0], 1))]).T).T[:, :3]
             
             # Filter valid points
             valid = depth.flatten() > 0
-            points_list.append(points_world[valid])
+            points_cam_valid = points_cam[valid]
+            
+            # Store points for this camera (in camera coordinates)
+            result['points_by_camera'][cam_name] = points_cam_valid
             
             # Get colors from processed images
             if hasattr(prediction, 'processed_images'):
                 img = prediction.processed_images[i]
                 colors = img.reshape(-1, 3)[valid] / 255.0
-                colors_list.append(colors)
-        
-        if points_list:
-            all_points = np.concatenate(points_list, axis=0)
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(all_points)
-            
-            if colors_list:
-                all_colors = np.concatenate(colors_list, axis=0)
-                pcd.colors = o3d.utility.Vector3dVector(all_colors)
-            
-            return pcd
+                result['colors_by_camera'][cam_name] = colors
     
-    return None
+    return result
+
+
+def display_camera_images(image_paths, frame_timestamp):
+    """
+    Display CAM_FRONT and CAM_BACK images side by side using OpenCV (thread-safe).
+    
+    Args:
+        image_paths: List of (camera_name, image_path) tuples
+        frame_timestamp: Frame timestamp for window title
+    """
+    # Find CAM_FRONT and CAM_BACK images (in order)
+    cam_front_path = None
+    cam_back_path = None
+    
+    # Process in order to maintain consistency
+    for camera_name, image_path in image_paths:
+        if camera_name == 'CAM_FRONT' and cam_front_path is None:
+            cam_front_path = image_path
+        elif camera_name == 'CAM_BACK' and cam_back_path is None:
+            cam_back_path = image_path
+    
+    # Load images
+    img_front = None
+    img_back = None
+    
+    if cam_front_path and os.path.exists(cam_front_path):
+        img_front = cv2.imread(cam_front_path)
+    
+    if cam_back_path and os.path.exists(cam_back_path):
+        img_back = cv2.imread(cam_back_path)
+    
+    if img_front is None and img_back is None:
+        print(f"  Warning: No CAM_FRONT or CAM_BACK images found to display")
+        return
+    
+    # Combine images side by side
+    if img_front is not None and img_back is not None:
+        # Resize images to same height if needed
+        h1, w1 = img_front.shape[:2]
+        h2, w2 = img_back.shape[:2]
+        target_height = max(h1, h2)
+        
+        if h1 != target_height:
+            scale = target_height / h1
+            new_w = int(w1 * scale)
+            img_front = cv2.resize(img_front, (new_w, target_height))
+        if h2 != target_height:
+            scale = target_height / h2
+            new_w = int(w2 * scale)
+            img_back = cv2.resize(img_back, (new_w, target_height))
+        
+        combined = np.hstack([img_front, img_back])
+        
+        # Add text labels
+        cv2.putText(combined, 'CAM_FRONT', (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(combined, 'CAM_BACK', (img_front.shape[1] + 10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    elif img_front is not None:
+        combined = img_front.copy()
+        cv2.putText(combined, 'CAM_FRONT', (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    else:
+        combined = img_back.copy()
+        cv2.putText(combined, 'CAM_BACK', (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    
+    # Display window
+    window_name = f'Camera Images - Frame {frame_timestamp}'
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1600, 800)
+    cv2.imshow(window_name, combined)
+    print(f"  Displaying camera images. Press any key or close the window to continue...")
+    cv2.waitKey(0)  # Wait for key press
+    cv2.destroyWindow(window_name)
+
+
+def display_camera_images_threaded(image_paths, frame_timestamp):
+    """
+    Display camera images in a separate thread (for simultaneous windows).
+    
+    Args:
+        image_paths: List of (camera_name, image_path) tuples
+        frame_timestamp: Frame timestamp for window title
+    """
+    def _display():
+        display_camera_images(image_paths, frame_timestamp)
+    
+    thread = threading.Thread(target=_display, daemon=False)
+    thread.start()
+    return thread
 
 
 def display_point_cloud(pcd, frame_timestamp, gt_lidar_boxes=None):
-    
-    
-    
-    
     """Display point cloud using open3d."""
     if pcd is None or len(pcd.points) == 0:
         print(f"  Warning: No point cloud to display for frame {frame_timestamp}")
@@ -361,28 +457,11 @@ def display_point_cloud(pcd, frame_timestamp, gt_lidar_boxes=None):
     vis.add_geometry(pcd)
     
     # Set up view
-    
-    ctr = vis.get_view_control()
-    
-    # User's perfect camera settings
-    target_pos = [0.000, 0.000, 0.000]
-    front_vector = [0.054, 0.662, 0.747]
-    up_vector = [-0.140, 0.746, -0.651]
-    
-    # Set camera direction
-    ctr.set_lookat(target_pos)
-    ctr.set_front(front_vector)
-    ctr.set_up(up_vector)
-
-    ctr.set_zoom(1)
-    
-    
     view_ctl = vis.get_view_control()
     view_ctl.set_front([0, 0, -1])
     view_ctl.set_lookat([0, 0, 0])
     view_ctl.set_up([0, -1, 0])
     view_ctl.set_zoom(0.7)
-    
     
     # draw the axis of the point cloud
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
@@ -402,16 +481,30 @@ def display_point_cloud(pcd, frame_timestamp, gt_lidar_boxes=None):
             # gt_lidar_box.orientation is a Quaternion object
             rotation_matrix = gt_lidar_box.orientation.rotation_matrix
             
-            
-            
             # Create OrientedBoundingBox
             obb = o3d.geometry.OrientedBoundingBox(center, rotation_matrix, size)
             obb.color = [1, 0, 0]  # Red color for boxes
             vis.add_geometry(obb)
-            
     
     vis.run()
     vis.destroy_window()
+
+
+def display_point_cloud_threaded(pcd, frame_timestamp, gt_lidar_boxes=None):
+    """
+    Display point cloud in a separate thread (for simultaneous windows).
+    
+    Args:
+        pcd: open3d.geometry.PointCloud object
+        frame_timestamp: Frame timestamp for window title
+        gt_lidar_boxes: List of nuScenes Box objects for bounding boxes
+    """
+    def _display():
+        display_point_cloud(pcd, frame_timestamp, gt_lidar_boxes)
+    
+    thread = threading.Thread(target=_display, daemon=False)
+    thread.start()
+    return thread
 
 
 def run_inference_for_frame(
@@ -434,8 +527,20 @@ def run_inference_for_frame(
     print(f"Cameras: {[name for name, _ in image_paths]}")
     print(f"{'='*60}")
     
-    # Extract just the image paths
-    image_files = [path for _, path in image_paths]
+    # Sort to ensure consistent order based on CAM_TYPES
+    # This ensures cameras are always in the same order
+    camera_path_map = {name: path for name, path in image_paths}
+    sorted_paths = []
+    for cam_type in CAM_TYPES:
+        if cam_type in camera_path_map:
+            sorted_paths.append((cam_type, camera_path_map[cam_type]))
+    
+    # Extract just the image paths in consistent order
+    image_files = [path for _, path in sorted_paths]
+    camera_order = [name for name, _ in sorted_paths]
+    
+    print(f"  Camera order: {camera_order}")
+    print(f"  Number of images for inference: {len(image_files)}")
     
     # Create output directory for this frame
     frame_output_dir = os.path.join(output_dir, frame_timestamp)
@@ -456,25 +561,68 @@ def run_inference_for_frame(
         print(f"✓ Successfully processed frame {frame_timestamp}")
         print(f"  Output directory: {frame_output_dir}")
         
-        # Load and display point cloud
+        # Display camera images and point cloud simultaneously
         if display:
-            pcd = load_point_cloud_from_prediction(prediction)
-            if pcd is not None:
-                # Convert point cloud from camera coordinates to LiDAR coordinates
-                # (to match nuScenes bounding box coordinate system)
-                points_cam = np.asarray(pcd.points)
+            # Display camera images (CAM_FRONT and CAM_BACK) in a separate thread (OpenCV is thread-safe)
+            camera_thread = display_camera_images_threaded(image_paths, frame_timestamp)
+            
+            # Load point clouds from prediction (points stay in camera coordinates)
+            pcd_data = load_point_cloud_from_prediction(prediction, sorted_paths)
+            
+            if pcd_data and pcd_data['points_by_camera']:
+                # Transform each camera's points from camera coordinates to LiDAR coordinates
+                # using ground truth extrinsics from nuScenes (not model's predicted extrinsics)
+                all_points_lidar = []
+                all_colors = []
                 
+                print(f"  Transforming points from camera coordinates to LiDAR coordinates...")
+                for cam_name in pcd_data['camera_order']:
+                    if cam_name in pcd_data['points_by_camera']:
+                        points_cam = pcd_data['points_by_camera'][cam_name]
+                        
+                        # Check if we have transformation for this camera
+                        if cam_name in nusc_info:
+                            # Transform points from camera coordinates to LiDAR coordinates
+                            # using ground truth extrinsics from nuScenes
+                            R = nusc_info[cam_name]['cam2lidar_rotation']
+                            T = nusc_info[cam_name]['cam2lidar_translation']
+                            
+                            # Transform: points_lidar = points_cam @ R.T + T
+                            points_lidar = points_cam @ R.T + T
+                            all_points_lidar.append(points_lidar)
+                            
+                            # Get colors if available
+                            if cam_name in pcd_data['colors_by_camera']:
+                                all_colors.append(pcd_data['colors_by_camera'][cam_name])
+                            
+                            print(f"    {cam_name}: {len(points_cam)} points -> {len(points_lidar)} points in LiDAR frame")
+                        else:
+                            print(f"    WARNING: No transformation found for {cam_name}, skipping...")
                 
-                # convert the points from camera coordinates to LiDAR coordinates
-                points_lidar = points_cam @ nusc_info['cam2lidar_rotation'].T + nusc_info['cam2lidar_translation']
-
-
-                pcd.points = o3d.utility.Vector3dVector(points_lidar)
-                print(f"  Converted point cloud from camera to LiDAR coordinates")
-                
-                display_point_cloud(pcd, frame_timestamp, nusc_info['gt_lidar_boxes'])
+                if all_points_lidar:
+                    # Concatenate all points
+                    combined_points = np.concatenate(all_points_lidar, axis=0)
+                    
+                    # Create point cloud
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(combined_points)
+                    
+                    if all_colors:
+                        combined_colors = np.concatenate(all_colors, axis=0)
+                        pcd.colors = o3d.utility.Vector3dVector(combined_colors)
+                    
+                    print(f"  Total points in LiDAR frame: {len(combined_points)}")
+                    
+                    # Display point cloud in MAIN thread (Open3D/Qt requires main thread)
+                    print(f"  Both windows are open. Close both windows to continue...")
+                    display_point_cloud(pcd, frame_timestamp, nusc_info['gt_lidar_boxes'])
+                else:
+                    print(f"  Warning: No valid points to display")
             else:
                 print(f"  Warning: Could not load point cloud for display")
+            
+            # Wait for camera images window to close
+            camera_thread.join()
         
         return True, prediction
         
