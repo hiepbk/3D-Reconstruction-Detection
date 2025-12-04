@@ -23,6 +23,15 @@ from pyquaternion import Quaternion
 
 CAM_TYPES = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
 
+# GLB export configuration
+GLB_CONFIG = {
+    "sky_depth_def": 98.0,  # Percentile used to fill sky pixels with plausible depth values
+    "conf_thresh_percentile": 30.0,  # Lower percentile for adaptive confidence threshold
+    "filter_black_bg": False,  # Filter near-black background pixels
+    "filter_white_bg": False,  # Filter near-white background pixels
+    "max_depth": 100.0,  # Maximum depth threshold to filter far objects/infinity (in meters, None = no limit)
+}
+
 
 def get_nusc_info(nusc, sample):
     """
@@ -179,7 +188,122 @@ def obtain_sensor2top(nusc,
 
 
 
+def load_polygon_from_txt(txt_path):
+    """
+    Load polygon from txt file.
+    
+    File format: class_id x1 y1 x2 y2 x3 y3 ... (normalized coordinates 0-1)
+    Example: "0 0.127344 0.890278 0.124219 0.890278 ..."
+    
+    Args:
+        txt_path: Path to polygon file
+    
+    Returns:
+        numpy array of shape (N, 2) with normalized coordinates [0, 1]
+        Returns None if file doesn't exist or is invalid
+    """
+    if not os.path.exists(txt_path):
+        return None
+    
+    try:
+        with open(txt_path, 'r') as f:
+            content = f.read().strip()
+            if not content:
+                return None
+            
+            # Parse the file: first number is class_id, rest are x y pairs
+            values = list(map(float, content.split()))
+            if len(values) < 3:  # Need at least class_id + one x,y pair
+                return None
+            
+            # Extract class_id (first value) and polygon vertices (rest)
+            class_id = int(values[0])
+            coords = np.array(values[1:], dtype=np.float32)
+            
+            # Reshape to (N, 2) - pairs of x, y coordinates
+            if len(coords) % 2 != 0:
+                print(f"  Warning: Odd number of coordinates in {txt_path}, ignoring last value")
+                coords = coords[:-1]
+            
+            polygon = coords.reshape(-1, 2)  # Shape: (N, 2)
+            
+            # Validate: coordinates should be in [0, 1] range
+            if np.any(polygon < 0) or np.any(polygon > 1):
+                print(f"  Warning: Polygon coordinates out of [0, 1] range in {txt_path}")
+            
+            return polygon
+    
+    except Exception as e:
+        print(f"  Error loading polygon from {txt_path}: {e}")
+        return None
 
+
+def create_polygon_mask(polygon_normalized, height, width):
+    """
+    Create a binary mask from normalized polygon coordinates.
+    
+    Args:
+        polygon_normalized: Polygon as numpy array (N, 2) with normalized coordinates [0, 1]
+        height: Image height in pixels
+        width: Image width in pixels
+    
+    Returns:
+        Binary mask of shape (height, width), True inside polygon, False outside
+    """
+    if polygon_normalized is None:
+        return None
+    
+    # Convert normalized coordinates to pixel coordinates
+    polygon_pixels = polygon_normalized.copy()
+    polygon_pixels[:, 0] *= width   # x coordinates
+    polygon_pixels[:, 1] *= height  # y coordinates
+    polygon_pixels = polygon_pixels.astype(np.int32)
+    
+    # Create empty mask
+    mask = np.zeros((height, width), dtype=np.uint8)
+    
+    # Fill polygon using cv2.fillPoly
+    cv2.fillPoly(mask, [polygon_pixels], 255)
+    
+    # Convert to boolean
+    return mask > 0
+
+
+def draw_polygon_on_image(img, polygon_normalized, color=(0, 0, 255), thickness=2):
+    """
+    Draw polygon on image.
+    
+    Args:
+        img: Image as numpy array (H, W, 3) in BGR format
+        polygon_normalized: Polygon as numpy array (N, 2) with normalized coordinates [0, 1]
+        color: BGR color tuple (default: red)
+        thickness: Line thickness (default: 2)
+    
+    Returns:
+        Image with polygon drawn on it
+    """
+    if polygon_normalized is None:
+        return img
+    
+    H, W = img.shape[:2]
+    
+    # Convert normalized coordinates to pixel coordinates
+    polygon_pixels = polygon_normalized.copy()
+    polygon_pixels[:, 0] *= W   # x coordinates
+    polygon_pixels[:, 1] *= H  # y coordinates
+    polygon_pixels = polygon_pixels.astype(np.int32)
+    
+    # Draw filled polygon
+    overlay = img.copy()
+    cv2.fillPoly(overlay, [polygon_pixels], color)
+    
+    # Blend with original image (70% original, 30% red overlay)
+    img_with_polygon = cv2.addWeighted(img, 0.7, overlay, 0.3, 0)
+    
+    # Also draw polygon outline
+    cv2.polylines(img_with_polygon, [polygon_pixels], isClosed=True, color=color, thickness=thickness)
+    
+    return img_with_polygon
 
 
 
@@ -188,6 +312,8 @@ def load_point_cloud_from_prediction(
     image_paths=None,
     max_depth=None,
     conf_thresh_percentile=None,
+    filter_sky=True,
+    polygon_by_camera=None,
 ):
     """
     Load point cloud from prediction results.
@@ -217,17 +343,21 @@ def load_point_cloud_from_prediction(
         image_paths: List of (camera_name, image_path) tuples in the SAME ORDER as passed to model.inference()
         max_depth: Maximum depth threshold to filter far objects/infinity (in meters, None = no limit)
         conf_thresh_percentile: Lower percentile for confidence threshold (None = no filtering)
+        filter_sky: Whether to filter out sky regions (True = remove sky, False = keep sky)
+        polygon_by_camera: Dict mapping camera_name -> polygon (numpy array (N, 2) with normalized coordinates)
     
     Returns: 
         Dictionary with:
         - 'points_by_camera': dict mapping camera_name -> points in camera coordinates
         - 'colors_by_camera': dict mapping camera_name -> colors
+        - 'polygon_mask_by_camera': dict mapping camera_name -> boolean mask (True = polygon point)
         - 'camera_order': list of camera names in order
     """
     
     result = {
         'points_by_camera': {},
         'colors_by_camera': {},
+        'polygon_mask_by_camera': {},
         'camera_order': []
     }
     
@@ -301,13 +431,14 @@ def load_point_cloud_from_prediction(
             # Filter sky regions if sky prediction is available
             # Note: prediction.sky is a boolean mask from the model (True = sky, False = non-sky)
             # The model outputs sky predictions which are converted to boolean in OutputProcessor
-            sky = getattr(prediction, 'sky', None)
-            if sky is not None:
-                sky_i = sky[i].flatten()
-                # Keep non-sky regions (sky is boolean: False = non-sky, True = sky)
-                non_sky = ~sky_i
-                valid = valid & non_sky
-                print(f"    Filtered sky regions: {valid.sum()} valid points (removed {sky_i.sum()} sky pixels)")
+            if filter_sky:
+                sky = getattr(prediction, 'sky', None)
+                if sky is not None:
+                    sky_i = sky[i].flatten()
+                    # Keep non-sky regions (sky is boolean: False = non-sky, True = sky)
+                    non_sky = ~sky_i
+                    valid = valid & non_sky
+                    print(f"    Filtered sky regions: {valid.sum()} valid points (removed {sky_i.sum()} sky pixels)")
             
             points_cam_valid = points_cam[valid]
             
@@ -319,86 +450,144 @@ def load_point_cloud_from_prediction(
                 img = prediction.processed_images[i]
                 colors = img.reshape(-1, 3)[valid] / 255.0
                 result['colors_by_camera'][cam_name] = colors
+            
+            # Check if points belong to polygon region
+            polygon_mask_flat = None
+            if polygon_by_camera and cam_name in polygon_by_camera:
+                polygon = polygon_by_camera[cam_name]
+                if polygon is not None:
+                    # Create polygon mask for this camera's image size
+                    polygon_mask = create_polygon_mask(polygon, H, W)
+                    if polygon_mask is not None:
+                        # Flatten polygon mask and apply same valid filter
+                        polygon_mask_flat = polygon_mask.flatten()[valid]
+                        result['polygon_mask_by_camera'][cam_name] = polygon_mask_flat
+                        print(f"    Polygon points: {polygon_mask_flat.sum()} / {len(polygon_mask_flat)}")
+                    else:
+                        # No valid polygon mask, create all-False mask
+                        result['polygon_mask_by_camera'][cam_name] = np.zeros(len(points_cam_valid), dtype=bool)
+                else:
+                    # No polygon for this camera, create all-False mask
+                    result['polygon_mask_by_camera'][cam_name] = np.zeros(len(points_cam_valid), dtype=bool)
+            else:
+                # No polygon information provided, create all-False mask
+                result['polygon_mask_by_camera'][cam_name] = np.zeros(len(points_cam_valid), dtype=bool)
     
     return result
 
 
-def display_camera_images(image_paths, sample_token):
+def display_camera_images(image_paths, sample_token, polygon_by_camera=None):
     """
-    Display CAM_FRONT and CAM_BACK images side by side using OpenCV (thread-safe).
+    Display all 6 camera images in a 2x3 grid layout using OpenCV (thread-safe).
+    
+    Grid layout:
+        Row 1: CAM_FRONT, CAM_FRONT_RIGHT, CAM_FRONT_LEFT
+        Row 2: CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT
     
     Args:
         image_paths: List of (camera_name, image_path) tuples
         sample_token: Sample token for window title
+        polygon_by_camera: Dict mapping camera_name -> polygon (numpy array (N, 2) with normalized coordinates)
     """
-    # Find CAM_FRONT and CAM_BACK images (in order)
-    cam_front_path = None
-    cam_back_path = None
+    # Create a dictionary to store images by camera name
+    camera_images = {}
     
-    # Process in order to maintain consistency
+    # Load all available camera images
     for camera_name, image_path in image_paths:
-        if camera_name == 'CAM_FRONT' and cam_front_path is None:
-            cam_front_path = image_path
-        elif camera_name == 'CAM_BACK' and cam_back_path is None:
-            cam_back_path = image_path
+        if os.path.exists(image_path):
+            img = cv2.imread(image_path)
+            if img is not None:
+                camera_images[camera_name] = img
     
-    # Load images
-    img_front = None
-    img_back = None
-    
-    if cam_front_path and os.path.exists(cam_front_path):
-        img_front = cv2.imread(cam_front_path)
-    
-    if cam_back_path and os.path.exists(cam_back_path):
-        img_back = cv2.imread(cam_back_path)
-    
-    if img_front is None and img_back is None:
-        print(f"  Warning: No CAM_FRONT or CAM_BACK images found to display")
+    if not camera_images:
+        print(f"  Warning: No camera images found to display")
         return
     
-    # Combine images side by side
-    if img_front is not None and img_back is not None:
-        # Resize images to same height if needed
-        h1, w1 = img_front.shape[:2]
-        h2, w2 = img_back.shape[:2]
-        target_height = max(h1, h2)
+    # Get images in CAM_TYPES order
+    images_to_display = []
+    labels = []
+    for cam_type in CAM_TYPES:
+        if cam_type in camera_images:
+            images_to_display.append(camera_images[cam_type])
+            labels.append(cam_type)
+            
+            if polygon_by_camera and cam_type in polygon_by_camera:
+                polygon = polygon_by_camera[cam_type]
+                if polygon is not None:
+                    # Draw polygon on image in red
+                    images_to_display[-1] = draw_polygon_on_image(images_to_display[-1], polygon, color=(0, 0, 255), thickness=2)
+                    print(f"  Drawn polygon on {cam_type} image")
+    
+    if not images_to_display:
+        print(f"  Warning: No valid camera images to display")
+        return
+    
+    # Resize all images to the same size
+    if images_to_display:
+        # Get target size (use median dimensions to balance)
+        heights = [img.shape[0] for img in images_to_display]
+        widths = [img.shape[1] for img in images_to_display]
+        target_h = int(np.median(heights))
+        target_w = int(np.median(widths))
         
-        if h1 != target_height:
-            scale = target_height / h1
-            new_w = int(w1 * scale)
-            img_front = cv2.resize(img_front, (new_w, target_height))
-        if h2 != target_height:
-            scale = target_height / h2
-            new_w = int(w2 * scale)
-            img_back = cv2.resize(img_back, (new_w, target_height))
+        # Resize all images to target size
+        resized_images = []
+        for img in images_to_display:
+            resized = cv2.resize(img, (target_w, target_h))
+            resized_images.append(resized)
         
-        combined = np.hstack([img_front, img_back])
+        # Arrange in 2x3 grid (2 rows, 3 columns)
+        # Row 1: CAM_FRONT, CAM_FRONT_RIGHT, CAM_FRONT_LEFT (indices 0, 1, 2)
+        # Row 2: CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT (indices 3, 4, 5)
         
-        # Add text labels
-        cv2.putText(combined, 'CAM_FRONT', (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(combined, 'CAM_BACK', (img_front.shape[1] + 10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-    elif img_front is not None:
-        combined = img_front.copy()
-        cv2.putText(combined, 'CAM_FRONT', (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-    else:
-        combined = img_back.copy()
-        cv2.putText(combined, 'CAM_BACK', (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # Create grid with 6 slots (always 2x3)
+        grid_images = []
+        for i in range(6):
+            if i < len(resized_images):
+                grid_images.append(resized_images[i])
+            else:
+                # Create black placeholder for missing cameras
+                grid_images.append(np.zeros((target_h, target_w, 3), dtype=np.uint8))
+        
+        # Create rows
+        row1 = np.hstack([grid_images[0], grid_images[1], grid_images[2]])  # Front cameras
+        row2 = np.hstack([grid_images[3], grid_images[4], grid_images[5]])  # Back cameras
+        combined = np.vstack([row1, row2])
+        grid_h, grid_w = combined.shape[:2]
+        
+        # Add text labels to each image
+        font_scale = 0.8
+        thickness = 2
+        color = (0, 255, 0)  # Green
+        
+        for i, label in enumerate(labels):
+            if i < 3:
+                # First row
+                x = (i % 3) * target_w + 10
+                y = 30
+            else:
+                # Second row
+                x = ((i - 3) % 3) * target_w + 10
+                y = target_h + 30
+            
+            cv2.putText(combined, label, (x, y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
     
     # Display window
     window_name = f'Camera Images - Sample {sample_token[:8]}'
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 1600, 800)
-    cv2.imshow(window_name, combined)
-    print(f"  Displaying camera images. Press any key or close the window to continue...")
-    cv2.waitKey(0)  # Wait for key press
-    cv2.destroyWindow(window_name)
+    # Set window size based on grid
+    if 'combined' in locals():
+        display_w = min(grid_w, 2400)  # Max width
+        display_h = min(grid_h, 1600)  # Max height
+        cv2.resizeWindow(window_name, display_w, display_h)
+        cv2.imshow(window_name, combined)
+        print(f"  Displaying {len(images_to_display)} camera images in grid layout. Press any key or close the window to continue...")
+        cv2.waitKey(0)  # Wait for key press
+        cv2.destroyWindow(window_name)
 
 
-def display_camera_images_threaded(image_paths, sample_token):
+def display_camera_images_threaded(image_paths, sample_token, polygon_by_camera=None):
     """
     Display camera images in a separate thread (for simultaneous windows).
     
@@ -407,7 +596,7 @@ def display_camera_images_threaded(image_paths, sample_token):
         sample_token: Sample token for window title
     """
     def _display():
-        display_camera_images(image_paths, sample_token)
+        display_camera_images(image_paths, sample_token, polygon_by_camera)
     
     thread = threading.Thread(target=_display, daemon=False)
     thread.start()
@@ -491,11 +680,6 @@ def run_inference_for_frame(
     max_points=1_000_000,
     display=True,
     nusc_info=None,
-    sky_depth_def=98.0,
-    conf_thresh_percentile=40.0,
-    filter_black_bg=False,
-    filter_white_bg=False,
-    max_depth=None,
 ):
     """Run inference for a single sample and optionally display point cloud."""
     print(f"\n{'='*60}")
@@ -524,10 +708,10 @@ def run_inference_for_frame(
         export_kwargs = {}
         if "glb" in export_format:
             export_kwargs["glb"] = {
-                "sky_depth_def": sky_depth_def,
-                "conf_thresh_percentile": conf_thresh_percentile,
-                "filter_black_bg": filter_black_bg,
-                "filter_white_bg": filter_white_bg,
+                "sky_depth_def": GLB_CONFIG["sky_depth_def"],
+                "conf_thresh_percentile": GLB_CONFIG["conf_thresh_percentile"],
+                "filter_black_bg": GLB_CONFIG["filter_black_bg"],
+                "filter_white_bg": GLB_CONFIG["filter_white_bg"],
             }
         
         # Run inference (no extrinsics/intrinsics - model estimates them!)
@@ -546,16 +730,18 @@ def run_inference_for_frame(
         
         # Display camera images and point cloud simultaneously
         if display:
-            # Display camera images (CAM_FRONT and CAM_BACK) in a separate thread (OpenCV is thread-safe)
-            camera_thread = display_camera_images_threaded(image_paths, sample_token)
+            # Display camera images (all 6 cameras) in a separate thread (OpenCV is thread-safe)
+            camera_thread = display_camera_images_threaded(image_paths, sample_token, nusc_info['polygon_by_camera'])
+            
             
             # Load point clouds from prediction (points stay in camera coordinates)
             # Apply filtering for sky, confidence, and max depth
             pcd_data = load_point_cloud_from_prediction(
                 prediction, 
                 image_paths,
-                max_depth=max_depth,
-                conf_thresh_percentile=conf_thresh_percentile,
+                max_depth=GLB_CONFIG["max_depth"],
+                conf_thresh_percentile=GLB_CONFIG["conf_thresh_percentile"],
+                polygon_by_camera=nusc_info['polygon_by_camera'],
             )
             
             if pcd_data and pcd_data['points_by_camera']:
@@ -563,6 +749,7 @@ def run_inference_for_frame(
                 # using ground truth extrinsics from nuScenes (not model's predicted extrinsics)
                 all_points_lidar = []
                 all_colors = []
+                all_polygon_mask = []
                 
                 print(f"  Transforming points from camera coordinates to LiDAR coordinates...")
                 for cam_name in pcd_data['camera_order']:
@@ -584,6 +771,10 @@ def run_inference_for_frame(
                             if cam_name in pcd_data['colors_by_camera']:
                                 all_colors.append(pcd_data['colors_by_camera'][cam_name])
                             
+                            # Get polygon mask if available
+                            if cam_name in pcd_data['polygon_mask_by_camera']:
+                                all_polygon_mask.append(pcd_data['polygon_mask_by_camera'][cam_name])
+                            
                             print(f"    {cam_name}: {len(points_cam)} points -> {len(points_lidar)} points in LiDAR frame")
                         else:
                             print(f"    WARNING: No transformation found for {cam_name}, skipping...")
@@ -598,6 +789,14 @@ def run_inference_for_frame(
                     
                     if all_colors:
                         combined_colors = np.concatenate(all_colors, axis=0)
+                        
+                        # Override colors for polygon points (red)
+                        if all_polygon_mask:
+                            combined_polygon_mask = np.concatenate(all_polygon_mask, axis=0)
+                            # Set polygon points to red [1, 0, 0]
+                            combined_colors[combined_polygon_mask] = [1.0, 0.0, 0.0]
+                            print(f"  Colored {combined_polygon_mask.sum()} polygon points in red")
+                        
                         pcd.colors = o3d.utility.Vector3dVector(combined_colors)
                     
                     print(f"  Total points in LiDAR frame: {len(combined_points)}")
@@ -697,35 +896,6 @@ def main():
         action="store_true",
         help="Skip point cloud visualization (default: display point clouds)",
     )
-    # Depth filtering options
-    parser.add_argument(
-        "--sky_depth_def",
-        type=float,
-        default=98.0,
-        help="[GLB] Percentile used to fill sky pixels with plausible depth values (default: 98.0)",
-    )
-    parser.add_argument(
-        "--conf_thresh_percentile",
-        type=float,
-        default=40.0,
-        help="[GLB] Lower percentile for adaptive confidence threshold (default: 40.0)",
-    )
-    parser.add_argument(
-        "--filter_black_bg",
-        action="store_true",
-        help="[GLB] Filter near-black background pixels (default: False)",
-    )
-    parser.add_argument(
-        "--filter_white_bg",
-        action="store_true",
-        help="[GLB] Filter near-white background pixels (default: False)",
-    )
-    parser.add_argument(
-        "--max_depth",
-        type=float,
-        default=None,
-        help="Maximum depth threshold to filter far objects/infinity (in meters, default: None = no limit)",
-    )
 
     args = parser.parse_args()
 
@@ -800,6 +970,9 @@ def main():
     successful = 0
     failed = 0
     
+    
+    
+    
     for i, sample in enumerate(samples, 1):
         sample_token = sample['token']
         print(f"\n[{i}/{len(samples)}] Processing sample: {sample_token}")
@@ -814,8 +987,27 @@ def main():
         
         print(f"  Found {len(image_paths)} camera images")
         
+        
+        
+            
+        # For debug: Load and draw polygon on CAM_FRONT_LEFT
+        # Hard-coded path for now
+        polygon_path = 'data/segmentation_polygon/CAM_FRONT_LEFT_1747104154682264.txt'
+        polygon_by_camera = {}
+        polygon_by_camera['CAM_FRONT_LEFT'] = load_polygon_from_txt(polygon_path)
+        
+        
+        
+
+        polygon_by_camera = None
+        
+        
         # Get nuScenes info (transformations, boxes, etc.)
         nusc_info = get_nusc_info(nusc, sample)
+        if polygon_by_camera is not None:
+            nusc_info['polygon_by_camera'] = polygon_by_camera
+        else:
+            nusc_info['polygon_by_camera'] = {}
     
         success, _ = run_inference_for_frame(
             model=model,
@@ -829,11 +1021,6 @@ def main():
             max_points=args.max_points,
             display=not args.no_display,
             nusc_info=nusc_info,
-            sky_depth_def=args.sky_depth_def,
-            conf_thresh_percentile=args.conf_thresh_percentile,
-            filter_black_bg=args.filter_black_bg,
-            filter_white_bg=args.filter_white_bg,
-            max_depth=args.max_depth,
         )
         
         if success:

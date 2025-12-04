@@ -158,7 +158,7 @@ python -c "import mmdet3d; print(f'mmdetection3d version: {mmdet3d.__version__}'
 python -m scripts.inference_nuscenes \
     --data_dir /hdd/automotive_perception_group/kadif/NAS_KATECH_3D_DATASET/BATCH1/nuscenes_katech \
     --output_dir result \
-    --sample_index 40 \
+    --sample_index 0 \
     --version v1.0-trainval
 
 
