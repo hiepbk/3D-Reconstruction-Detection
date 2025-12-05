@@ -36,6 +36,8 @@ USE_RAY_POSE = False
 MAX_POINTS = 1_000_000
 
 
+SHOW_GT_BOXES = False
+
 # ============================================================================
 # GLB Export Configuration
 # ============================================================================
@@ -57,16 +59,17 @@ GLB_CONFIG = {
 # Smaller values preserve more detail but result in more points
 # Recommended: 0.05-0.2 for nuScenes
 # Set to None to disable downsampling
-DOWNSAMPLE_VOXEL_SIZE = 0.1  # None to disable
+DOWNSAMPLE_VOXEL_SIZE = None  # None to disable
 
 # Apply Furthest Point Sampling (FPS) after voxel downsampling for uniform distribution
-DOWNSAMPLE_USE_FPS = True
+DOWNSAMPLE_USE_FPS = False
 
 # Number of points to sample with FPS (required if DOWNSAMPLE_USE_FPS is True)
-DOWNSAMPLE_FPS_NUM_POINTS = 40000  # e.g., 100000
+DOWNSAMPLE_FPS_NUM_POINTS = None  # e.g., 100000
 
 # Point cloud range for voxelization [x_min, y_min, z_min, x_max, y_max, z_max]
 #point_cloud_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
 # Set to None to auto-compute from point cloud
-DOWNSAMPLE_POINT_CLOUD_RANGE = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]  # e.g., [-50, -50, -5, 50, 50, 3]
+# DOWNSAMPLE_POINT_CLOUD_RANGE = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]  # e.g., [-50, -50, -5, 50, 50, 3]
+DOWNSAMPLE_POINT_CLOUD_RANGE = None  # e.g., [-50, -50, -5, 50, 50, 3]
 

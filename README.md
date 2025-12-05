@@ -184,7 +184,7 @@ python -m scripts.inference_nuscenes \
 python -m scripts.inference_nuscenes \
     --data_dir data/nuscenes_mini \
     --output_dir result \
-    --sample_index 100 \
+    --sample_index 0 \
     --version v1.0-mini
 ```
 

@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import csv
 import os
 import sys
 import threading
@@ -68,14 +69,45 @@ def get_nusc_info(nusc, sample):
             cam_to_lidar = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat,
                                             e2g_t, e2g_r_mat, camera_type)
             
-            # Store transformation for this camera
+            # Get calibrated sensor record to extract camera intrinsic
+            sd_rec = nusc.get('sample_data', cam_token)
+            cs_record = nusc.get('calibrated_sensor', sd_rec['calibrated_sensor_token'])
+            camera_intrinsic = np.array(cs_record['camera_intrinsic'])  # 3x3 matrix
+            
+            # Store transformation and camera info for this camera
             nusc_info[camera_type] = {
+                'cam_token': cam_token,
                 'cam2lidar_rotation': cam_to_lidar['sensor2lidar_rotation'],
                 'cam2lidar_translation': cam_to_lidar['sensor2lidar_translation'],
+                'camera_intrinsic': camera_intrinsic,
             }
             print(f"  Extracted transformation for {camera_type}")
     
-    nusc_info['gt_lidar_boxes'] = gt_lidar_boxes
+    if cfg.SHOW_GT_BOXES:
+        nusc_info['gt_lidar_boxes'] = gt_lidar_boxes
+    else:
+        nusc_info['gt_lidar_boxes'] = None
+        
+    # Write camera info to CSV file
+    # cam_name, cam_token, camera_intrinsic (as flattened string: fx fy cx cy)
+    csv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'camera_info.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['cam_name', 'cam_token', 'fx', 'fy', 'cx', 'cy', 'intrinsic_matrix'])
+        for camera_type in cfg.CAM_TYPES:
+            if camera_type in nusc_info:
+                cam_token = nusc_info[camera_type]['cam_token']
+                camera_intrinsic = nusc_info[camera_type]['camera_intrinsic']
+                # Extract fx, fy, cx, cy from intrinsic matrix
+                fx = camera_intrinsic[0, 0]
+                fy = camera_intrinsic[1, 1]
+                cx = camera_intrinsic[0, 2]
+                cy = camera_intrinsic[1, 2]
+                # Format intrinsic matrix as string (flattened: row1,row2,row3)
+                intrinsic_str = ';'.join([','.join(map(str, row)) for row in camera_intrinsic])
+                writer.writerow([camera_type, cam_token, fx, fy, cx, cy, intrinsic_str])
+        
+    
     return nusc_info
 
 
@@ -405,6 +437,10 @@ def load_point_cloud_from_prediction(
             x = (u - cx) * depth / fx
             y = (v - cy) * depth / fy
             z = depth
+            
+            # debug: use the zero depth to make all point at the same plane
+            # z = np.zeros_like(depth)
+            
             
             # Points are in camera coordinate system (NOT transformed to world)
             points_cam = np.stack([x.flatten(), y.flatten(), z.flatten()], axis=1)
