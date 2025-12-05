@@ -61,9 +61,9 @@ xformers is required for efficient attention operations. **Important**: Install 
 ```bash 
 # xformers should be >-0.0.24, otherwise, the DA3 model will generate inaccurate result
 
-pip install xformers==0.0.21 --no-deps
+# pip install xformers==0.0.21 --no-deps
 
-pip install xformers==0.0.24 --no-deps # 0.0.24 is smallest version can generate the good result, but the minimum pytorch version require is 2.2.0
+# pip install xformers==0.0.24 --no-deps # 0.0.24 is smallest version can generate the good result, but the minimum pytorch version require is 2.2.0
 pip install xformers==0.0.23 --no-deps # this for torch 2.1.0
 
 # Install triton (required by xformers)
@@ -124,17 +124,12 @@ cd ..
 
 pip install mmcv-full==1.7.2 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.1.0/index.html
 
-pip install mmdet==2.14.0
 
 pip install mmdet==2.28.0
-
-pip install llvmlite==0.31.0
-pip install numba==0.48.0 
 
 pip install mmsegmentation==0.30.0
 
 pip install numba==0.56.4 llvmlite==0.39.1
-pip install shapely
 
 cd mmdetection3d
 
