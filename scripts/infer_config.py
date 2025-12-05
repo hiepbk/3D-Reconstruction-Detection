@@ -59,17 +59,33 @@ GLB_CONFIG = {
 # Smaller values preserve more detail but result in more points
 # Recommended: 0.05-0.2 for nuScenes
 # Set to None to disable downsampling
-DOWNSAMPLE_VOXEL_SIZE = None  # None to disable
+DOWNSAMPLE_VOXEL_SIZE = 0.1  # None to disable
 
 # Apply Furthest Point Sampling (FPS) after voxel downsampling for uniform distribution
-DOWNSAMPLE_USE_FPS = False
+DOWNSAMPLE_USE_FPS = True
 
 # Number of points to sample with FPS (required if DOWNSAMPLE_USE_FPS is True)
-DOWNSAMPLE_FPS_NUM_POINTS = None  # e.g., 100000
+DOWNSAMPLE_FPS_NUM_POINTS = 40000  # e.g., 100000
 
 # Point cloud range for voxelization [x_min, y_min, z_min, x_max, y_max, z_max]
 #point_cloud_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
 # Set to None to auto-compute from point cloud
 # DOWNSAMPLE_POINT_CLOUD_RANGE = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]  # e.g., [-50, -50, -5, 50, 50, 3]
-DOWNSAMPLE_POINT_CLOUD_RANGE = None  # e.g., [-50, -50, -5, 50, 50, 3]
+# DOWNSAMPLE_POINT_CLOUD_RANGE = None  # e.g., [-50, -50, -5, 50, 50, 3]
+DOWNSAMPLE_POINT_CLOUD_RANGE = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]  # e.g., [-50, -50, -5, 50, 50, 3]
+
+# ============================================================================
+# Ball Query Configuration (Density-Aware Sampling)
+# ============================================================================
+
+# Use ball_query for density-aware downsampling (preserves local structure better than pure FPS)
+# Strategy: Use FPS to get anchor points, then ball_query to find neighbors within radius
+# This preserves more points in dense regions and fewer in sparse regions
+DOWNSAMPLE_USE_BALL_QUERY = True  # Set to True to enable ball_query
+
+# Ball query parameters (only used if DOWNSAMPLE_USE_BALL_QUERY is True)
+DOWNSAMPLE_BALL_QUERY_MIN_RADIUS = 0.0  # Minimum radius (meters) - typically 0.0
+DOWNSAMPLE_BALL_QUERY_MAX_RADIUS = 0.5  # Maximum radius (meters) - adjust based on scene scale
+DOWNSAMPLE_BALL_QUERY_SAMPLE_NUM = 16  # Maximum number of neighbors per anchor point
+DOWNSAMPLE_BALL_QUERY_ANCHOR_POINTS = 25000  # Number of FPS anchor points for ball_query
 

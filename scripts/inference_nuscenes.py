@@ -717,9 +717,14 @@ def downsample_point_cloud_mmcv(
     use_fps=False,
     fps_num_points=None,
     point_cloud_range=None,
+    use_ball_query=False,
+    ball_query_min_radius=0.0,
+    ball_query_max_radius=0.5,
+    ball_query_sample_num=16,
+    ball_query_anchor_points=25000,
 ):
     """
-    Downsample point cloud using mmdet3d.ops operations (voxelization + optional FPS).
+    Downsample point cloud using mmdet3d.ops operations (voxelization + optional FPS/ball_query).
     This helps reduce overlapping points and manage large point clouds.
     
     Args:
@@ -731,6 +736,11 @@ def downsample_point_cloud_mmcv(
         fps_num_points: int - number of points to sample with FPS (required if use_fps=True)
         point_cloud_range: list of 6 floats [x_min, y_min, z_min, x_max, y_max, z_max] - 
                           point cloud range for voxelization (optional, auto-computed if None)
+        use_ball_query: bool - whether to use ball_query for density-aware sampling (default: False)
+        ball_query_min_radius: float - minimum radius for ball_query (meters, default: 0.0)
+        ball_query_max_radius: float - maximum radius for ball_query (meters, default: 0.5)
+        ball_query_sample_num: int - max neighbors per anchor point (default: 16)
+        ball_query_anchor_points: int - number of FPS anchor points for ball_query (default: 25000)
     
     Returns:
         Dictionary with:
@@ -741,7 +751,7 @@ def downsample_point_cloud_mmcv(
     """
     # Import mmdet3d ops at the start
     try:
-        from mmdet3d.ops import Voxelization, furthest_point_sample
+        from mmdet3d.ops import Voxelization, furthest_point_sample, ball_query
     except ImportError as e:
         raise ImportError(
             "mmdet3d.ops is required for point cloud downsampling but could not be imported.\n"
@@ -764,19 +774,67 @@ def downsample_point_cloud_mmcv(
     # Detect device for GPU operations (FPS needs GPU)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Handle FPS-only mode (no voxelization)
+    # Handle FPS-only or ball_query-only mode (no voxelization)
     if voxel_size is None:
-        if not use_fps or fps_num_points is None:
-            # No downsampling requested, return original
-            return {
-                'points': points,
-                'colors': colors if colors is not None else None,
-                'polygon_mask': polygon_mask if polygon_mask is not None else None,
-                'indices': np.arange(len(points))
-            }
+        # Check ball_query first (takes precedence over FPS)
+        if use_ball_query and device.type == "cuda":
+            # Ball query mode without voxelization
+            if len(points) > ball_query_anchor_points:
+                print(f"  Applying ball_query-only: {len(points)} points -> {ball_query_anchor_points} anchors -> neighbors...")
+                # Step 1: Use FPS to get anchor points
+                points_for_fps = points_tensor.to(device).unsqueeze(0)  # (1, N, 3)
+                anchor_indices = furthest_point_sample(points_for_fps, ball_query_anchor_points)
+                anchor_indices = anchor_indices.squeeze(0)  # (anchor_points,)
+                anchor_points = points[anchor_indices.cpu().numpy()]  # (anchor_points, 3)
+                
+                # Step 2: Use ball_query to find neighbors around each anchor
+                points_tensor_gpu = points_tensor.to(device).unsqueeze(0).contiguous()  # (1, N, 3)
+                anchor_tensor_gpu = torch.from_numpy(anchor_points).float().to(device).unsqueeze(0).contiguous()  # (1, anchor_points, 3)
+                
+                with torch.no_grad():
+                    ball_query_indices = ball_query(
+                        ball_query_min_radius,
+                        ball_query_max_radius,
+                        ball_query_sample_num,
+                        points_tensor_gpu,
+                        anchor_tensor_gpu
+                    )  # (1, anchor_points, sample_num)
+                
+                # Step 3: Collect unique indices
+                ball_query_indices = ball_query_indices.squeeze(0).cpu().numpy()  # (anchor_points, sample_num)
+                all_indices = ball_query_indices.flatten()
+                valid_mask = (all_indices >= 0) & (all_indices < len(points))
+                unique_indices = np.unique(all_indices[valid_mask])
+                anchor_indices_np = anchor_indices.cpu().numpy()
+                final_indices = np.unique(np.concatenate([unique_indices, anchor_indices_np]))
+                
+                print(f"    Ball query found {len(final_indices)} unique points")
+                
+                downsampled_points = points[final_indices]
+                downsampled_colors = colors[final_indices] if colors is not None else None
+                downsampled_polygon_mask = polygon_mask[final_indices] if polygon_mask is not None else None
+                
+                return {
+                    'points': downsampled_points,
+                    'colors': downsampled_colors,
+                    'polygon_mask': downsampled_polygon_mask,
+                    'indices': final_indices
+                }
+            else:
+                # Too few points, return original
+                return {
+                    'points': points,
+                    'colors': colors if colors is not None else None,
+                    'polygon_mask': polygon_mask if polygon_mask is not None else None,
+                    'indices': np.arange(len(points))
+                }
+        elif use_ball_query and device.type != "cuda":
+            # ball_query requested but CUDA not available, warn and fall through
+            print(f"  Warning: ball_query requires CUDA but device is {device.type}, skipping...")
         
         # FPS-only mode: skip voxelization, apply FPS directly
-        if len(points) > fps_num_points:
+        if use_fps and fps_num_points is not None and len(points) > fps_num_points:
+            # FPS-only mode: skip voxelization, apply FPS directly
             print(f"  Applying FPS-only to downsample from {len(points)} to {fps_num_points} points...")
             # Move tensor to GPU for FPS operation
             points_for_fps = points_tensor.to(device).unsqueeze(0)  # (1, N, 3)
@@ -793,14 +851,14 @@ def downsample_point_cloud_mmcv(
                 'polygon_mask': downsampled_polygon_mask,
                 'indices': fps_indices
             }
-        else:
-            # Already fewer points than requested, return original
-            return {
-                'points': points,
-                'colors': colors if colors is not None else None,
-                'polygon_mask': polygon_mask if polygon_mask is not None else None,
-                'indices': np.arange(len(points))
-            }
+        
+        # No downsampling requested or already fewer points than requested, return original
+        return {
+            'points': points,
+            'colors': colors if colors is not None else None,
+            'polygon_mask': polygon_mask if polygon_mask is not None else None,
+            'indices': np.arange(len(points))
+        }
     
     # Voxelization mode (with optional FPS after)
     # Auto-compute point cloud range if not provided
@@ -888,8 +946,68 @@ def downsample_point_cloud_mmcv(
         
         downsampled_points = voxel_centers
         
-        # Apply FPS if requested
-        if use_fps and fps_num_points is not None and len(downsampled_points) > fps_num_points:
+        # Apply ball_query if requested (density-aware sampling)
+        if use_ball_query:
+            if device.type != "cuda":
+                print(f"  Warning: ball_query requires CUDA but device is {device.type}, skipping ball_query...")
+                use_ball_query = False  # Disable for this path
+        
+        if use_ball_query and device.type == "cuda":
+            if len(downsampled_points) > ball_query_anchor_points:
+                print(f"  Applying ball_query: {len(downsampled_points)} points -> {ball_query_anchor_points} anchors -> neighbors...")
+                # Step 1: Use FPS to get anchor points
+                points_for_fps = torch.from_numpy(downsampled_points).float().to(device).unsqueeze(0)  # (1, M, 3)
+                anchor_indices = furthest_point_sample(points_for_fps, ball_query_anchor_points)
+                anchor_indices = anchor_indices.squeeze(0)  # (anchor_points,)
+                anchor_points = downsampled_points[anchor_indices.cpu().numpy()]  # (anchor_points, 3)
+                
+                # Step 2: Use ball_query to find neighbors around each anchor
+                # ball_query expects: (B, N, 3) xyz, (B, npoint, 3) center_xyz
+                # Returns: (B, npoint, nsample) indices into xyz
+                points_tensor_gpu = torch.from_numpy(downsampled_points).float().to(device).unsqueeze(0)  # (1, M, 3)
+                anchor_tensor_gpu = torch.from_numpy(anchor_points).float().to(device).unsqueeze(0)  # (1, anchor_points, 3)
+                
+                # Ensure tensors are contiguous (required by ball_query)
+                points_tensor_gpu = points_tensor_gpu.contiguous()
+                anchor_tensor_gpu = anchor_tensor_gpu.contiguous()
+                
+                with torch.no_grad():
+                    ball_query_indices = ball_query(
+                        ball_query_min_radius,
+                        ball_query_max_radius,
+                        ball_query_sample_num,
+                        points_tensor_gpu,
+                        anchor_tensor_gpu
+                    )  # (1, anchor_points, sample_num) - indices into downsampled_points
+                
+                # Step 3: Collect unique indices from all ball queries
+                ball_query_indices = ball_query_indices.squeeze(0).cpu().numpy()  # (anchor_points, sample_num)
+                # Flatten and get unique indices
+                all_indices = ball_query_indices.flatten()
+                # Filter out invalid indices (ball_query may return duplicates or invalid values)
+                # Valid indices are >= 0 and < len(downsampled_points)
+                valid_mask = (all_indices >= 0) & (all_indices < len(downsampled_points))
+                unique_indices = np.unique(all_indices[valid_mask])
+                
+                # Also include anchor points themselves
+                anchor_indices_np = anchor_indices.cpu().numpy()
+                final_indices = np.unique(np.concatenate([unique_indices, anchor_indices_np]))
+                
+                print(f"    Ball query found {len(final_indices)} unique voxel points (from {len(downsampled_points)} input, {ball_query_anchor_points} anchors)")
+                
+                # final_indices are indices into downsampled_points (voxel centers)
+                downsampled_points = downsampled_points[final_indices]
+                if voxel_colors is not None:
+                    voxel_colors = voxel_colors[final_indices]
+                if voxel_polygon_mask is not None:
+                    voxel_polygon_mask = voxel_polygon_mask[final_indices]
+                # Map back to original point indices
+                closest_indices = closest_indices[final_indices]
+            else:
+                print(f"  Skipping ball_query: only {len(downsampled_points)} points (need > {ball_query_anchor_points})")
+        
+        # Apply FPS if requested (and ball_query was not used)
+        elif use_fps and fps_num_points is not None and len(downsampled_points) > fps_num_points:
             print(f"  Applying FPS to downsample from {len(downsampled_points)} to {fps_num_points} points...")
             # FPS expects batch dimension: (1, N, 3)
             # Move tensor to GPU for FPS operation
@@ -1038,6 +1156,11 @@ def run_inference_for_frame(
                                     use_fps=False,  # Don't use FPS per camera, only on final combined if needed
                                     fps_num_points=None,
                                     point_cloud_range=nusc_info.get('downsample_point_cloud_range', None),
+                                    use_ball_query=False,  # Don't use ball_query per camera, only on final combined if needed
+                                    ball_query_min_radius=nusc_info.get('downsample_ball_query_min_radius', 0.0),
+                                    ball_query_max_radius=nusc_info.get('downsample_ball_query_max_radius', 0.5),
+                                    ball_query_sample_num=nusc_info.get('downsample_ball_query_sample_num', 16),
+                                    ball_query_anchor_points=nusc_info.get('downsample_ball_query_anchor_points', 25000),
                                 )
                                 
                                 points_lidar = downsample_result['points']
@@ -1077,8 +1200,31 @@ def run_inference_for_frame(
                     num_points_after_camera_downsample = len(combined_points)
                     print(f"  Total points in LiDAR frame (after per-camera downsampling): {num_points_after_camera_downsample} (was {total_points_before_downsample} before)")
                     
-                    # Apply FPS on combined point cloud if requested (optional final step)
-                    if nusc_info.get('downsample_use_fps', False) and nusc_info.get('downsample_fps_num_points', None) is not None:
+                    # Apply FPS or ball_query on combined point cloud if requested (optional final step)
+                    if nusc_info.get('downsample_use_ball_query', False):
+                        print(f"  Applying ball_query to final combined point cloud...")
+                        downsample_result = downsample_point_cloud_mmcv(
+                            combined_points,
+                            colors=combined_colors,
+                            polygon_mask=combined_polygon_mask,
+                            voxel_size=None,  # Skip voxelization, only ball_query
+                            use_fps=False,
+                            fps_num_points=None,
+                            point_cloud_range=None,
+                            use_ball_query=True,
+                            ball_query_min_radius=nusc_info.get('downsample_ball_query_min_radius', 0.0),
+                            ball_query_max_radius=nusc_info.get('downsample_ball_query_max_radius', 0.5),
+                            ball_query_sample_num=nusc_info.get('downsample_ball_query_sample_num', 16),
+                            ball_query_anchor_points=nusc_info.get('downsample_ball_query_anchor_points', 25000),
+                        )
+                        
+                        combined_points = downsample_result['points']
+                        combined_colors = downsample_result['colors']
+                        combined_polygon_mask = downsample_result['polygon_mask']
+                        
+                        num_points_after_ball_query = len(combined_points)
+                        print(f"  Points after ball_query: {num_points_after_ball_query}")
+                    elif nusc_info.get('downsample_use_fps', False) and nusc_info.get('downsample_fps_num_points', None) is not None:
                         if len(combined_points) > nusc_info.get('downsample_fps_num_points', None):
                             print(f"  Applying FPS to final combined point cloud...")
                             downsample_result = downsample_point_cloud_mmcv(
@@ -1089,6 +1235,7 @@ def run_inference_for_frame(
                                 use_fps=True,
                                 fps_num_points=nusc_info.get('downsample_fps_num_points', None),
                                 point_cloud_range=None,
+                                use_ball_query=False,
                             )
                             
                             combined_points = downsample_result['points']
@@ -1291,6 +1438,11 @@ def main():
         nusc_info['downsample_use_fps'] = cfg.DOWNSAMPLE_USE_FPS
         nusc_info['downsample_fps_num_points'] = cfg.DOWNSAMPLE_FPS_NUM_POINTS
         nusc_info['downsample_point_cloud_range'] = cfg.DOWNSAMPLE_POINT_CLOUD_RANGE
+        nusc_info['downsample_use_ball_query'] = cfg.DOWNSAMPLE_USE_BALL_QUERY
+        nusc_info['downsample_ball_query_min_radius'] = cfg.DOWNSAMPLE_BALL_QUERY_MIN_RADIUS
+        nusc_info['downsample_ball_query_max_radius'] = cfg.DOWNSAMPLE_BALL_QUERY_MAX_RADIUS
+        nusc_info['downsample_ball_query_sample_num'] = cfg.DOWNSAMPLE_BALL_QUERY_SAMPLE_NUM
+        nusc_info['downsample_ball_query_anchor_points'] = cfg.DOWNSAMPLE_BALL_QUERY_ANCHOR_POINTS
     
         success, _ = run_inference_for_frame(
             model=model,
