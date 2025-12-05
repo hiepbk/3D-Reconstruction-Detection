@@ -645,16 +645,26 @@ def display_point_cloud(pcd, sample_token, gt_lidar_boxes=None):
             
             # Change the color of points which are in this box
             indices = obb.get_point_indices_within_bounding_box(pcd.points)
-            pcd.colors[indices] = [1, 0, 0]
-    
-            # find the center of front face (heading direction)
-            # then connect the bbox center with the front center -> heading direction
-            front_center = center + size[1] * np.array([-np.sin(yaw), np.cos(yaw), 0])
-            # append geometry line set from center to front center
+            if len(indices) > 0:
+                # Convert colors to numpy array, modify, then assign back
+                colors_array = np.asarray(pcd.colors)
+                colors_array[indices] = [1, 0, 0]  # Red color for points in box
+                pcd.colors = o3d.utility.Vector3dVector(colors_array)
+                vis.update_geometry(pcd)
+            
+            # Find the center of front face (heading direction)
+            # Extract yaw from rotation matrix (rotation around z-axis)
+            # The rotation matrix's first column gives the heading direction
+            heading_dir = rotation_matrix[:2, 0]  # x, y components of heading
+            yaw = np.arctan2(heading_dir[1], heading_dir[0])
+            
+            # Connect the bbox center with the front center -> heading direction
+            front_center = center + size[0] * np.array([np.cos(yaw), np.sin(yaw), 0])
+            # Append geometry line set from center to front center
             line_set = o3d.geometry.LineSet()
             line_set.points = o3d.utility.Vector3dVector([center, front_center])
             line_set.lines = o3d.utility.Vector2iVector([[0, 1]])
-            line_set.colors = o3d.utility.Vector3dVector([colors[i] if colors is not None else (1, 0, 0)])
+            line_set.colors = o3d.utility.Vector3dVector([[1, 0, 0], [1, 0, 0]])  # Red color for heading line
             vis.add_geometry(line_set)
             
             
