@@ -1,16 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Dict, List, Sequence
-
 import torch
-from torch import Tensor, nn
+from mmcv.runner import auto_fp16
+from torch import nn as nn
 
-from mmdet3d.models.layers import PointFPModule, build_sa_module
-from mmdet3d.registry import MODELS
-from mmdet3d.utils import ConfigType, OptMultiConfig
+from mmdet3d.ops import PointFPModule, build_sa_module
+from mmdet.models import BACKBONES
 from .base_pointnet import BasePointNet
 
 
-@MODELS.register_module()
+@BACKBONES.register_module()
 class PointNet2SASSG(BasePointNet):
     """PointNet2 with Single-scale grouping.
 
@@ -34,23 +32,20 @@ class PointNet2SASSG(BasePointNet):
     """
 
     def __init__(self,
-                 in_channels: int,
-                 num_points: Sequence[int] = (2048, 1024, 512, 256),
-                 radius: Sequence[float] = (0.2, 0.4, 0.8, 1.2),
-                 num_samples: Sequence[int] = (64, 32, 16, 16),
-                 sa_channels: Sequence[Sequence[int]] = ((64, 64, 128),
-                                                         (128, 128, 256),
-                                                         (128, 128, 256),
-                                                         (128, 128, 256)),
-                 fp_channels: Sequence[Sequence[int]] = ((256, 256), (256,
-                                                                      256)),
-                 norm_cfg: ConfigType = dict(type='BN2d'),
-                 sa_cfg: ConfigType = dict(
+                 in_channels,
+                 num_points=(2048, 1024, 512, 256),
+                 radius=(0.2, 0.4, 0.8, 1.2),
+                 num_samples=(64, 32, 16, 16),
+                 sa_channels=((64, 64, 128), (128, 128, 256), (128, 128, 256),
+                              (128, 128, 256)),
+                 fp_channels=((256, 256), (256, 256)),
+                 norm_cfg=dict(type='BN2d'),
+                 sa_cfg=dict(
                      type='PointSAModule',
                      pool_mod='max',
                      use_xyz=True,
                      normalize_xyz=True),
-                 init_cfg: OptMultiConfig = None):
+                 init_cfg=None):
         super().__init__(init_cfg=init_cfg)
         self.num_sa = len(sa_channels)
         self.num_fp = len(fp_channels)
@@ -91,7 +86,8 @@ class PointNet2SASSG(BasePointNet):
                 fp_source_channel = cur_fp_mlps[-1]
                 fp_target_channel = skip_channel_list.pop()
 
-    def forward(self, points: Tensor) -> Dict[str, List[Tensor]]:
+    @auto_fp16(apply_to=('points', ))
+    def forward(self, points):
         """Forward pass.
 
         Args:
@@ -101,11 +97,11 @@ class PointNet2SASSG(BasePointNet):
         Returns:
             dict[str, list[torch.Tensor]]: Outputs after SA and FP modules.
 
-                - fp_xyz (list[torch.Tensor]): The coordinates of
+                - fp_xyz (list[torch.Tensor]): The coordinates of \
                     each fp features.
-                - fp_features (list[torch.Tensor]): The features
+                - fp_features (list[torch.Tensor]): The features \
                     from each Feature Propagate Layers.
-                - fp_indices (list[torch.Tensor]): Indices of the
+                - fp_indices (list[torch.Tensor]): Indices of the \
                     input points.
         """
         xyz, features = self._split_point_feats(points)

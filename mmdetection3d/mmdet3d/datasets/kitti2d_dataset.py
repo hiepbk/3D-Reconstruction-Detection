@@ -1,13 +1,12 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import mmengine
+import mmcv
 import numpy as np
 
-from mmdet3d.datasets import Det3DDataset
-from mmdet3d.registry import DATASETS
+from mmdet.datasets import DATASETS, CustomDataset
 
 
 @DATASETS.register_module()
-class Kitti2DDataset(Det3DDataset):
+class Kitti2DDataset(CustomDataset):
     r"""KITTI 2D Dataset.
 
     This class serves as the API for experiments on the `KITTI Dataset
@@ -36,7 +35,7 @@ class Kitti2DDataset(Det3DDataset):
             Defaults to False.
     """
 
-    classes = ('car', 'pedestrian', 'cyclist')
+    CLASSES = ('car', 'pedestrian', 'cyclist')
     """
     Annotation format:
     [
@@ -87,10 +86,10 @@ class Kitti2DDataset(Det3DDataset):
         Returns:
             list[dict]: List of annotations.
         """
-        self.data_infos = mmengine.load(ann_file)
+        self.data_infos = mmcv.load(ann_file)
         self.cat2label = {
             cat_name: i
-            for i, cat_name in enumerate(self.classes)
+            for i, cat_name in enumerate(self.CLASSES)
         }
         return self.data_infos
 
@@ -122,7 +121,7 @@ class Kitti2DDataset(Det3DDataset):
         difficulty = annos['difficulty']
 
         # remove classes that is not needed
-        selected = self.keep_arrays_by_name(gt_names, self.classes)
+        selected = self.keep_arrays_by_name(gt_names, self.CLASSES)
         gt_bboxes = gt_bboxes[selected]
         gt_names = gt_names[selected]
         difficulty = difficulty[selected]
@@ -207,15 +206,14 @@ class Kitti2DDataset(Det3DDataset):
         Args:
             outputs (list[np.ndarray]): List of arrays storing the inferenced
                 bounding boxes and scores.
-            out (str, optional): The prefix of output file.
-                Default: None.
+            out (str | None): The prefix of output file. Default: None.
 
         Returns:
             list[dict]: A list of dictionaries with the kitti 2D format.
         """
-        from mmdet3d.structures.ops.transforms import bbox2result_kitti2d
+        from mmdet3d.core.bbox.transforms import bbox2result_kitti2d
         sample_idx = [info['image']['image_idx'] for info in self.data_infos]
-        result_files = bbox2result_kitti2d(outputs, self.classes, sample_idx,
+        result_files = bbox2result_kitti2d(outputs, self.CLASSES, sample_idx,
                                            out)
         return result_files
 
@@ -224,18 +222,18 @@ class Kitti2DDataset(Det3DDataset):
 
         Args:
             result_files (str): Path of result files.
-            eval_types (str, optional): Types of evaluation. Default: None.
+            eval_types (str): Types of evaluation. Default: None.
                 KITTI dataset only support 'bbox' evaluation type.
 
         Returns:
             tuple (str, dict): Average precision results in str format
                 and average precision results in dict format.
         """
-        from mmdet3d.evaluation import kitti_eval
+        from mmdet3d.core.evaluation import kitti_eval
         eval_types = ['bbox'] if not eval_types else eval_types
         assert eval_types in ('bbox', ['bbox'
                                        ]), 'KITTI data set only evaluate bbox'
         gt_annos = [info['annos'] for info in self.data_infos]
         ap_result_str, ap_dict = kitti_eval(
-            gt_annos, result_files, self.classes, eval_types=['bbox'])
+            gt_annos, result_files, self.CLASSES, eval_types=['bbox'])
         return ap_result_str, ap_dict

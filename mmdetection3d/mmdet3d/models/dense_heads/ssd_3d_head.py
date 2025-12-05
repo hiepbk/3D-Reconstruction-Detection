@@ -1,23 +1,20 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import List, Optional, Tuple, Union
-
+import numpy as np
 import torch
 from mmcv.ops.nms import batched_nms
-from mmdet.models.utils import multi_apply
-from mmengine import ConfigDict
-from mmengine.structures import InstanceData
-from torch import Tensor
+from mmcv.runner import force_fp32
 from torch.nn import functional as F
 
-from mmdet3d.registry import MODELS
-from mmdet3d.structures import BaseInstance3DBoxes
-from mmdet3d.structures.bbox_3d import (DepthInstance3DBoxes,
-                                        LiDARInstance3DBoxes,
-                                        rotation_3d_in_axis)
+from mmdet3d.core.bbox.structures import (DepthInstance3DBoxes,
+                                          LiDARInstance3DBoxes,
+                                          rotation_3d_in_axis)
+from mmdet3d.models.builder import build_loss
+from mmdet.core import multi_apply
+from mmdet.models import HEADS
 from .vote_head import VoteHead
 
 
-@MODELS.register_module()
+@HEADS.register_module()
 class SSD3DHead(VoteHead):
     r"""Bbox head of `3DSSD <https://arxiv.org/abs/2002.10187>`_.
 
@@ -25,6 +22,7 @@ class SSD3DHead(VoteHead):
         num_classes (int): The number of class.
         bbox_coder (:obj:`BaseBBoxCoder`): Bbox coder for encoding and
             decoding boxes.
+        in_channels (int): The number of input feature channel.
         train_cfg (dict): Config for training.
         test_cfg (dict): Config for testing.
         vote_module_cfg (dict): Config of VoteModule for point-wise votes.
@@ -44,21 +42,25 @@ class SSD3DHead(VoteHead):
     """
 
     def __init__(self,
-                 num_classes: int,
-                 bbox_coder: Union[ConfigDict, dict],
-                 train_cfg: Optional[dict] = None,
-                 test_cfg: Optional[dict] = None,
-                 vote_module_cfg: Optional[dict] = None,
-                 vote_aggregation_cfg: Optional[dict] = None,
-                 pred_layer_cfg: Optional[dict] = None,
-                 objectness_loss: Optional[dict] = None,
-                 center_loss: Optional[dict] = None,
-                 dir_class_loss: Optional[dict] = None,
-                 dir_res_loss: Optional[dict] = None,
-                 size_res_loss: Optional[dict] = None,
-                 corner_loss: Optional[dict] = None,
-                 vote_loss: Optional[dict] = None,
-                 init_cfg: Optional[dict] = None) -> None:
+                 num_classes,
+                 bbox_coder,
+                 in_channels=256,
+                 train_cfg=None,
+                 test_cfg=None,
+                 vote_module_cfg=None,
+                 vote_aggregation_cfg=None,
+                 pred_layer_cfg=None,
+                 conv_cfg=dict(type='Conv1d'),
+                 norm_cfg=dict(type='BN1d'),
+                 act_cfg=dict(type='ReLU'),
+                 objectness_loss=None,
+                 center_loss=None,
+                 dir_class_loss=None,
+                 dir_res_loss=None,
+                 size_res_loss=None,
+                 corner_loss=None,
+                 vote_loss=None,
+                 init_cfg=None):
         super(SSD3DHead, self).__init__(
             num_classes,
             bbox_coder,
@@ -67,6 +69,8 @@ class SSD3DHead(VoteHead):
             vote_module_cfg=vote_module_cfg,
             vote_aggregation_cfg=vote_aggregation_cfg,
             pred_layer_cfg=pred_layer_cfg,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
             objectness_loss=objectness_loss,
             center_loss=center_loss,
             dir_class_loss=dir_class_loss,
@@ -75,23 +79,24 @@ class SSD3DHead(VoteHead):
             size_res_loss=size_res_loss,
             semantic_loss=None,
             init_cfg=init_cfg)
-        self.corner_loss = MODELS.build(corner_loss)
-        self.vote_loss = MODELS.build(vote_loss)
+
+        self.corner_loss = build_loss(corner_loss)
+        self.vote_loss = build_loss(vote_loss)
         self.num_candidates = vote_module_cfg['num_points']
 
-    def _get_cls_out_channels(self) -> int:
+    def _get_cls_out_channels(self):
         """Return the channel number of classification outputs."""
         # Class numbers (k) + objectness (1)
         return self.num_classes
 
-    def _get_reg_out_channels(self) -> int:
+    def _get_reg_out_channels(self):
         """Return the channel number of regression outputs."""
         # Bbox classification and regression
         # (center residual (3), size regression (3)
         # heading class+residual (num_dir_bins*2)),
         return 3 + 3 + self.num_dir_bins * 2
 
-    def _extract_input(self, feat_dict: dict) -> Tuple:
+    def _extract_input(self, feat_dict):
         """Extract inputs from features dictionary.
 
         Args:
@@ -108,87 +113,86 @@ class SSD3DHead(VoteHead):
 
         return seed_points, seed_features, seed_indices
 
-    def loss_by_feat(
-            self,
-            points: List[torch.Tensor],
-            bbox_preds_dict: dict,
-            batch_gt_instances_3d: List[InstanceData],
-            batch_pts_semantic_mask: Optional[List[torch.Tensor]] = None,
-            batch_pts_instance_mask: Optional[List[torch.Tensor]] = None,
-            batch_input_metas: List[dict] = None,
-            ret_target: bool = False,
-            **kwargs) -> dict:
+    @force_fp32(apply_to=('bbox_preds', ))
+    def loss(self,
+             bbox_preds,
+             points,
+             gt_bboxes_3d,
+             gt_labels_3d,
+             pts_semantic_mask=None,
+             pts_instance_mask=None,
+             img_metas=None,
+             gt_bboxes_ignore=None):
         """Compute loss.
 
         Args:
+            bbox_preds (dict): Predictions from forward of SSD3DHead.
             points (list[torch.Tensor]): Input points.
-            bbox_preds_dict (dict): Predictions from forward of vote head.
-            batch_gt_instances_3d (list[:obj:`InstanceData`]): Batch of
-                gt_instances. It usually includes ``bboxes_3d`` and
-                ``labels_3d`` attributes.
-            batch_pts_semantic_mask (list[tensor]): Semantic mask
-                of points cloud. Defaults to None. Defaults to None.
-            batch_pts_semantic_mask (list[tensor]): Instance mask
-                of points cloud. Defaults to None. Defaults to None.
-            batch_input_metas (list[dict]): Contain pcd and img's meta info.
-            ret_target (bool): Return targets or not.  Defaults to False.
+            gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`]): Ground truth \
+                bboxes of each sample.
+            gt_labels_3d (list[torch.Tensor]): Labels of each sample.
+            pts_semantic_mask (None | list[torch.Tensor]): Point-wise
+                semantic mask.
+            pts_instance_mask (None | list[torch.Tensor]): Point-wise
+                instance mask.
+            img_metas (list[dict]): Contain pcd and img's meta info.
+            gt_bboxes_ignore (None | list[torch.Tensor]): Specify
+                which bounding.
 
         Returns:
             dict: Losses of 3DSSD.
         """
-
-        targets = self.get_targets(points, bbox_preds_dict,
-                                   batch_gt_instances_3d,
-                                   batch_pts_semantic_mask,
-                                   batch_pts_instance_mask)
+        targets = self.get_targets(points, gt_bboxes_3d, gt_labels_3d,
+                                   pts_semantic_mask, pts_instance_mask,
+                                   bbox_preds)
         (vote_targets, center_targets, size_res_targets, dir_class_targets,
          dir_res_targets, mask_targets, centerness_targets, corner3d_targets,
          vote_mask, positive_mask, negative_mask, centerness_weights,
          box_loss_weights, heading_res_loss_weight) = targets
 
         # calculate centerness loss
-        centerness_loss = self.loss_objectness(
-            bbox_preds_dict['obj_scores'].transpose(2, 1),
+        centerness_loss = self.objectness_loss(
+            bbox_preds['obj_scores'].transpose(2, 1),
             centerness_targets,
             weight=centerness_weights)
 
         # calculate center loss
-        center_loss = self.loss_center(
-            bbox_preds_dict['center_offset'],
+        center_loss = self.center_loss(
+            bbox_preds['center_offset'],
             center_targets,
             weight=box_loss_weights.unsqueeze(-1))
 
         # calculate direction class loss
-        dir_class_loss = self.loss_dir_class(
-            bbox_preds_dict['dir_class'].transpose(1, 2),
+        dir_class_loss = self.dir_class_loss(
+            bbox_preds['dir_class'].transpose(1, 2),
             dir_class_targets,
             weight=box_loss_weights)
 
         # calculate direction residual loss
-        dir_res_loss = self.loss_dir_res(
-            bbox_preds_dict['dir_res_norm'],
+        dir_res_loss = self.dir_res_loss(
+            bbox_preds['dir_res_norm'],
             dir_res_targets.unsqueeze(-1).repeat(1, 1, self.num_dir_bins),
             weight=heading_res_loss_weight)
 
         # calculate size residual loss
-        size_loss = self.loss_size_res(
-            bbox_preds_dict['size'],
+        size_loss = self.size_res_loss(
+            bbox_preds['size'],
             size_res_targets,
             weight=box_loss_weights.unsqueeze(-1))
 
         # calculate corner loss
         one_hot_dir_class_targets = dir_class_targets.new_zeros(
-            bbox_preds_dict['dir_class'].shape)
+            bbox_preds['dir_class'].shape)
         one_hot_dir_class_targets.scatter_(2, dir_class_targets.unsqueeze(-1),
                                            1)
         pred_bbox3d = self.bbox_coder.decode(
             dict(
-                center=bbox_preds_dict['center'],
-                dir_res=bbox_preds_dict['dir_res'],
+                center=bbox_preds['center'],
+                dir_res=bbox_preds['dir_res'],
                 dir_class=one_hot_dir_class_targets,
-                size=bbox_preds_dict['size']))
+                size=bbox_preds['size']))
         pred_bbox3d = pred_bbox3d.reshape(-1, pred_bbox3d.shape[-1])
-        pred_bbox3d = batch_input_metas[0]['box_type_3d'](
+        pred_bbox3d = img_metas[0]['box_type_3d'](
             pred_bbox3d.clone(),
             box_dim=pred_bbox3d.shape[-1],
             with_yaw=self.bbox_coder.with_rot,
@@ -201,7 +205,7 @@ class SSD3DHead(VoteHead):
 
         # calculate vote loss
         vote_loss = self.vote_loss(
-            bbox_preds_dict['vote_offset'].transpose(1, 2),
+            bbox_preds['vote_offset'].transpose(1, 2),
             vote_targets,
             weight=vote_mask.unsqueeze(-1))
 
@@ -216,74 +220,57 @@ class SSD3DHead(VoteHead):
 
         return losses
 
-    def get_targets(
-        self,
-        points: List[Tensor],
-        bbox_preds_dict: dict = None,
-        batch_gt_instances_3d: List[InstanceData] = None,
-        batch_pts_semantic_mask: List[torch.Tensor] = None,
-        batch_pts_instance_mask: List[torch.Tensor] = None,
-    ) -> Tuple[Tensor]:
-        """Generate targets of 3DSSD head.
+    def get_targets(self,
+                    points,
+                    gt_bboxes_3d,
+                    gt_labels_3d,
+                    pts_semantic_mask=None,
+                    pts_instance_mask=None,
+                    bbox_preds=None):
+        """Generate targets of ssd3d head.
 
         Args:
             points (list[torch.Tensor]): Points of each batch.
-            bbox_preds_dict (dict): Bounding box predictions of
-                vote head.  Defaults to None.
-            batch_gt_instances_3d (list[:obj:`InstanceData`]): Batch of
-                gt_instances. It usually includes ``bboxes`` and ``labels``
-                attributes.  Defaults to None.
-            batch_pts_semantic_mask (list[tensor]): Semantic gt mask for
-                point clouds.  Defaults to None.
-            batch_pts_instance_mask (list[tensor]): Instance gt mask for
-                point clouds. Defaults to None.
+            gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`]): Ground truth \
+                bboxes of each batch.
+            gt_labels_3d (list[torch.Tensor]): Labels of each batch.
+            pts_semantic_mask (None | list[torch.Tensor]): Point-wise semantic
+                label of each batch.
+            pts_instance_mask (None | list[torch.Tensor]): Point-wise instance
+                label of each batch.
+            bbox_preds (torch.Tensor): Bounding box predictions of ssd3d head.
 
         Returns:
-            tuple[torch.Tensor]: Targets of 3DSSD head.
+            tuple[torch.Tensor]: Targets of ssd3d head.
         """
-        batch_gt_labels_3d = [
-            gt_instances_3d.labels_3d
-            for gt_instances_3d in batch_gt_instances_3d
-        ]
-        batch_gt_bboxes_3d = [
-            gt_instances_3d.bboxes_3d
-            for gt_instances_3d in batch_gt_instances_3d
-        ]
-
         # find empty example
-        for index in range(len(batch_gt_labels_3d)):
-            if len(batch_gt_labels_3d[index]) == 0:
-                fake_box = batch_gt_bboxes_3d[index].tensor.new_zeros(
-                    1, batch_gt_bboxes_3d[index].tensor.shape[-1])
-                batch_gt_bboxes_3d[index] = batch_gt_bboxes_3d[index].new_box(
-                    fake_box)
-                batch_gt_labels_3d[index] = batch_gt_labels_3d[
-                    index].new_zeros(1)
+        for index in range(len(gt_labels_3d)):
+            if len(gt_labels_3d[index]) == 0:
+                fake_box = gt_bboxes_3d[index].tensor.new_zeros(
+                    1, gt_bboxes_3d[index].tensor.shape[-1])
+                gt_bboxes_3d[index] = gt_bboxes_3d[index].new_box(fake_box)
+                gt_labels_3d[index] = gt_labels_3d[index].new_zeros(1)
 
-        if batch_pts_semantic_mask is None:
-            batch_pts_semantic_mask = [
-                None for _ in range(len(batch_gt_labels_3d))
-            ]
-            batch_pts_instance_mask = [
-                None for _ in range(len(batch_gt_labels_3d))
-            ]
+        if pts_semantic_mask is None:
+            pts_semantic_mask = [None for i in range(len(gt_labels_3d))]
+            pts_instance_mask = [None for i in range(len(gt_labels_3d))]
 
         aggregated_points = [
-            bbox_preds_dict['aggregated_points'][i]
-            for i in range(len(batch_gt_labels_3d))
+            bbox_preds['aggregated_points'][i]
+            for i in range(len(gt_labels_3d))
         ]
 
         seed_points = [
-            bbox_preds_dict['seed_points'][i, :self.num_candidates].detach()
-            for i in range(len(batch_gt_labels_3d))
+            bbox_preds['seed_points'][i, :self.num_candidates].detach()
+            for i in range(len(gt_labels_3d))
         ]
 
         (vote_targets, center_targets, size_res_targets, dir_class_targets,
          dir_res_targets, mask_targets, centerness_targets, corner3d_targets,
          vote_mask, positive_mask, negative_mask) = multi_apply(
-             self.get_targets_single, points, batch_gt_bboxes_3d,
-             batch_gt_labels_3d, batch_pts_semantic_mask,
-             batch_pts_instance_mask, aggregated_points, seed_points)
+             self.get_targets_single, points, gt_bboxes_3d, gt_labels_3d,
+             pts_semantic_mask, pts_instance_mask, aggregated_points,
+             seed_points)
 
         center_targets = torch.stack(center_targets)
         positive_mask = torch.stack(positive_mask)
@@ -297,7 +284,7 @@ class SSD3DHead(VoteHead):
         vote_targets = torch.stack(vote_targets)
         vote_mask = torch.stack(vote_mask)
 
-        center_targets -= bbox_preds_dict['aggregated_points']
+        center_targets -= bbox_preds['aggregated_points']
 
         centerness_weights = (positive_mask +
                               negative_mask).unsqueeze(-1).repeat(
@@ -322,24 +309,23 @@ class SSD3DHead(VoteHead):
                 heading_res_loss_weight)
 
     def get_targets_single(self,
-                           points: Tensor,
-                           gt_bboxes_3d: BaseInstance3DBoxes,
-                           gt_labels_3d: Tensor,
-                           pts_semantic_mask: Optional[Tensor] = None,
-                           pts_instance_mask: Optional[Tensor] = None,
-                           aggregated_points: Optional[Tensor] = None,
-                           seed_points: Optional[Tensor] = None,
-                           **kwargs):
+                           points,
+                           gt_bboxes_3d,
+                           gt_labels_3d,
+                           pts_semantic_mask=None,
+                           pts_instance_mask=None,
+                           aggregated_points=None,
+                           seed_points=None):
         """Generate targets of ssd3d head for single batch.
 
         Args:
             points (torch.Tensor): Points of each batch.
-            gt_bboxes_3d (:obj:`BaseInstance3DBoxes`): Ground truth
+            gt_bboxes_3d (:obj:`BaseInstance3DBoxes`): Ground truth \
                 boxes of each batch.
             gt_labels_3d (torch.Tensor): Labels of each batch.
-            pts_semantic_mask (torch.Tensor): Point-wise semantic
+            pts_semantic_mask (None | torch.Tensor): Point-wise semantic
                 label of each batch.
-            pts_instance_mask (torch.Tensor): Point-wise instance
+            pts_instance_mask (None | torch.Tensor): Point-wise instance
                 label of each batch.
             aggregated_points (torch.Tensor): Aggregated points from
                 candidate points layer.
@@ -406,8 +392,7 @@ class SSD3DHead(VoteHead):
             # LiDARInstance3DBoxes and DepthInstance3DBoxes
             canonical_xyz = rotation_3d_in_axis(
                 canonical_xyz.unsqueeze(0).transpose(0, 1),
-                -gt_bboxes_3d.yaw[assignment],
-                axis=2).squeeze(1)
+                -gt_bboxes_3d.yaw[assignment], 2).squeeze(1)
         distance_front = torch.clamp(
             size_res_targets[:, 0] - canonical_xyz[:, 0], min=0)
         distance_back = torch.clamp(
@@ -455,55 +440,48 @@ class SSD3DHead(VoteHead):
                 centerness_targets, corner3d_targets, vote_mask, positive_mask,
                 negative_mask)
 
-    def predict_by_feat(self, points: List[torch.Tensor],
-                        bbox_preds_dict: dict, batch_input_metas: List[dict],
-                        **kwargs) -> List[InstanceData]:
-        """Generate bboxes from vote head predictions.
+    def get_bboxes(self, points, bbox_preds, input_metas, rescale=False):
+        """Generate bboxes from sdd3d head predictions.
 
         Args:
-            points (List[torch.Tensor]): Input points of multiple samples.
-            bbox_preds_dict (dict): Predictions from vote head.
-            batch_input_metas (list[dict]): Each item
-                contains the meta information of each sample.
+            points (torch.Tensor): Input points.
+            bbox_preds (dict): Predictions from sdd3d head.
+            input_metas (list[dict]): Point cloud and image's meta info.
+            rescale (bool): Whether to rescale bboxes.
 
         Returns:
-            list[:obj:`InstanceData`]: List of processed predictions. Each
-            InstanceData cantains 3d Bounding boxes and corresponding
-            scores and labels.
+            list[tuple[torch.Tensor]]: Bounding boxes, scores and labels.
         """
         # decode boxes
-        sem_scores = F.sigmoid(bbox_preds_dict['obj_scores']).transpose(1, 2)
+        sem_scores = F.sigmoid(bbox_preds['obj_scores']).transpose(1, 2)
         obj_scores = sem_scores.max(-1)[0]
-        bbox3d = self.bbox_coder.decode(bbox_preds_dict)
+        bbox3d = self.bbox_coder.decode(bbox_preds)
+
         batch_size = bbox3d.shape[0]
-        points = torch.stack(points)
-        results_list = []
+        results = list()
+
         for b in range(batch_size):
-            temp_results = InstanceData()
             bbox_selected, score_selected, labels = self.multiclass_nms_single(
                 obj_scores[b], sem_scores[b], bbox3d[b], points[b, ..., :3],
-                batch_input_metas[b])
-
-            bbox = batch_input_metas[b]['box_type_3d'](
+                input_metas[b])
+            # fix the wrong direction
+            # To do: remove this ops
+            bbox_selected[..., 6] += np.pi
+            bbox = input_metas[b]['box_type_3d'](
                 bbox_selected.clone(),
                 box_dim=bbox_selected.shape[-1],
                 with_yaw=self.bbox_coder.with_rot)
+            results.append((bbox, score_selected, labels))
 
-            temp_results.bboxes_3d = bbox
-            temp_results.scores_3d = score_selected
-            temp_results.labels_3d = labels
-            results_list.append(temp_results)
+        return results
 
-        return results_list
-
-    def multiclass_nms_single(self, obj_scores: Tensor, sem_scores: Tensor,
-                              bbox: Tensor, points: Tensor,
-                              input_meta: dict) -> Tuple[Tensor]:
+    def multiclass_nms_single(self, obj_scores, sem_scores, bbox, points,
+                              input_meta):
         """Multi-class nms in single batch.
 
         Args:
             obj_scores (torch.Tensor): Objectness score of bounding boxes.
-            sem_scores (torch.Tensor): Semantic class score of bounding boxes.
+            sem_scores (torch.Tensor): semantic class score of bounding boxes.
             bbox (torch.Tensor): Predicted bounding boxes.
             points (torch.Tensor): Input points.
             input_meta (dict): Point cloud and image's meta info.
@@ -511,14 +489,23 @@ class SSD3DHead(VoteHead):
         Returns:
             tuple[torch.Tensor]: Bounding boxes, scores and labels.
         """
+        num_bbox = bbox.shape[0]
         bbox = input_meta['box_type_3d'](
             bbox.clone(),
             box_dim=bbox.shape[-1],
             with_yaw=self.bbox_coder.with_rot,
             origin=(0.5, 0.5, 0.5))
 
-        if isinstance(bbox, (LiDARInstance3DBoxes, DepthInstance3DBoxes)):
-            box_indices = bbox.points_in_boxes_all(points)
+        if isinstance(bbox, LiDARInstance3DBoxes):
+            box_idx = bbox.points_in_boxes(points)
+            box_indices = box_idx.new_zeros([num_bbox + 1])
+            box_idx[box_idx == -1] = num_bbox
+            box_indices.scatter_add_(0, box_idx.long(),
+                                     box_idx.new_ones(box_idx.shape))
+            box_indices = box_indices[:-1]
+            nonempty_box_mask = box_indices >= 0
+        elif isinstance(bbox, DepthInstance3DBoxes):
+            box_indices = bbox.points_in_boxes(points)
             nonempty_box_mask = box_indices.T.sum(1) >= 0
         else:
             raise NotImplementedError('Unsupported bbox type!')
@@ -529,20 +516,20 @@ class SSD3DHead(VoteHead):
         minmax_box3d[:, 3:] = torch.max(corner3d, dim=1)[0]
 
         bbox_classes = torch.argmax(sem_scores, -1)
-        nms_keep = batched_nms(
+        nms_selected = batched_nms(
             minmax_box3d[nonempty_box_mask][:, [0, 1, 3, 4]],
             obj_scores[nonempty_box_mask], bbox_classes[nonempty_box_mask],
             self.test_cfg.nms_cfg)[1]
 
-        if nms_keep.shape[0] > self.test_cfg.max_output_num:
-            nms_keep = nms_keep[:self.test_cfg.max_output_num]
+        if nms_selected.shape[0] > self.test_cfg.max_output_num:
+            nms_selected = nms_selected[:self.test_cfg.max_output_num]
 
         # filter empty boxes and boxes with low score
         scores_mask = (obj_scores >= self.test_cfg.score_thr)
         nonempty_box_inds = torch.nonzero(
             nonempty_box_mask, as_tuple=False).flatten()
         nonempty_mask = torch.zeros_like(bbox_classes).scatter(
-            0, nonempty_box_inds[nms_keep], 1)
+            0, nonempty_box_inds[nms_selected], 1)
         selected = (nonempty_mask.bool() & scores_mask.bool())
 
         if self.test_cfg.per_class_proposal:
@@ -562,8 +549,7 @@ class SSD3DHead(VoteHead):
 
         return bbox_selected, score_selected, labels
 
-    def _assign_targets_by_points_inside(self, bboxes_3d: BaseInstance3DBoxes,
-                                         points: Tensor) -> Tuple:
+    def _assign_targets_by_points_inside(self, bboxes_3d, points):
         """Compute assignment by checking whether point is inside bbox.
 
         Args:
@@ -574,8 +560,18 @@ class SSD3DHead(VoteHead):
             tuple[torch.Tensor]: Flags indicating whether each point is
                 inside bbox and the index of box where each point are in.
         """
-        if isinstance(bboxes_3d, (LiDARInstance3DBoxes, DepthInstance3DBoxes)):
-            points_mask = bboxes_3d.points_in_boxes_all(points)
+        # TODO: align points_in_boxes function in each box_structures
+        num_bbox = bboxes_3d.tensor.shape[0]
+        if isinstance(bboxes_3d, LiDARInstance3DBoxes):
+            assignment = bboxes_3d.points_in_boxes(points).long()
+            points_mask = assignment.new_zeros(
+                [assignment.shape[0], num_bbox + 1])
+            assignment[assignment == -1] = num_bbox
+            points_mask.scatter_(1, assignment.unsqueeze(1), 1)
+            points_mask = points_mask[:, :-1]
+            assignment[assignment == num_bbox] = num_bbox - 1
+        elif isinstance(bboxes_3d, DepthInstance3DBoxes):
+            points_mask = bboxes_3d.points_in_boxes(points)
             assignment = points_mask.argmax(dim=-1)
         else:
             raise NotImplementedError('Unsupported bbox type!')

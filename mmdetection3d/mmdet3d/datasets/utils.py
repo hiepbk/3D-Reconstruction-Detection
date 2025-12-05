@@ -1,18 +1,18 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import numpy as np
-from mmcv.transforms import LoadImageFromFile
-from pyquaternion import Quaternion
+import mmcv
 
 # yapf: disable
-from mmdet3d.datasets.transforms import (LoadAnnotations3D,
-                                         LoadImageFromFileMono3D,
-                                         LoadMultiViewImageFromFiles,
-                                         LoadPointsFromFile,
-                                         LoadPointsFromMultiSweeps,
-                                         MultiScaleFlipAug3D, Pack3DDetInputs,
-                                         PointSegClassMapping)
+from mmdet3d.datasets.pipelines import (Collect3D, DefaultFormatBundle3D,
+                                        LoadAnnotations3D,
+                                        LoadImageFromFileMono3D,
+                                        LoadMultiViewImageFromFiles,
+                                        LoadPointsFromFile,
+                                        LoadPointsFromMultiSweeps,
+                                        MultiScaleFlipAug3D,
+                                        PointSegClassMapping)
 # yapf: enable
-from mmdet3d.registry import TRANSFORMS
+from mmdet.datasets.builder import PIPELINES
+from mmdet.datasets.pipelines import LoadImageFromFile
 
 
 def is_loading_function(transform):
@@ -25,16 +25,17 @@ def is_loading_function(transform):
         transform (dict | :obj:`Pipeline`): A transform config or a function.
 
     Returns:
-        bool: Whether it is a loading function. None means can't judge.
+        bool | None: Whether it is a loading function. None means can't judge.
             When transform is `MultiScaleFlipAug3D`, we return None.
     """
     # TODO: use more elegant way to distinguish loading modules
     loading_functions = (LoadImageFromFile, LoadPointsFromFile,
                          LoadAnnotations3D, LoadMultiViewImageFromFiles,
-                         LoadPointsFromMultiSweeps, Pack3DDetInputs,
-                         LoadImageFromFileMono3D, PointSegClassMapping)
+                         LoadPointsFromMultiSweeps, DefaultFormatBundle3D,
+                         Collect3D, LoadImageFromFileMono3D,
+                         PointSegClassMapping)
     if isinstance(transform, dict):
-        obj_cls = TRANSFORMS.get(transform['type'])
+        obj_cls = PIPELINES.get(transform['type'])
         if obj_cls is None:
             return False
         if obj_cls in loading_functions:
@@ -44,7 +45,7 @@ def is_loading_function(transform):
     elif callable(transform):
         if isinstance(transform, loading_functions):
             return True
-        if isinstance(transform, (MultiScaleFlipAug3D)):
+        if isinstance(transform, MultiScaleFlipAug3D):
             return None
     return False
 
@@ -61,7 +62,7 @@ def get_loading_pipeline(pipeline):
             keep loading image, points and annotations related configuration.
 
     Examples:
-        >>> transforms = [
+        >>> pipelines = [
         ...    dict(type='LoadPointsFromFile',
         ...         coord_type='LIDAR', load_dim=4, use_dim=4),
         ...    dict(type='LoadImageFromFile'),
@@ -91,8 +92,8 @@ def get_loading_pipeline(pipeline):
         ...    dict(type='Collect3D',
         ...         keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'])
         ...    ]
-        >>> assert expected_pipelines == \
-        ...        get_loading_pipeline(transforms)
+        >>> assert expected_pipelines ==\
+        ...        get_loading_pipeline(pipelines)
     """
     loading_pipeline = []
     for transform in pipeline:
@@ -112,12 +113,28 @@ def get_loading_pipeline(pipeline):
     return loading_pipeline
 
 
-def convert_quaternion_to_matrix(quaternion: list,
-                                 translation: list = None) -> list:
-    """Compute a transform matrix by given quaternion and translation
-    vector."""
-    result = np.eye(4)
-    result[:3, :3] = Quaternion(quaternion).rotation_matrix
-    if translation is not None:
-        result[:3, 3] = np.array(translation)
-    return result.astype(np.float32).tolist()
+def extract_result_dict(results, key):
+    """Extract and return the data corresponding to key in result dict.
+
+    ``results`` is a dict output from `pipeline(input_dict)`, which is the
+        loaded data from ``Dataset`` class.
+    The data terms inside may be wrapped in list, tuple and DataContainer, so
+        this function essentially extracts data from these wrappers.
+
+    Args:
+        results (dict): Data loaded using pipeline.
+        key (str): Key of the desired data.
+
+    Returns:
+        np.ndarray | torch.Tensor | None: Data term.
+    """
+    if key not in results.keys():
+        return None
+    # results[key] may be data or list[data] or tuple[data]
+    # data may be wrapped inside DataContainer
+    data = results[key]
+    if isinstance(data, (list, tuple)):
+        data = data[0]
+    if isinstance(data, mmcv.parallel.DataContainer):
+        data = data._data
+    return data

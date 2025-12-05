@@ -1,21 +1,15 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Tuple
-
 import torch
 from mmcv.cnn import ConvModule
-from torch import Tensor, nn
+from mmcv.runner import auto_fp16
+from torch import nn as nn
 
-from mmdet3d.models.layers.pointnet_modules import build_sa_module
-from mmdet3d.registry import MODELS
-from mmdet3d.utils import OptConfigType
+from mmdet3d.ops import build_sa_module
+from mmdet.models import BACKBONES
 from .base_pointnet import BasePointNet
 
-ThreeTupleIntType = Tuple[Tuple[Tuple[int, int, int]]]
-TwoTupleIntType = Tuple[Tuple[int, int, int]]
-TwoTupleStrType = Tuple[Tuple[str]]
 
-
-@MODELS.register_module()
+@BACKBONES.register_module()
 class PointNet2SAMSG(BasePointNet):
     """PointNet2 with Multi-scale grouping.
 
@@ -29,7 +23,7 @@ class PointNet2SAMSG(BasePointNet):
         sa_channels (tuple[tuple[int]]): Out channels of each mlp in SA module.
         aggregation_channels (tuple[int]): Out channels of aggregation
             multi-scale grouping features.
-        fps_mods Sequence[Tuple[str]]: Mod of FPS for each SA module.
+        fps_mods (tuple[int]): Mod of FPS for each SA module.
         fps_sample_range_lists (tuple[tuple[int]]): The number of sampling
             points which each SA module samples.
         dilated_group (tuple[bool]): Whether to use dilated ball query for
@@ -45,47 +39,32 @@ class PointNet2SAMSG(BasePointNet):
     """
 
     def __init__(self,
-                 in_channels: int,
-                 num_points: Tuple[int] = (2048, 1024, 512, 256),
-                 radii: Tuple[Tuple[float, float, float]] = (
-                     (0.2, 0.4, 0.8),
-                     (0.4, 0.8, 1.6),
-                     (1.6, 3.2, 4.8),
-                 ),
-                 num_samples: TwoTupleIntType = ((32, 32, 64), (32, 32, 64),
-                                                 (32, 32, 32)),
-                 sa_channels: ThreeTupleIntType = (((16, 16, 32), (16, 16, 32),
-                                                    (32, 32, 64)),
-                                                   ((64, 64, 128),
-                                                    (64, 64, 128), (64, 96,
-                                                                    128)),
-                                                   ((128, 128, 256),
-                                                    (128, 192, 256), (128, 256,
-                                                                      256))),
-                 aggregation_channels: Tuple[int] = (64, 128, 256),
-                 fps_mods: TwoTupleStrType = (('D-FPS'), ('FS'), ('F-FPS',
-                                                                  'D-FPS')),
-                 fps_sample_range_lists: TwoTupleIntType = ((-1), (-1), (512,
-                                                                         -1)),
-                 dilated_group: Tuple[bool] = (True, True, True),
-                 out_indices: Tuple[int] = (2, ),
-                 norm_cfg: dict = dict(type='BN2d'),
-                 sa_cfg: dict = dict(
+                 in_channels,
+                 num_points=(2048, 1024, 512, 256),
+                 radii=((0.2, 0.4, 0.8), (0.4, 0.8, 1.6), (1.6, 3.2, 4.8)),
+                 num_samples=((32, 32, 64), (32, 32, 64), (32, 32, 32)),
+                 sa_channels=(((16, 16, 32), (16, 16, 32), (32, 32, 64)),
+                              ((64, 64, 128), (64, 64, 128), (64, 96, 128)),
+                              ((128, 128, 256), (128, 192, 256), (128, 256,
+                                                                  256))),
+                 aggregation_channels=(64, 128, 256),
+                 fps_mods=(('D-FPS'), ('FS'), ('F-FPS', 'D-FPS')),
+                 fps_sample_range_lists=((-1), (-1), (512, -1)),
+                 dilated_group=(True, True, True),
+                 out_indices=(2, ),
+                 norm_cfg=dict(type='BN2d'),
+                 sa_cfg=dict(
                      type='PointSAModuleMSG',
                      pool_mod='max',
                      use_xyz=True,
                      normalize_xyz=False),
-                 init_cfg: OptConfigType = None):
+                 init_cfg=None):
         super().__init__(init_cfg=init_cfg)
         self.num_sa = len(sa_channels)
         self.out_indices = out_indices
         assert max(out_indices) < self.num_sa
         assert len(num_points) == len(radii) == len(num_samples) == len(
-            sa_channels)
-        if aggregation_channels is not None:
-            assert len(sa_channels) == len(aggregation_channels)
-        else:
-            aggregation_channels = [None] * len(sa_channels)
+            sa_channels) == len(aggregation_channels)
 
         self.SA_modules = nn.ModuleList()
         self.aggregation_mlps = nn.ModuleList()
@@ -141,7 +120,8 @@ class PointNet2SAMSG(BasePointNet):
                         bias=True))
                 sa_in_channel = cur_aggregation_channel
 
-    def forward(self, points: Tensor):
+    @auto_fp16(apply_to=('points', ))
+    def forward(self, points):
         """Forward pass.
 
         Args:
@@ -154,7 +134,7 @@ class PointNet2SAMSG(BasePointNet):
                 - sa_xyz (torch.Tensor): The coordinates of sa features.
                 - sa_features (torch.Tensor): The features from the
                     last Set Aggregation Layers.
-                - sa_indices (torch.Tensor): Indices of the
+                - sa_indices (torch.Tensor): Indices of the \
                     input points.
         """
         xyz, features = self._split_point_feats(points)

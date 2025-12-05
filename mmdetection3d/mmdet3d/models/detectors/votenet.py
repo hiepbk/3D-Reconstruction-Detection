@@ -1,148 +1,107 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Dict, List, Optional, Union
+import torch
 
-from mmengine.structures import InstanceData
-from torch import Tensor
-
-from mmdet3d.registry import MODELS
-from mmdet3d.structures import Det3DDataSample
-from ..test_time_augs import merge_aug_bboxes_3d
+from mmdet3d.core import bbox3d2result, merge_aug_bboxes_3d
+from mmdet.models import DETECTORS
 from .single_stage import SingleStage3DDetector
 
 
-@MODELS.register_module()
+@DETECTORS.register_module()
 class VoteNet(SingleStage3DDetector):
-    r"""`VoteNet <https://arxiv.org/pdf/1904.09664.pdf>`_ for 3D detection.
-
-    Args:
-        backbone (dict): Config dict of detector's backbone.
-        bbox_head (dict, optional): Config dict of box head. Defaults to None.
-        train_cfg (dict, optional): Config dict of training hyper-parameters.
-            Defaults to None.
-        test_cfg (dict, optional): Config dict of test hyper-parameters.
-            Defaults to None.
-        init_cfg (dict, optional): the config to control the
-           initialization. Default to None.
-        data_preprocessor (dict or ConfigDict, optional): The pre-process
-            config of :class:`BaseDataPreprocessor`.  it usually includes,
-            ``pad_size_divisor``, ``pad_value``, ``mean`` and ``std``.
-    """
+    r"""`VoteNet <https://arxiv.org/pdf/1904.09664.pdf>`_ for 3D detection."""
 
     def __init__(self,
-                 backbone: dict,
-                 bbox_head: Optional[dict] = None,
-                 train_cfg: Optional[dict] = None,
-                 test_cfg: Optional[dict] = None,
-                 init_cfg: Optional[dict] = None,
-                 data_preprocessor: Optional[dict] = None,
-                 **kwargs):
+                 backbone,
+                 bbox_head=None,
+                 train_cfg=None,
+                 test_cfg=None,
+                 init_cfg=None,
+                 pretrained=None):
         super(VoteNet, self).__init__(
             backbone=backbone,
             bbox_head=bbox_head,
             train_cfg=train_cfg,
             test_cfg=test_cfg,
-            init_cfg=init_cfg,
-            data_preprocessor=data_preprocessor,
-            **kwargs)
+            init_cfg=None,
+            pretrained=pretrained)
 
-    def loss(self, batch_inputs_dict: Dict[str, Union[List, Tensor]],
-             batch_data_samples: List[Det3DDataSample],
-             **kwargs) -> List[Det3DDataSample]:
-        """
+    def forward_train(self,
+                      points,
+                      img_metas,
+                      gt_bboxes_3d,
+                      gt_labels_3d,
+                      pts_semantic_mask=None,
+                      pts_instance_mask=None,
+                      gt_bboxes_ignore=None):
+        """Forward of training.
+
         Args:
-            batch_inputs_dict (dict): The model input dict which include
-                'points' keys.
-
-                - points (list[torch.Tensor]): Point cloud of each sample.
-
-            batch_data_samples (List[:obj:`Det3DDataSample`]): The Data
-                Samples. It usually includes information such as
-                `gt_instance_3d`.
+            points (list[torch.Tensor]): Points of each batch.
+            img_metas (list): Image metas.
+            gt_bboxes_3d (:obj:`BaseInstance3DBoxes`): gt bboxes of each batch.
+            gt_labels_3d (list[torch.Tensor]): gt class labels of each batch.
+            pts_semantic_mask (None | list[torch.Tensor]): point-wise semantic
+                label of each batch.
+            pts_instance_mask (None | list[torch.Tensor]): point-wise instance
+                label of each batch.
+            gt_bboxes_ignore (None | list[torch.Tensor]): Specify
+                which bounding.
 
         Returns:
-            dict[str, Tensor]: A dictionary of loss components.
+            dict: Losses.
         """
-        feat_dict = self.extract_feat(batch_inputs_dict)
-        points = batch_inputs_dict['points']
-        losses = self.bbox_head.loss(points, feat_dict, batch_data_samples,
-                                     **kwargs)
+        points_cat = torch.stack(points)
+
+        x = self.extract_feat(points_cat)
+        bbox_preds = self.bbox_head(x, self.train_cfg.sample_mod)
+        loss_inputs = (points, gt_bboxes_3d, gt_labels_3d, pts_semantic_mask,
+                       pts_instance_mask, img_metas)
+        losses = self.bbox_head.loss(
+            bbox_preds, *loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
         return losses
 
-    def predict(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
-                batch_data_samples: List[Det3DDataSample],
-                **kwargs) -> List[Det3DDataSample]:
+    def simple_test(self, points, img_metas, imgs=None, rescale=False):
         """Forward of testing.
 
         Args:
-            batch_inputs_dict (dict): The model input dict which include
-                'points' keys.
-
-                - points (list[torch.Tensor]): Point cloud of each sample.
-            batch_data_samples (List[:obj:`Det3DDataSample`]): The Data
-                Samples. It usually includes information such as
-                `gt_instance_3d`.
+            points (list[torch.Tensor]): Points of each sample.
+            img_metas (list): Image metas.
+            rescale (bool): Whether to rescale results.
 
         Returns:
-            list[:obj:`Det3DDataSample`]: Detection results of the
-            input sample. Each Det3DDataSample usually contain
-            'pred_instances_3d'. And the ``pred_instances_3d`` usually
-            contains following keys.
-
-                - scores_3d (Tensor): Classification scores, has a shape
-                    (num_instances, )
-                - labels_3d (Tensor): Labels of bboxes, has a shape
-                    (num_instances, ).
-                - bboxes_3d (:obj:`BaseInstance3DBoxes`): Prediction of bboxes,
-                    contains a tensor with shape (num_instances, 7).
+            list: Predicted 3d boxes.
         """
-        feats_dict = self.extract_feat(batch_inputs_dict)
-        points = batch_inputs_dict['points']
-        results_list = self.bbox_head.predict(points, feats_dict,
-                                              batch_data_samples, **kwargs)
-        data_3d_samples = self.add_pred_to_datasample(batch_data_samples,
-                                                      results_list)
-        return data_3d_samples
+        points_cat = torch.stack(points)
 
-    def aug_test(self, aug_inputs_list: List[dict],
-                 aug_data_samples: List[List[dict]], **kwargs):
-        """Test with augmentation.
+        x = self.extract_feat(points_cat)
+        bbox_preds = self.bbox_head(x, self.test_cfg.sample_mod)
+        bbox_list = self.bbox_head.get_bboxes(
+            points_cat, bbox_preds, img_metas, rescale=rescale)
+        bbox_results = [
+            bbox3d2result(bboxes, scores, labels)
+            for bboxes, scores, labels in bbox_list
+        ]
+        return bbox_results
 
-        Batch size always is 1 when do the augtest.
+    def aug_test(self, points, img_metas, imgs=None, rescale=False):
+        """Test with augmentation."""
+        points_cat = [torch.stack(pts) for pts in points]
+        feats = self.extract_feats(points_cat, img_metas)
 
-        Args:
-            aug_inputs_list (List[dict]): The list indicate same data
-                under differecnt augmentation.
-            aug_data_samples (List[List[dict]]): The outer list
-                indicate different augmentation, and the inter
-                list indicate the batch size.
-        """
-        num_augs = len(aug_inputs_list)
-        if num_augs == 1:
-            return self.predict(aug_inputs_list[0], aug_data_samples[0])
+        # only support aug_test for one sample
+        aug_bboxes = []
+        for x, pts_cat, img_meta in zip(feats, points_cat, img_metas):
+            bbox_preds = self.bbox_head(x, self.test_cfg.sample_mod)
+            bbox_list = self.bbox_head.get_bboxes(
+                pts_cat, bbox_preds, img_meta, rescale=rescale)
+            bbox_list = [
+                dict(boxes_3d=bboxes, scores_3d=scores, labels_3d=labels)
+                for bboxes, scores, labels in bbox_list
+            ]
+            aug_bboxes.append(bbox_list[0])
 
-        batch_size = len(aug_data_samples[0])
-        assert batch_size == 1
-        multi_aug_results = []
-        for aug_id in range(num_augs):
-            batch_inputs_dict = aug_inputs_list[aug_id]
-            batch_data_samples = aug_data_samples[aug_id]
-            feats_dict = self.extract_feat(batch_inputs_dict)
-            points = batch_inputs_dict['points']
-            results_list = self.bbox_head.predict(points, feats_dict,
-                                                  batch_data_samples, **kwargs)
-            multi_aug_results.append(results_list[0])
-        aug_input_metas_list = []
-        for aug_index in range(num_augs):
-            metainfo = aug_data_samples[aug_id][0].metainfo
-            aug_input_metas_list.append(metainfo)
-
-        aug_results_list = [item.to_dict() for item in multi_aug_results]
         # after merging, bboxes will be rescaled to the original image size
-        merged_results_dict = merge_aug_bboxes_3d(aug_results_list,
-                                                  aug_input_metas_list,
-                                                  self.bbox_head.test_cfg)
+        merged_bboxes = merge_aug_bboxes_3d(aug_bboxes, img_metas,
+                                            self.bbox_head.test_cfg)
 
-        merged_results = InstanceData(**merged_results_dict)
-        data_3d_samples = self.add_pred_to_datasample(batch_data_samples,
-                                                      [merged_results])
-        return data_3d_samples
+        return [merged_bboxes]

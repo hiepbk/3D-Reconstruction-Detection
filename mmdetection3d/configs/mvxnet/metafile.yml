@@ -18,14 +18,13 @@ Collections:
 
 Models:
   - Name: dv_mvx-fpn_second_secfpn_adamw_2x8_80e_kitti-3d-3class
-    Alias: mvxnet_kitti-3class
     In Collection: MVX-Net
-    Config: configs/mvxnet/mvxnet_fpn_dv_second_secfpn_8xb2-80e_kitti-3d-3class.py
+    Config: configs/mvxnet/dv_mvx-fpn_second_secfpn_adamw_2x8_80e_kitti-3d-3class.py
     Metadata:
       Training Memory (GB): 6.7
     Results:
       - Task: 3D Object Detection
         Dataset: KITTI
         Metrics:
-          mAP: 63.5
-    Weights: https://download.openmmlab.com/mmdetection3d/v1.1.0_models/mvxnet/mvxnet_fpn_dv_second_secfpn_8xb2-80e_kitti-3d-3class/mvxnet_fpn_dv_second_secfpn_8xb2-80e_kitti-3d-3class-8963258a.pth
+          mAP: 63.0
+    Weights: https://download.openmmlab.com/mmdetection3d/v0.1.0_models/mvxnet/dv_mvx-fpn_second_secfpn_adamw_2x8_80e_kitti-3d-3class/dv_mvx-fpn_second_secfpn_adamw_2x8_80e_kitti-3d-3class_20200621_003904-10140f2d.pth

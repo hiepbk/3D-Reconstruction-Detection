@@ -1,19 +1,10 @@
 # Copyright (c) Open-MMLab. All rights reserved.
 
-__version__ = '1.4.0'
+__version__ = '0.17.1'
 short_version = __version__
 
 
-def parse_version_info(version_str: str) -> tuple:
-    """Parse a version string into a tuple.
-
-    Args:
-        version_str (str): The version string.
-
-    Returns:
-        tuple: The version info, e.g., "1.3.0" is parsed into (1, 3, 0), and
-        "2.0.0rc4" is parsed into (2, 0, 0, 'rc4').
-    """
+def parse_version_info(version_str):
     version_info = []
     for x in version_str.split('.'):
         if x.isdigit():

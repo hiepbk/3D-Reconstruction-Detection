@@ -27,7 +27,9 @@ If this fails, install [Anaconda](https://www.anaconda.com/download) or [Minicon
 Create a new conda environment with Python 3.11:
 
 ```bash
-conda create -n da3 python=3.11 -y
+# conda create -n da3 python=3.11 -y
+
+conda create -n da3 python=3.9 -y
 
 ```
 
@@ -42,8 +44,12 @@ conda activate da3
 ### For CUDA 12.1 (most common)
 ```bash
 
-# have to use pytroch 2.2.0, because it is minimum version can use with xformer to generate the good result
-pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+
+# pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118
+pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+
+# # have to use pytroch 2.2.0, because it is minimum version can use with xformer to generate the good result
+# pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
 
 
 ```
@@ -55,13 +61,16 @@ xformers is required for efficient attention operations. **Important**: Install 
 ```bash 
 # xformers should be >-0.0.24, otherwise, the DA3 model will generate inaccurate result
 
-
+pip install xformers==0.0.21 --no-deps
 
 pip install xformers==0.0.24 --no-deps # 0.0.24 is smallest version can generate the good result, but the minimum pytorch version require is 2.2.0
-
+pip install xformers==0.0.23 --no-deps # this for torch 2.1.0
 
 # Install triton (required by xformers)
 pip install triton
+# avoid the torch compile error
+pip install e3nn==0.4.0
+
 ```
 
 **Note**: Using `--no-deps` prevents xformers from changing your PyTorch version. This is the safest approach to maintain version compatibility.
@@ -113,23 +122,25 @@ cd ..
 
 ```bash
 
-# Install mmcv (v1.4.0 uses mmcv, not mmcv-full)
-# v1.4.0 requires: mmcv>=2.0.0rc4,<2.2.0
-# GOOD NEWS: mmcv 2.1.0 has pre-built wheels for PyTorch 2.2.0 + CUDA 12.1!
-pip install mmcv==2.1.0 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.2.0/index.html
+pip install mmcv-full==1.7.2 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.1.0/index.html
 
-# Install MMDetection (v1.4.0 compatible version)
-# Requirements: mmdet>=3.0.0,<3.3.0, so use 3.2.0 (not 3.3.0)
-pip install mmdet==3.2.0
+pip install mmdet==2.14.0
 
-# 4. Clone mmdetection3d with specific tag v1.4.0
-git clone --depth 1 --branch v1.4.0 https://github.com/open-mmlab/mmdetection3d.git
-cd mmdetection3d/
+pip install mmdet==2.28.0
 
-# Install mmdetection3d
-# Use --no-build-isolation so pip uses the current environment (which has torch)
-# instead of creating an isolated build environment
-pip install -e . --no-build-isolation
+pip install llvmlite==0.31.0
+pip install numba==0.48.0 
+
+pip install mmsegmentation==0.30.0
+
+pip install numba==0.56.4 llvmlite==0.39.1
+pip install shapely
+
+cd mmdetection3d
+
+
+python setup.py build_ext --inplace
+python setup.py develop --no-deps
 
 ```
 
@@ -152,6 +163,14 @@ python -c "import mmdet3d; print(f'mmdetection3d version: {mmdet3d.__version__}'
 
 ## Commands
 
+### Clean up compiled ops extensions
+
+Remove all `.so` files from mmdet3d ops directories (useful before rebuilding):
+
+```bash
+find mmdetection3d/mmdet3d/ops -name "*.so" -type f -delete
+```
+
 ### Inference with nuScenes (Sample-based iteration)
 
 ```bash
@@ -165,7 +184,7 @@ python -m scripts.inference_nuscenes \
 python -m scripts.inference_nuscenes \
     --data_dir data/nuscenes_mini \
     --output_dir result \
-    --sample_index 40 \
+    --sample_index 100 \
     --version v1.0-mini
 ```
 

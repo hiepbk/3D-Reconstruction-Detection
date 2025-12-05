@@ -1,17 +1,13 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import List, Sequence, Tuple
-
 from mmcv.cnn.bricks import ConvModule
-from torch import Tensor
 from torch import nn as nn
 
-from mmdet3d.models.layers import PointFPModule
-from mmdet3d.registry import MODELS
-from mmdet3d.utils.typing_utils import ConfigType
+from mmdet3d.ops import PointFPModule
+from mmdet.models import HEADS
 from .decode_head import Base3DDecodeHead
 
 
-@MODELS.register_module()
+@HEADS.register_module()
 class PointNet2Head(Base3DDecodeHead):
     r"""PointNet2 decoder head.
 
@@ -19,20 +15,16 @@ class PointNet2Head(Base3DDecodeHead):
     Refer to the `official code <https://github.com/charlesq34/pointnet2>`_.
 
     Args:
-        fp_channels (Sequence[Sequence[int]]): Tuple of mlp channels in FP
-            modules. Defaults to ((768, 256, 256), (384, 256, 256),
-            (320, 256, 128), (128, 128, 128, 128)).
-        fp_norm_cfg (dict or :obj:`ConfigDict`): Config of norm layers used
-            in FP modules. Defaults to dict(type='BN2d').
+        fp_channels (tuple[tuple[int]]): Tuple of mlp channels in FP modules.
+        fp_norm_cfg (dict|None): Config of norm layers used in FP modules.
+            Default: dict(type='BN2d').
     """
 
     def __init__(self,
-                 fp_channels: Sequence[Sequence[int]] = ((768, 256, 256),
-                                                         (384, 256, 256),
-                                                         (320, 256, 128),
-                                                         (128, 128, 128, 128)),
-                 fp_norm_cfg: ConfigType = dict(type='BN2d'),
-                 **kwargs) -> None:
+                 fp_channels=((768, 256, 256), (384, 256, 256),
+                              (320, 256, 128), (128, 128, 128, 128)),
+                 fp_norm_cfg=dict(type='BN2d'),
+                 **kwargs):
         super(PointNet2Head, self).__init__(**kwargs)
 
         self.num_fp = len(fp_channels)
@@ -51,16 +43,15 @@ class PointNet2Head(Base3DDecodeHead):
             norm_cfg=self.norm_cfg,
             act_cfg=self.act_cfg)
 
-    def _extract_input(self,
-                       feat_dict: dict) -> Tuple[List[Tensor], List[Tensor]]:
+    def _extract_input(self, feat_dict):
         """Extract inputs from features dictionary.
 
         Args:
             feat_dict (dict): Feature dict from backbone.
 
         Returns:
-            Tuple[List[Tensor], List[Tensor]]: Coordinates and features of
-            multiple levels of points.
+            list[torch.Tensor]: Coordinates of multiple levels of points.
+            list[torch.Tensor]: Features of multiple levels of points.
         """
         sa_xyz = feat_dict['sa_xyz']
         sa_features = feat_dict['sa_features']
@@ -68,14 +59,14 @@ class PointNet2Head(Base3DDecodeHead):
 
         return sa_xyz, sa_features
 
-    def forward(self, feat_dict: dict) -> Tensor:
+    def forward(self, feat_dict):
         """Forward pass.
 
         Args:
             feat_dict (dict): Feature dict from backbone.
 
         Returns:
-            Tensor: Segmentation map of shape [B, num_classes, N].
+            torch.Tensor: Segmentation map of shape [B, num_classes, N].
         """
         sa_xyz, sa_features = self._extract_input(feat_dict)
 

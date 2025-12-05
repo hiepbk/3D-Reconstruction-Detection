@@ -1,7 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
-
-from mmengine import Config, DictAction
+from mmcv import Config, DictAction
 
 
 def parse_args():

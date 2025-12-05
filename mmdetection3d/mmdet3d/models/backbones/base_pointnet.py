@@ -1,21 +1,15 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import warnings
 from abc import ABCMeta
-from typing import Optional, Tuple
-
-from mmengine.model import BaseModule
-from torch import Tensor
-
-from mmdet3d.utils import OptMultiConfig
+from mmcv.runner import BaseModule
 
 
 class BasePointNet(BaseModule, metaclass=ABCMeta):
     """Base class for PointNet."""
 
-    def __init__(self,
-                 init_cfg: OptMultiConfig = None,
-                 pretrained: Optional[str] = None):
+    def __init__(self, init_cfg=None, pretrained=None):
         super(BasePointNet, self).__init__(init_cfg)
+        self.fp16_enabled = False
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be setting at the same time'
         if isinstance(pretrained, str):
@@ -24,7 +18,7 @@ class BasePointNet(BaseModule, metaclass=ABCMeta):
             self.init_cfg = dict(type='Pretrained', checkpoint=pretrained)
 
     @staticmethod
-    def _split_point_feats(points: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+    def _split_point_feats(points):
         """Split coordinates and features of input points.
 
         Args:

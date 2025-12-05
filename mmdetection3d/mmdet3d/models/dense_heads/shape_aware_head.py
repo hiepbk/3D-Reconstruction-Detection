@@ -1,24 +1,19 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import warnings
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import torch
+import warnings
 from mmcv.cnn import ConvModule
-from mmdet.models.utils import multi_apply
-from mmengine.model import BaseModule
-from mmengine.structures import InstanceData
-from torch import Tensor
+from mmcv.runner import BaseModule
 from torch import nn as nn
 
-from mmdet3d.models.layers import box3d_multiclass_nms
-from mmdet3d.registry import MODELS
-from mmdet3d.structures import limit_period, xywhr2xyxyr
-from mmdet3d.utils import InstanceList, OptInstanceList
+from mmdet3d.core import box3d_multiclass_nms, limit_period, xywhr2xyxyr
+from mmdet.core import multi_apply
+from mmdet.models import HEADS
+from ..builder import build_head
 from .anchor3d_head import Anchor3DHead
 
 
-@MODELS.register_module()
+@HEADS.register_module()
 class BaseShapeHead(BaseModule):
     """Base Shape-aware Head in Shape Signature Network.
 
@@ -35,32 +30,29 @@ class BaseShapeHead(BaseModule):
         num_base_anchors (int): Number of anchors per location.
         box_code_size (int): The dimension of boxes to be encoded.
         in_channels (int): Input channels for convolutional layers.
-        shared_conv_channels (tuple, optional): Channels for shared
-            convolutional layers. Default: (64, 64).
-        shared_conv_strides (tuple): Strides for shared
-            convolutional layers. Default: (1, 1).
-        use_direction_classifier (bool): Whether to use direction
+        shared_conv_channels (tuple): Channels for shared convolutional \
+            layers. Default: (64, 64). \
+        shared_conv_strides (tuple): Strides for shared convolutional \
+            layers. Default: (1, 1).
+        use_direction_classifier (bool, optional): Whether to use direction \
             classifier. Default: True.
-        conv_cfg (dict): Config of conv layer.
-            Default: dict(type='Conv2d')
-        norm_cfg (dict): Config of norm layer.
-            Default: dict(type='BN2d').
-        bias (bool | str): Type of bias. Default: False.
-        init_cfg (dict or list[dict], optional): Initialization config dict.
+        conv_cfg (dict): Config of conv layer. Default: dict(type='Conv2d')
+        norm_cfg (dict): Config of norm layer. Default: dict(type='BN2d').
+        bias (bool|str, optional): Type of bias. Default: False.
     """
 
     def __init__(self,
-                 num_cls: int,
-                 num_base_anchors: int,
-                 box_code_size: int,
-                 in_channels: int,
-                 shared_conv_channels: Tuple = (64, 64),
-                 shared_conv_strides: Tuple = (1, 1),
-                 use_direction_classifier: bool = True,
-                 conv_cfg: Dict = dict(type='Conv2d'),
-                 norm_cfg: Dict = dict(type='BN2d'),
-                 bias: bool = False,
-                 init_cfg: Optional[dict] = None) -> None:
+                 num_cls,
+                 num_base_anchors,
+                 box_code_size,
+                 in_channels,
+                 shared_conv_channels=(64, 64),
+                 shared_conv_strides=(1, 1),
+                 use_direction_classifier=True,
+                 conv_cfg=dict(type='Conv2d'),
+                 norm_cfg=dict(type='BN2d'),
+                 bias=False,
+                 init_cfg=None):
         super().__init__(init_cfg=init_cfg)
         self.num_cls = num_cls
         self.num_base_anchors = num_base_anchors
@@ -127,7 +119,7 @@ class BaseShapeHead(BaseModule):
                             bias_prob=0.01)
                     ])
 
-    def forward(self, x: Tensor) -> Dict:
+    def forward(self, x):
         """Forward function for SmallHead.
 
         Args:
@@ -135,11 +127,11 @@ class BaseShapeHead(BaseModule):
                 [B, C, H, W].
 
         Returns:
-            dict[torch.Tensor]: Contain score of each class, bbox
-                regression and direction classification predictions.
-                Note that all the returned tensors are reshaped as
-                [bs*num_base_anchors*H*W, num_cls/box_code_size/dir_bins].
-                It is more convenient to concat anchors for different
+            dict[torch.Tensor]: Contain score of each class, bbox \
+                regression and direction classification predictions. \
+                Note that all the returned tensors are reshaped as \
+                [bs*num_base_anchors*H*W, num_cls/box_code_size/dir_bins]. \
+                It is more convenient to concat anchors for different \
                 classes even though they have different feature map sizes.
         """
         x = self.shared_conv(x)
@@ -170,22 +162,19 @@ class BaseShapeHead(BaseModule):
         return ret
 
 
-@MODELS.register_module()
+@HEADS.register_module()
 class ShapeAwareHead(Anchor3DHead):
     """Shape-aware grouping head for SSN.
 
     Args:
         tasks (dict): Shape-aware groups of multi-class objects.
-        assign_per_class (bool): Whether to do assignment for each
+        assign_per_class (bool, optional): Whether to do assignment for each \
             class. Default: True.
-        init_cfg (dict or list[dict], optional): Initialization config dict.
+        kwargs (dict): Other arguments are the same as those in \
+            :class:`Anchor3DHead`.
     """
 
-    def __init__(self,
-                 tasks: Dict,
-                 assign_per_class: bool = True,
-                 init_cfg: Optional[dict] = None,
-                 **kwargs) -> Dict:
+    def __init__(self, tasks, assign_per_class=True, init_cfg=None, **kwargs):
         self.tasks = tasks
         self.featmap_sizes = []
         super().__init__(
@@ -206,10 +195,10 @@ class ShapeAwareHead(Anchor3DHead):
         self.heads = nn.ModuleList()
         cls_ptr = 0
         for task in self.tasks:
-            sizes = self.prior_generator.sizes[cls_ptr:cls_ptr +
-                                               task['num_class']]
+            sizes = self.anchor_generator.sizes[cls_ptr:cls_ptr +
+                                                task['num_class']]
             num_size = torch.tensor(sizes).reshape(-1, 3).size(0)
-            num_rot = len(self.prior_generator.rotations)
+            num_rot = len(self.anchor_generator.rotations)
             num_base_anchors = num_rot * num_size
             branch = dict(
                 type='BaseShapeHead',
@@ -219,16 +208,16 @@ class ShapeAwareHead(Anchor3DHead):
                 in_channels=self.in_channels,
                 shared_conv_channels=task['shared_conv_channels'],
                 shared_conv_strides=task['shared_conv_strides'])
-            self.heads.append(MODELS.build(branch))
+            self.heads.append(build_head(branch))
             cls_ptr += task['num_class']
 
-    def forward_single(self, x: Tensor) -> Tuple[Tensor]:
+    def forward_single(self, x):
         """Forward function on a single-scale feature map.
 
         Args:
             x (torch.Tensor): Input features.
         Returns:
-            tuple[torch.Tensor]: Contain score of each class, bbox
+            tuple[torch.Tensor]: Contain score of each class, bbox \
                 regression and direction classification predictions.
         """
         results = []
@@ -249,18 +238,15 @@ class ShapeAwareHead(Anchor3DHead):
         for i, task in enumerate(self.tasks):
             for _ in range(task['num_class']):
                 self.featmap_sizes.append(results[i]['featmap_size'])
-        assert len(self.featmap_sizes) == len(self.prior_generator.ranges), \
+        assert len(self.featmap_sizes) == len(self.anchor_generator.ranges), \
             'Length of feature map sizes must be equal to length of ' + \
             'different ranges of anchor generator.'
 
         return cls_score, bbox_pred, dir_cls_preds
 
-    def loss_single(self, cls_score: Tensor, bbox_pred: Tensor,
-                    dir_cls_preds: Tensor, labels: Tensor,
-                    label_weights: Tensor, bbox_targets: Tensor,
-                    bbox_weights: Tensor, dir_targets: Tensor,
-                    dir_weights: Tensor,
-                    num_total_samples: int) -> Tuple[Tensor]:
+    def loss_single(self, cls_score, bbox_pred, dir_cls_preds, labels,
+                    label_weights, bbox_targets, bbox_weights, dir_targets,
+                    dir_weights, num_total_samples):
         """Calculate loss of Single-level results.
 
         Args:
@@ -277,7 +263,7 @@ class ShapeAwareHead(Anchor3DHead):
             num_total_samples (int): The number of valid samples.
 
         Returns:
-            tuple[torch.Tensor]: Losses of class, bbox
+            tuple[torch.Tensor]: Losses of class, bbox \
                 and direction, respectively.
         """
         # classification loss
@@ -320,48 +306,46 @@ class ShapeAwareHead(Anchor3DHead):
 
         return loss_cls, loss_bbox, loss_dir
 
-    def loss_by_feat(
-            self,
-            cls_scores: List[Tensor],
-            bbox_preds: List[Tensor],
-            dir_cls_preds: List[Tensor],
-            batch_gt_instances_3d: InstanceList,
-            batch_input_metas: List[dict],
-            batch_gt_instances_ignore: OptInstanceList = None) -> Dict:
-        """Calculate the loss based on the features extracted by the detection
-        head.
+    def loss(self,
+             cls_scores,
+             bbox_preds,
+             dir_cls_preds,
+             gt_bboxes,
+             gt_labels,
+             input_metas,
+             gt_bboxes_ignore=None):
+        """Calculate losses.
 
         Args:
             cls_scores (list[torch.Tensor]): Multi-level class scores.
             bbox_preds (list[torch.Tensor]): Multi-level bbox predictions.
             dir_cls_preds (list[torch.Tensor]): Multi-level direction
                 class predictions.
-            batch_gt_instances_3d (list[:obj:`InstanceData`]): Batch of
-                gt_instances. It usually includes ``bboxes_3d`` and
-                ``labels_3d`` attributes.
-            batch_input_metas (list[dict]): Contain pcd and sample's meta info.
-            batch_gt_instances_ignore (list[:obj:`InstanceData`], optional):
-                Batch of gt_instances_ignore. It includes ``bboxes`` attribute
-                data that is ignored during training and testing.
-                Defaults to None.
+            gt_bboxes (list[:obj:`BaseInstance3DBoxes`]): Gt bboxes
+                of each sample.
+            gt_labels (list[torch.Tensor]): Gt labels of each sample.
+            input_metas (list[dict]): Contain pcd and img's meta info.
+            gt_bboxes_ignore (None | list[torch.Tensor]): Specify
+                which bounding.
 
         Returns:
-            dict[str, list[torch.Tensor]]: Classification, bbox, and
+            dict[str, list[torch.Tensor]]: Classification, bbox, and \
                 direction losses of each level.
 
                 - loss_cls (list[torch.Tensor]): Classification losses.
                 - loss_bbox (list[torch.Tensor]): Box regression losses.
-                - loss_dir (list[torch.Tensor]): Direction classification
+                - loss_dir (list[torch.Tensor]): Direction classification \
                     losses.
         """
         device = cls_scores[0].device
         anchor_list = self.get_anchors(
-            self.featmap_sizes, batch_input_metas, device=device)
+            self.featmap_sizes, input_metas, device=device)
         cls_reg_targets = self.anchor_target_3d(
             anchor_list,
-            batch_gt_instances_3d,
-            batch_input_metas,
-            batch_gt_instances_ignore=batch_gt_instances_ignore,
+            gt_bboxes,
+            input_metas,
+            gt_bboxes_ignore_list=gt_bboxes_ignore,
+            gt_labels_list=gt_labels,
             num_classes=self.num_classes,
             sampling=self.sampling)
 
@@ -389,23 +373,22 @@ class ShapeAwareHead(Anchor3DHead):
         return dict(
             loss_cls=losses_cls, loss_bbox=losses_bbox, loss_dir=losses_dir)
 
-    def predict_by_feat(self,
-                        cls_scores: List[Tensor],
-                        bbox_preds: List[Tensor],
-                        dir_cls_preds: List[Tensor],
-                        batch_input_metas: List[dict],
-                        cfg: Optional[dict] = None,
-                        rescale: List[Tensor] = False) -> List[tuple]:
-        """Transform a batch of output features extracted from the head into
-        bbox results.
+    def get_bboxes(self,
+                   cls_scores,
+                   bbox_preds,
+                   dir_cls_preds,
+                   input_metas,
+                   cfg=None,
+                   rescale=False):
+        """Get bboxes of anchor head.
 
         Args:
             cls_scores (list[torch.Tensor]): Multi-level class scores.
             bbox_preds (list[torch.Tensor]): Multi-level bbox predictions.
             dir_cls_preds (list[torch.Tensor]): Multi-level direction
                 class predictions.
-            batch_input_metas (list[dict]): Contain pcd and img's meta info.
-            cfg (:obj:`ConfigDict`, optional): Training or testing config.
+            input_metas (list[dict]): Contain pcd and img's meta info.
+            cfg (None | :obj:`ConfigDict`): Training or testing config.
                 Default: None.
             rescale (list[torch.Tensor], optional): Whether to rescale bbox.
                 Default: False.
@@ -418,13 +401,13 @@ class ShapeAwareHead(Anchor3DHead):
         num_levels = len(cls_scores)
         assert num_levels == 1, 'Only support single level inference.'
         device = cls_scores[0].device
-        mlvl_anchors = self.prior_generator.grid_anchors(
+        mlvl_anchors = self.anchor_generator.grid_anchors(
             self.featmap_sizes, device=device)
         # `anchor` is a list of anchors for different classes
         mlvl_anchors = [torch.cat(anchor, dim=0) for anchor in mlvl_anchors]
 
         result_list = []
-        for img_id in range(len(batch_input_metas)):
+        for img_id in range(len(input_metas)):
             cls_score_list = [
                 cls_scores[i][img_id].detach() for i in range(num_levels)
             ]
@@ -435,25 +418,22 @@ class ShapeAwareHead(Anchor3DHead):
                 dir_cls_preds[i][img_id].detach() for i in range(num_levels)
             ]
 
-            input_meta = batch_input_metas[img_id]
-            proposals = self._predict_by_feat_single(cls_score_list,
-                                                     bbox_pred_list,
-                                                     dir_cls_pred_list,
-                                                     mlvl_anchors, input_meta,
-                                                     cfg, rescale)
+            input_meta = input_metas[img_id]
+            proposals = self.get_bboxes_single(cls_score_list, bbox_pred_list,
+                                               dir_cls_pred_list, mlvl_anchors,
+                                               input_meta, cfg, rescale)
             result_list.append(proposals)
         return result_list
 
-    def _predict_by_feat_single(self,
-                                cls_scores: Tensor,
-                                bbox_preds: Tensor,
-                                dir_cls_preds: Tensor,
-                                mlvl_anchors: List[Tensor],
-                                input_meta: List[dict],
-                                cfg: Dict = None,
-                                rescale: List[Tensor] = False):
-        """Transform a single point's features extracted from the head into
-        bbox results.
+    def get_bboxes_single(self,
+                          cls_scores,
+                          bbox_preds,
+                          dir_cls_preds,
+                          mlvl_anchors,
+                          input_meta,
+                          cfg=None,
+                          rescale=False):
+        """Get bboxes of single branch.
 
         Args:
             cls_scores (torch.Tensor): Class score in single batch.
@@ -463,8 +443,8 @@ class ShapeAwareHead(Anchor3DHead):
             mlvl_anchors (List[torch.Tensor]): Multi-level anchors
                 in single batch.
             input_meta (list[dict]): Contain pcd and img's meta info.
-            cfg (:obj:`ConfigDict`): Training or testing config.
-            rescale (list[torch.Tensor]): whether to rescale bbox.
+            cfg (None | :obj:`ConfigDict`): Training or testing config.
+            rescale (list[torch.Tensor], optional): whether to rescale bbox. \
                 Default: False.
 
         Returns:
@@ -530,8 +510,4 @@ class ShapeAwareHead(Anchor3DHead):
                 dir_rot + self.dir_offset +
                 np.pi * dir_scores.to(bboxes.dtype))
         bboxes = input_meta['box_type_3d'](bboxes, box_dim=self.box_code_size)
-        results = InstanceData()
-        results.bboxes_3d = bboxes
-        results.scores_3d = scores
-        results.labels_3d = labels
-        return results
+        return bboxes, scores, labels

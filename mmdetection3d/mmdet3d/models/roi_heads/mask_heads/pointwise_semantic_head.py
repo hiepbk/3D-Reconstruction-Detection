@@ -1,19 +1,16 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Dict, Optional, Tuple
-
 import torch
-from mmdet.models.utils import multi_apply
-from mmengine.model import BaseModule
-from torch import Tensor
+from mmcv.runner import BaseModule
 from torch import nn as nn
 from torch.nn import functional as F
 
-from mmdet3d.registry import MODELS
-from mmdet3d.structures.bbox_3d import BaseInstance3DBoxes, rotation_3d_in_axis
-from mmdet3d.utils import InstanceList
+from mmdet3d.core.bbox.structures import rotation_3d_in_axis
+from mmdet3d.models.builder import build_loss
+from mmdet.core import multi_apply
+from mmdet.models import HEADS
 
 
-@MODELS.register_module()
+@HEADS.register_module()
 class PointwiseSemanticHead(BaseModule):
     """Semantic segmentation head for point-wise segmentation.
 
@@ -28,23 +25,23 @@ class PointwiseSemanticHead(BaseModule):
         loss_part (dict): Config of part prediction loss.
     """
 
-    def __init__(
-        self,
-        in_channels: int,
-        num_classes: int = 3,
-        extra_width: float = 0.2,
-        seg_score_thr: float = 0.3,
-        init_cfg: Optional[dict] = None,
-        loss_seg: dict = dict(
-            type='FocalLoss',
-            use_sigmoid=True,
-            reduction='sum',
-            gamma=2.0,
-            alpha=0.25,
-            loss_weight=1.0),
-        loss_part: dict = dict(
-            type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0)
-    ) -> None:
+    def __init__(self,
+                 in_channels,
+                 num_classes=3,
+                 extra_width=0.2,
+                 seg_score_thr=0.3,
+                 init_cfg=None,
+                 loss_seg=dict(
+                     type='FocalLoss',
+                     use_sigmoid=True,
+                     reduction='sum',
+                     gamma=2.0,
+                     alpha=0.25,
+                     loss_weight=1.0),
+                 loss_part=dict(
+                     type='CrossEntropyLoss',
+                     use_sigmoid=True,
+                     loss_weight=1.0)):
         super(PointwiseSemanticHead, self).__init__(init_cfg=init_cfg)
         self.extra_width = extra_width
         self.num_classes = num_classes
@@ -52,10 +49,10 @@ class PointwiseSemanticHead(BaseModule):
         self.seg_cls_layer = nn.Linear(in_channels, 1, bias=True)
         self.seg_reg_layer = nn.Linear(in_channels, 3, bias=True)
 
-        self.loss_seg = MODELS.build(loss_seg)
-        self.loss_part = MODELS.build(loss_part)
+        self.loss_seg = build_loss(loss_seg)
+        self.loss_part = build_loss(loss_part)
 
-    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+    def forward(self, x):
         """Forward pass.
 
         Args:
@@ -64,9 +61,9 @@ class PointwiseSemanticHead(BaseModule):
         Returns:
             dict: Part features, segmentation and part predictions.
 
-            - seg_preds (torch.Tensor): Segment predictions.
-            - part_preds (torch.Tensor): Part predictions.
-            - part_feats (torch.Tensor): Feature predictions.
+                - seg_preds (torch.Tensor): Segment predictions.
+                - part_preds (torch.Tensor): Part predictions.
+                - part_feats (torch.Tensor): Feature predictions.
         """
         seg_preds = self.seg_cls_layer(x)  # (N, 1)
         part_preds = self.seg_reg_layer(x)  # (N, 3)
@@ -81,22 +78,20 @@ class PointwiseSemanticHead(BaseModule):
         return dict(
             seg_preds=seg_preds, part_preds=part_preds, part_feats=part_feats)
 
-    def get_targets_single(self, voxel_centers: Tensor,
-                           gt_bboxes_3d: BaseInstance3DBoxes,
-                           gt_labels_3d: Tensor) -> Tuple[Tensor]:
+    def get_targets_single(self, voxel_centers, gt_bboxes_3d, gt_labels_3d):
         """generate segmentation and part prediction targets for a single
         sample.
 
         Args:
-            voxel_centers (torch.Tensor): The center of voxels in shape
+            voxel_centers (torch.Tensor): The center of voxels in shape \
                 (voxel_num, 3).
-            gt_bboxes_3d (:obj:`BaseInstance3DBoxes`): Ground truth boxes in
+            gt_bboxes_3d (:obj:`BaseInstance3DBoxes`): Ground truth boxes in \
                 shape (box_num, 7).
-            gt_labels_3d (torch.Tensor): Class labels of ground truths in
+            gt_labels_3d (torch.Tensor): Class labels of ground truths in \
                 shape (box_num).
 
         Returns:
-            tuple[torch.Tensor]: Segmentation targets with shape [voxel_num]
+            tuple[torch.Tensor]: Segmentation targets with shape [voxel_num] \
                 part prediction targets with shape [voxel_num, 3]
         """
         gt_bboxes_3d = gt_bboxes_3d.to(voxel_centers.device)
@@ -104,8 +99,8 @@ class PointwiseSemanticHead(BaseModule):
 
         part_targets = voxel_centers.new_zeros((voxel_centers.shape[0], 3),
                                                dtype=torch.float32)
-        box_idx = gt_bboxes_3d.points_in_boxes_part(voxel_centers)
-        enlarge_box_idx = enlarged_gt_boxes.points_in_boxes_part(
+        box_idx = gt_bboxes_3d.points_in_boxes(voxel_centers)
+        enlarge_box_idx = enlarged_gt_boxes.points_in_boxes(
             voxel_centers).long()
 
         gt_labels_pad = F.pad(
@@ -132,33 +127,31 @@ class PointwiseSemanticHead(BaseModule):
         part_targets = torch.clamp(part_targets, min=0)
         return seg_targets, part_targets
 
-    def get_targets(self, voxel_dict: dict,
-                    batch_gt_instances_3d: InstanceList) -> dict:
+    def get_targets(self, voxels_dict, gt_bboxes_3d, gt_labels_3d):
         """generate segmentation and part prediction targets.
 
         Args:
-            voxel_dict (dict): Contains information of voxels.
-            batch_gt_instances_3d (list[:obj:`InstanceData`]): Batch of
-                gt_instances. It usually includes ``bboxes_3d`` and
-                ``labels_3d`` attributes.
+            voxel_centers (torch.Tensor): The center of voxels in shape \
+                (voxel_num, 3).
+            gt_bboxes_3d (:obj:`BaseInstance3DBoxes`): Ground truth boxes in \
+                shape (box_num, 7).
+            gt_labels_3d (torch.Tensor): Class labels of ground truths in \
+                shape (box_num).
 
         Returns:
             dict: Prediction targets
 
-            - seg_targets (torch.Tensor): Segmentation targets
-                with shape [voxel_num].
-            - part_targets (torch.Tensor): Part prediction targets
-                with shape [voxel_num, 3].
+                - seg_targets (torch.Tensor): Segmentation targets \
+                    with shape [voxel_num].
+                - part_targets (torch.Tensor): Part prediction targets \
+                    with shape [voxel_num, 3].
         """
-        batch_size = len(batch_gt_instances_3d)
+        batch_size = len(gt_labels_3d)
         voxel_center_list = []
-        gt_bboxes_3d = []
-        gt_labels_3d = []
         for idx in range(batch_size):
-            coords_idx = voxel_dict['coors'][:, 0] == idx
-            voxel_center_list.append(voxel_dict['voxel_centers'][coords_idx])
-            gt_bboxes_3d.append(batch_gt_instances_3d[idx].bboxes_3d)
-            gt_labels_3d.append(batch_gt_instances_3d[idx].labels_3d)
+            coords_idx = voxels_dict['coors'][:, 0] == idx
+            voxel_center_list.append(voxels_dict['voxel_centers'][coords_idx])
+
         seg_targets, part_targets = multi_apply(self.get_targets_single,
                                                 voxel_center_list,
                                                 gt_bboxes_3d, gt_labels_3d)
@@ -166,8 +159,7 @@ class PointwiseSemanticHead(BaseModule):
         part_targets = torch.cat(part_targets, dim=0)
         return dict(seg_targets=seg_targets, part_targets=part_targets)
 
-    def loss(self, semantic_results: dict,
-             semantic_targets: dict) -> Dict[str, Tensor]:
+    def loss(self, semantic_results, semantic_targets):
         """Calculate point-wise segmentation and part prediction losses.
 
         Args:
@@ -184,8 +176,8 @@ class PointwiseSemanticHead(BaseModule):
         Returns:
             dict: Loss of segmentation and part prediction.
 
-            - loss_seg (torch.Tensor): Segmentation prediction loss.
-            - loss_part (torch.Tensor): Part prediction loss.
+                - loss_seg (torch.Tensor): Segmentation prediction loss.
+                - loss_part (torch.Tensor): Part prediction loss.
         """
         seg_preds = semantic_results['seg_preds']
         part_preds = semantic_results['part_preds']

@@ -1,16 +1,15 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Optional, Tuple
-
 import torch
 from mmcv.cnn import build_norm_layer
-from mmcv.ops import DynamicScatter
-from torch import Tensor, nn
+from mmcv.runner import force_fp32
+from torch import nn
 
-from mmdet3d.registry import MODELS
+from mmdet3d.ops import DynamicScatter
+from ..builder import VOXEL_ENCODERS
 from .utils import PFNLayer, get_paddings_indicator
 
 
-@MODELS.register_module()
+@VOXEL_ENCODERS.register_module()
 class PillarFeatureNet(nn.Module):
     """Pillar Feature Net.
 
@@ -34,35 +33,34 @@ class PillarFeatureNet(nn.Module):
             Defaults to dict(type='BN1d', eps=1e-3, momentum=0.01).
         mode (str, optional): The mode to gather point features. Options are
             'max' or 'avg'. Defaults to 'max'.
-        legacy (bool, optional): Whether to use the new behavior or
+        legacy (bool): Whether to use the new behavior or
             the original behavior. Defaults to True.
     """
 
     def __init__(self,
-                 in_channels: Optional[int] = 4,
-                 feat_channels: Optional[tuple] = (64, ),
-                 with_distance: Optional[bool] = False,
-                 with_cluster_center: Optional[bool] = True,
-                 with_voxel_center: Optional[bool] = True,
-                 voxel_size: Optional[Tuple[float]] = (0.2, 0.2, 4),
-                 point_cloud_range: Optional[Tuple[float]] = (0, -40, -3, 70.4,
-                                                              40, 1),
-                 norm_cfg: Optional[dict] = dict(
-                     type='BN1d', eps=1e-3, momentum=0.01),
-                 mode: Optional[str] = 'max',
-                 legacy: Optional[bool] = True):
+                 in_channels=4,
+                 feat_channels=(64, ),
+                 with_distance=False,
+                 with_cluster_center=True,
+                 with_voxel_center=True,
+                 voxel_size=(0.2, 0.2, 4),
+                 point_cloud_range=(0, -40, -3, 70.4, 40, 1),
+                 norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
+                 mode='max',
+                 legacy=True):
         super(PillarFeatureNet, self).__init__()
         assert len(feat_channels) > 0
         self.legacy = legacy
         if with_cluster_center:
             in_channels += 3
         if with_voxel_center:
-            in_channels += 3
+            in_channels += 2
         if with_distance:
             in_channels += 1
         self._with_distance = with_distance
         self._with_cluster_center = with_cluster_center
         self._with_voxel_center = with_voxel_center
+        self.fp16_enabled = False
         # Create PillarFeatureNet layers
         self.in_channels = in_channels
         feat_channels = [in_channels] + list(feat_channels)
@@ -86,14 +84,12 @@ class PillarFeatureNet(nn.Module):
         # Need pillar (voxel) size and x/y offset in order to calculate offset
         self.vx = voxel_size[0]
         self.vy = voxel_size[1]
-        self.vz = voxel_size[2]
         self.x_offset = self.vx / 2 + point_cloud_range[0]
         self.y_offset = self.vy / 2 + point_cloud_range[1]
-        self.z_offset = self.vz / 2 + point_cloud_range[2]
         self.point_cloud_range = point_cloud_range
 
-    def forward(self, features: Tensor, num_points: Tensor, coors: Tensor,
-                *args, **kwargs) -> Tensor:
+    @force_fp32(out_fp16=True)
+    def forward(self, features, num_points, coors):
         """Forward function.
 
         Args:
@@ -118,27 +114,21 @@ class PillarFeatureNet(nn.Module):
         dtype = features.dtype
         if self._with_voxel_center:
             if not self.legacy:
-                f_center = torch.zeros_like(features[:, :, :3])
+                f_center = torch.zeros_like(features[:, :, :2])
                 f_center[:, :, 0] = features[:, :, 0] - (
                     coors[:, 3].to(dtype).unsqueeze(1) * self.vx +
                     self.x_offset)
                 f_center[:, :, 1] = features[:, :, 1] - (
                     coors[:, 2].to(dtype).unsqueeze(1) * self.vy +
                     self.y_offset)
-                f_center[:, :, 2] = features[:, :, 2] - (
-                    coors[:, 1].to(dtype).unsqueeze(1) * self.vz +
-                    self.z_offset)
             else:
-                f_center = features[:, :, :3]
+                f_center = features[:, :, :2]
                 f_center[:, :, 0] = f_center[:, :, 0] - (
                     coors[:, 3].type_as(features).unsqueeze(1) * self.vx +
                     self.x_offset)
                 f_center[:, :, 1] = f_center[:, :, 1] - (
                     coors[:, 2].type_as(features).unsqueeze(1) * self.vy +
                     self.y_offset)
-                f_center[:, :, 2] = f_center[:, :, 2] - (
-                    coors[:, 1].type_as(features).unsqueeze(1) * self.vz +
-                    self.z_offset)
             features_ls.append(f_center)
 
         if self._with_distance:
@@ -158,10 +148,10 @@ class PillarFeatureNet(nn.Module):
         for pfn in self.pfn_layers:
             features = pfn(features, num_points)
 
-        return features.squeeze(1)
+        return features.squeeze()
 
 
-@MODELS.register_module()
+@VOXEL_ENCODERS.register_module()
 class DynamicPillarFeatureNet(PillarFeatureNet):
     """Pillar Feature Net using dynamic voxelization.
 
@@ -187,23 +177,18 @@ class DynamicPillarFeatureNet(PillarFeatureNet):
             Defaults to dict(type='BN1d', eps=1e-3, momentum=0.01).
         mode (str, optional): The mode to gather point features. Options are
             'max' or 'avg'. Defaults to 'max'.
-        legacy (bool, optional): Whether to use the new behavior or
-            the original behavior. Defaults to True.
     """
 
     def __init__(self,
-                 in_channels: Optional[int] = 4,
-                 feat_channels: Optional[tuple] = (64, ),
-                 with_distance: Optional[bool] = False,
-                 with_cluster_center: Optional[bool] = True,
-                 with_voxel_center: Optional[bool] = True,
-                 voxel_size: Optional[Tuple[float]] = (0.2, 0.2, 4),
-                 point_cloud_range: Optional[Tuple[float]] = (0, -40, -3, 70.4,
-                                                              40, 1),
-                 norm_cfg: Optional[dict] = dict(
-                     type='BN1d', eps=1e-3, momentum=0.01),
-                 mode: Optional[str] = 'max',
-                 legacy: Optional[bool] = True):
+                 in_channels=4,
+                 feat_channels=(64, ),
+                 with_distance=False,
+                 with_cluster_center=True,
+                 with_voxel_center=True,
+                 voxel_size=(0.2, 0.2, 4),
+                 point_cloud_range=(0, -40, -3, 70.4, 40, 1),
+                 norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
+                 mode='max'):
         super(DynamicPillarFeatureNet, self).__init__(
             in_channels,
             feat_channels,
@@ -213,8 +198,8 @@ class DynamicPillarFeatureNet(PillarFeatureNet):
             voxel_size=voxel_size,
             point_cloud_range=point_cloud_range,
             norm_cfg=norm_cfg,
-            mode=mode,
-            legacy=legacy)
+            mode=mode)
+        self.fp16_enabled = False
         feat_channels = [self.in_channels] + list(feat_channels)
         pfn_layers = []
         # TODO: currently only support one PFNLayer
@@ -236,20 +221,19 @@ class DynamicPillarFeatureNet(PillarFeatureNet):
         self.cluster_scatter = DynamicScatter(
             voxel_size, point_cloud_range, average_points=True)
 
-    def map_voxel_center_to_point(self, pts_coors: Tensor, voxel_mean: Tensor,
-                                  voxel_coors: Tensor) -> Tensor:
+    def map_voxel_center_to_point(self, pts_coors, voxel_mean, voxel_coors):
         """Map the centers of voxels to its corresponding points.
 
         Args:
             pts_coors (torch.Tensor): The coordinates of each points, shape
                 (M, 3), where M is the number of points.
-            voxel_mean (torch.Tensor): The mean or aggregated features of a
+            voxel_mean (torch.Tensor): The mean or aggreagated features of a
                 voxel, shape (N, C), where N is the number of voxels.
             voxel_coors (torch.Tensor): The coordinates of each voxel.
 
         Returns:
             torch.Tensor: Corresponding voxel centers of each points, shape
-                (M, C), where M is the number of points.
+                (M, C), where M is the numver of points.
         """
         # Step 1: scatter voxel into canvas
         # Calculate necessary things for canvas creation
@@ -276,7 +260,8 @@ class DynamicPillarFeatureNet(PillarFeatureNet):
         center_per_point = canvas[:, voxel_index.long()].t()
         return center_per_point
 
-    def forward(self, features: Tensor, coors: Tensor) -> Tensor:
+    @force_fp32(out_fp16=True)
+    def forward(self, features, coors):
         """Forward function.
 
         Args:
@@ -299,13 +284,11 @@ class DynamicPillarFeatureNet(PillarFeatureNet):
 
         # Find distance of x, y, and z from pillar center
         if self._with_voxel_center:
-            f_center = features.new_zeros(size=(features.size(0), 3))
+            f_center = features.new_zeros(size=(features.size(0), 2))
             f_center[:, 0] = features[:, 0] - (
                 coors[:, 3].type_as(features) * self.vx + self.x_offset)
             f_center[:, 1] = features[:, 1] - (
                 coors[:, 2].type_as(features) * self.vy + self.y_offset)
-            f_center[:, 2] = features[:, 2] - (
-                coors[:, 1].type_as(features) * self.vz + self.z_offset)
             features_ls.append(f_center)
 
         if self._with_distance:

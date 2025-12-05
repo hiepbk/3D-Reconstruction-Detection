@@ -1,15 +1,12 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Optional
-
 import torch
 from mmcv.cnn import build_norm_layer
-from torch import Tensor, nn
+from mmcv.runner import auto_fp16
+from torch import nn
 from torch.nn import functional as F
 
 
-def get_paddings_indicator(actual_num: Tensor,
-                           max_num: Tensor,
-                           axis: int = 0) -> Tensor:
+def get_paddings_indicator(actual_num, max_num, axis=0):
     """Create boolean mask by actually number of a padded tensor.
 
     Args:
@@ -50,13 +47,13 @@ class VFELayer(nn.Module):
     """
 
     def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 norm_cfg: Optional[dict] = dict(
-                     type='BN1d', eps=1e-3, momentum=0.01),
-                 max_out: Optional[bool] = True,
-                 cat_max: Optional[bool] = True):
+                 in_channels,
+                 out_channels,
+                 norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
+                 max_out=True,
+                 cat_max=True):
         super(VFELayer, self).__init__()
+        self.fp16_enabled = False
         self.cat_max = cat_max
         self.max_out = max_out
         # self.units = int(out_channels / 2)
@@ -64,7 +61,8 @@ class VFELayer(nn.Module):
         self.norm = build_norm_layer(norm_cfg, out_channels)[1]
         self.linear = nn.Linear(in_channels, out_channels, bias=False)
 
-    def forward(self, inputs: Tensor) -> Tensor:
+    @auto_fp16(apply_to=('inputs'), out_fp32=True)
+    def forward(self, inputs):
         """Forward function.
 
         Args:
@@ -115,23 +113,22 @@ class PFNLayer(nn.Module):
     Args:
         in_channels (int): Number of input channels.
         out_channels (int): Number of output channels.
-        norm_cfg (dict, optional): Config dict of normalization layers.
-            Defaults to dict(type='BN1d', eps=1e-3, momentum=0.01).
-        last_layer (bool, optional): If last_layer, there is no
-            concatenation of features. Defaults to False.
-        mode (str, optional): Pooling model to gather features inside voxels.
-            Defaults to 'max'.
+        norm_cfg (dict): Config dict of normalization layers
+        last_layer (bool): If last_layer, there is no concatenation of
+            features.
+        mode (str): Pooling model to gather features inside voxels.
+            Default to 'max'.
     """
 
     def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 norm_cfg: Optional[dict] = dict(
-                     type='BN1d', eps=1e-3, momentum=0.01),
-                 last_layer: Optional[bool] = False,
-                 mode: Optional[str] = 'max'):
+                 in_channels,
+                 out_channels,
+                 norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
+                 last_layer=False,
+                 mode='max'):
 
         super().__init__()
+        self.fp16_enabled = False
         self.name = 'PFNLayer'
         self.last_vfe = last_layer
         if not self.last_vfe:
@@ -144,10 +141,8 @@ class PFNLayer(nn.Module):
         assert mode in ['max', 'avg']
         self.mode = mode
 
-    def forward(self,
-                inputs: Tensor,
-                num_voxels: Optional[Tensor] = None,
-                aligned_distance: Optional[Tensor] = None) -> Tensor:
+    @auto_fp16(apply_to=('inputs'), out_fp32=True)
+    def forward(self, inputs, num_voxels=None, aligned_distance=None):
         """Forward function.
 
         Args:

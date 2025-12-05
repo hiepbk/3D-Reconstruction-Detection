@@ -1,11 +1,9 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
-
 import torch
-from mmengine import Config, DictAction
-from mmengine.registry import init_default_scope
+from mmcv import Config, DictAction
 
-from mmdet3d.registry import MODELS
+from mmdet3d.models import build_model
 
 try:
     from mmcv.cnn import get_model_complexity_info
@@ -43,6 +41,7 @@ def parse_args():
 
 
 def main():
+
     args = parse_args()
 
     if args.modality == 'point':
@@ -63,12 +62,25 @@ def main():
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
-    init_default_scope(cfg.get('default_scope', 'mmdet3d'))
+    # import modules from string list.
+    if cfg.get('custom_imports', None):
+        from mmcv.utils import import_modules_from_strings
+        import_modules_from_strings(**cfg['custom_imports'])
 
-    model = MODELS.build(cfg.model)
+    model = build_model(
+        cfg.model,
+        train_cfg=cfg.get('train_cfg'),
+        test_cfg=cfg.get('test_cfg'))
     if torch.cuda.is_available():
         model.cuda()
     model.eval()
+
+    if hasattr(model, 'forward_dummy'):
+        model.forward = model.forward_dummy
+    else:
+        raise NotImplementedError(
+            'FLOPs counter is currently not supported for {}'.format(
+                model.__class__.__name__))
 
     flops, params = get_model_complexity_info(model, input_shape)
     split_line = '=' * 30

@@ -1,15 +1,9 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Tuple
-
-import torch.nn as nn
 from mmdet.models.backbones import RegNet
-from torch import Tensor
-
-from mmdet3d.registry import MODELS
-from mmdet3d.utils import OptMultiConfig
+from ..builder import BACKBONES
 
 
-@MODELS.register_module()
+@BACKBONES.register_module()
 class NoStemRegNet(RegNet):
     """RegNet backbone without Stem for 3D detection.
 
@@ -22,7 +16,7 @@ class NoStemRegNet(RegNet):
             - wm (float): Quantization parameter to quantize the width.
             - depth (int): Depth of the backbone.
             - group_w (int): Width of group.
-            - bot_mul (float): Bottleneck ratio, i.e. expansion of bottleneck.
+            - bot_mul (float): Bottleneck ratio, i.e. expansion of bottlneck.
         strides (Sequence[int]): Strides of the first block of each stage.
         base_channels (int): Base channels after stem layer.
         in_channels (int): Number of input image channels. Normally 3.
@@ -64,19 +58,15 @@ class NoStemRegNet(RegNet):
         (1, 1008, 1, 1)
     """
 
-    def __init__(self,
-                 arch: dict,
-                 init_cfg: OptMultiConfig = None,
-                 **kwargs) -> None:
+    def __init__(self, arch, init_cfg=None, **kwargs):
         super(NoStemRegNet, self).__init__(arch, init_cfg=init_cfg, **kwargs)
 
-    def _make_stem_layer(self, in_channels: int,
-                         base_channels: int) -> nn.Module:
+    def _make_stem_layer(self, in_channels, base_channels):
         """Override the original function that do not initialize a stem layer
         since 3D detector's voxel encoder works like a stem layer."""
         return
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, ...]:
+    def forward(self, x):
         """Forward function of backbone.
 
         Args:

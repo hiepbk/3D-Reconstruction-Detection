@@ -1,48 +1,42 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Optional, Tuple, Union
-
 import torch
-from torch import Tensor
 from torch import nn as nn
 from torch.nn.functional import l1_loss, mse_loss, smooth_l1_loss
 
-from mmdet3d.registry import MODELS
+from mmdet.models.builder import LOSSES
 
 
-def chamfer_distance(
-        src: Tensor,
-        dst: Tensor,
-        src_weight: Union[Tensor, float] = 1.0,
-        dst_weight: Union[Tensor, float] = 1.0,
-        criterion_mode: str = 'l2',
-        reduction: str = 'mean') -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+def chamfer_distance(src,
+                     dst,
+                     src_weight=1.0,
+                     dst_weight=1.0,
+                     criterion_mode='l2',
+                     reduction='mean'):
     """Calculate Chamfer Distance of two sets.
 
     Args:
-        src (Tensor): Source set with shape [B, N, C] to
+        src (torch.Tensor): Source set with shape [B, N, C] to
             calculate Chamfer Distance.
-        dst (Tensor): Destination set with shape [B, M, C] to
+        dst (torch.Tensor): Destination set with shape [B, M, C] to
             calculate Chamfer Distance.
-        src_weight (Tensor or float): Weight of source loss. Defaults to 1.0.
-        dst_weight (Tensor or float): Weight of destination loss.
-            Defaults to 1.0.
+        src_weight (torch.Tensor or float): Weight of source loss.
+        dst_weight (torch.Tensor or float): Weight of destination loss.
         criterion_mode (str): Criterion mode to calculate distance.
-            The valid modes are 'smooth_l1', 'l1' or 'l2'. Defaults to 'l2'.
+            The valid modes are smooth_l1, l1 or l2.
         reduction (str): Method to reduce losses.
             The valid reduction method are 'none', 'sum' or 'mean'.
-            Defaults to 'mean'.
 
     Returns:
         tuple: Source and Destination loss with the corresponding indices.
 
-            - loss_src (Tensor): The min distance
-              from source to destination.
-            - loss_dst (Tensor): The min distance
-              from destination to source.
-            - indices1 (Tensor): Index the min distance point
-              for each point in source to destination.
-            - indices2 (Tensor): Index the min distance point
-              for each point in destination to source.
+            - loss_src (torch.Tensor): The min distance \
+                from source to destination.
+            - loss_dst (torch.Tensor): The min distance \
+                from destination to source.
+            - indices1 (torch.Tensor): Index the min distance point \
+                for each point in source to destination.
+            - indices2 (torch.Tensor): Index the min distance point \
+                for each point in destination to source.
     """
 
     if criterion_mode == 'smooth_l1':
@@ -78,25 +72,24 @@ def chamfer_distance(
     return loss_src, loss_dst, indices1, indices2
 
 
-@MODELS.register_module()
+@LOSSES.register_module()
 class ChamferDistance(nn.Module):
     """Calculate Chamfer Distance of two sets.
 
     Args:
         mode (str): Criterion mode to calculate distance.
-            The valid modes are 'smooth_l1', 'l1' or 'l2'. Defaults to 'l2'.
+            The valid modes are smooth_l1, l1 or l2.
         reduction (str): Method to reduce losses.
-            The valid reduction method are 'none', 'sum' or 'mean'.
-            Defaults to 'mean'.
-        loss_src_weight (float): Weight of loss_source. Defaults to l.0.
-        loss_dst_weight (float): Weight of loss_target. Defaults to 1.0.
+            The valid reduction method are none, sum or mean.
+        loss_src_weight (float): Weight of loss_source.
+        loss_dst_weight (float): Weight of loss_target.
     """
 
     def __init__(self,
-                 mode: str = 'l2',
-                 reduction: str = 'mean',
-                 loss_src_weight: float = 1.0,
-                 loss_dst_weight: float = 1.0) -> None:
+                 mode='l2',
+                 reduction='mean',
+                 loss_src_weight=1.0,
+                 loss_dst_weight=1.0):
         super(ChamferDistance, self).__init__()
 
         assert mode in ['smooth_l1', 'l1', 'l2']
@@ -106,38 +99,36 @@ class ChamferDistance(nn.Module):
         self.loss_src_weight = loss_src_weight
         self.loss_dst_weight = loss_dst_weight
 
-    def forward(
-        self,
-        source: Tensor,
-        target: Tensor,
-        src_weight: Union[Tensor, float] = 1.0,
-        dst_weight: Union[Tensor, float] = 1.0,
-        reduction_override: Optional[str] = None,
-        return_indices: bool = False,
-        **kwargs
-    ) -> Union[Tuple[Tensor, Tensor, Tensor, Tensor], Tuple[Tensor, Tensor]]:
+    def forward(self,
+                source,
+                target,
+                src_weight=1.0,
+                dst_weight=1.0,
+                reduction_override=None,
+                return_indices=False,
+                **kwargs):
         """Forward function of loss calculation.
 
         Args:
-            source (Tensor): Source set with shape [B, N, C] to
+            source (torch.Tensor): Source set with shape [B, N, C] to
                 calculate Chamfer Distance.
-            target (Tensor): Destination set with shape [B, M, C] to
+            target (torch.Tensor): Destination set with shape [B, M, C] to
                 calculate Chamfer Distance.
-            src_weight (Tensor | float):
+            src_weight (torch.Tensor | float, optional):
                 Weight of source loss. Defaults to 1.0.
-            dst_weight (Tensor | float):
+            dst_weight (torch.Tensor | float, optional):
                 Weight of destination loss. Defaults to 1.0.
             reduction_override (str, optional): Method to reduce losses.
                 The valid reduction method are 'none', 'sum' or 'mean'.
                 Defaults to None.
-            return_indices (bool): Whether to return indices.
+            return_indices (bool, optional): Whether to return indices.
                 Defaults to False.
 
         Returns:
-            tuple[Tensor]: If ``return_indices=True``, return losses of
-                source and target with their corresponding indices in the
-                order of ``(loss_source, loss_target, indices1, indices2)``.
-                If ``return_indices=False``, return
+            tuple[torch.Tensor]: If ``return_indices=True``, return losses of \
+                source and target with their corresponding indices in the \
+                order of ``(loss_source, loss_target, indices1, indices2)``. \
+                If ``return_indices=False``, return \
                 ``(loss_source, loss_target)``.
         """
         assert reduction_override in (None, 'none', 'mean', 'sum')
