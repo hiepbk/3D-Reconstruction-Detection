@@ -89,3 +89,31 @@ DOWNSAMPLE_BALL_QUERY_MAX_RADIUS = 0.5  # Maximum radius (meters) - adjust based
 DOWNSAMPLE_BALL_QUERY_SAMPLE_NUM = 16  # Maximum number of neighbors per anchor point
 DOWNSAMPLE_BALL_QUERY_ANCHOR_POINTS = 25000  # Number of FPS anchor points for ball_query
 
+# ============================================================================
+# Post-processing pipeline (mimic mmdet3d style)
+# Each step receives/returns a dict with at least: points, colors, polygon_mask
+# ============================================================================
+POST_PROCESSING_PIPELINE = [
+    # Voxel downsample (always runs if voxel_size is not None)
+    dict(
+        type="VoxelDownsample",
+        voxel_size=DOWNSAMPLE_VOXEL_SIZE,
+        point_cloud_range=DOWNSAMPLE_POINT_CLOUD_RANGE,
+    ),
+    # Density-aware ball query (optional)
+    dict(
+        type="BallQueryDownsample",
+        enabled=DOWNSAMPLE_USE_BALL_QUERY,
+        min_radius=DOWNSAMPLE_BALL_QUERY_MIN_RADIUS,
+        max_radius=DOWNSAMPLE_BALL_QUERY_MAX_RADIUS,
+        sample_num=DOWNSAMPLE_BALL_QUERY_SAMPLE_NUM,
+        anchor_points=DOWNSAMPLE_BALL_QUERY_ANCHOR_POINTS,
+    ),
+    # Uniform cap with FPS (optional)
+    dict(
+        type="FPSDownsample",
+        enabled=DOWNSAMPLE_USE_FPS,
+        num_points=DOWNSAMPLE_FPS_NUM_POINTS,
+    ),
+]
+

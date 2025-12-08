@@ -21,6 +21,7 @@ from scipy.spatial import cKDTree
 from depth_anything_3.api import DepthAnything3
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
+from post_process_utils import build_post_processing_pipeline, run_post_processing_pipeline
 
 # Import inference configuration
 # Add scripts directory to path to allow importing infer_config
@@ -1057,6 +1058,16 @@ def run_inference_for_frame(
     # Extract just the image paths in consistent order
     image_files = [path for _, path in image_paths]
     camera_order = [name for name, _ in image_paths]
+
+    # Normalize device to torch.device for post-processing checks
+    device_obj = torch.device(device)
+
+    # Build post-processing pipeline processors (mmdet3d-style)
+    pipeline_processors = build_post_processing_pipeline(
+        nusc_info.get('post_processing_pipeline', []),
+        downsample_fn=downsample_point_cloud_mmcv,
+        device=device_obj,
+    )
     
     print(f"  Camera order: {camera_order}")
     print(f"  Number of images for inference: {len(image_files)}")
@@ -1199,51 +1210,23 @@ def run_inference_for_frame(
                     
                     num_points_after_camera_downsample = len(combined_points)
                     print(f"  Total points in LiDAR frame (after per-camera downsampling): {num_points_after_camera_downsample} (was {total_points_before_downsample} before)")
-                    
-                    # Apply FPS or ball_query on combined point cloud if requested (optional final step)
-                    if nusc_info.get('downsample_use_ball_query', False):
-                        print(f"  Applying ball_query to final combined point cloud...")
-                        downsample_result = downsample_point_cloud_mmcv(
-                            combined_points,
-                            colors=combined_colors,
-                            polygon_mask=combined_polygon_mask,
-                            voxel_size=None,  # Skip voxelization, only ball_query
-                            use_fps=False,
-                            fps_num_points=None,
-                            point_cloud_range=None,
-                            use_ball_query=True,
-                            ball_query_min_radius=nusc_info.get('downsample_ball_query_min_radius', 0.0),
-                            ball_query_max_radius=nusc_info.get('downsample_ball_query_max_radius', 0.5),
-                            ball_query_sample_num=nusc_info.get('downsample_ball_query_sample_num', 16),
-                            ball_query_anchor_points=nusc_info.get('downsample_ball_query_anchor_points', 25000),
-                        )
-                        
-                        combined_points = downsample_result['points']
-                        combined_colors = downsample_result['colors']
-                        combined_polygon_mask = downsample_result['polygon_mask']
-                        
-                        num_points_after_ball_query = len(combined_points)
-                        print(f"  Points after ball_query: {num_points_after_ball_query}")
-                    elif nusc_info.get('downsample_use_fps', False) and nusc_info.get('downsample_fps_num_points', None) is not None:
-                        if len(combined_points) > nusc_info.get('downsample_fps_num_points', None):
-                            print(f"  Applying FPS to final combined point cloud...")
-                            downsample_result = downsample_point_cloud_mmcv(
-                                combined_points,
-                                colors=combined_colors,
-                                polygon_mask=combined_polygon_mask,
-                                voxel_size=None,  # Skip voxelization, only FPS
-                                use_fps=True,
-                                fps_num_points=nusc_info.get('downsample_fps_num_points', None),
-                                point_cloud_range=None,
-                                use_ball_query=False,
-                            )
-                            
-                            combined_points = downsample_result['points']
-                            combined_colors = downsample_result['colors']
-                            combined_polygon_mask = downsample_result['polygon_mask']
-                            
-                            num_points_after_fps = len(combined_points)
-                            print(f"  Points after FPS: {num_points_after_fps}")
+
+                    # Apply configurable post-processing pipeline (mmdet3d-style)
+                    pipeline_input = {
+                        'points': combined_points,
+                        'colors': combined_colors,
+                        'polygon_mask': combined_polygon_mask,
+                        'indices': None,
+                    }
+                    pipeline_output = run_post_processing_pipeline(
+                        pipeline_input,
+                        pipeline_processors,
+                    )
+
+                    combined_points = pipeline_output.get('points', combined_points)
+                    combined_colors = pipeline_output.get('colors', combined_colors)
+                    combined_polygon_mask = pipeline_output.get('polygon_mask', combined_polygon_mask)
+                    print(f"  Points after pipeline: {len(combined_points)}")
                     
                     # Create point cloud
                     pcd = o3d.geometry.PointCloud()
@@ -1443,6 +1426,7 @@ def main():
         nusc_info['downsample_ball_query_max_radius'] = cfg.DOWNSAMPLE_BALL_QUERY_MAX_RADIUS
         nusc_info['downsample_ball_query_sample_num'] = cfg.DOWNSAMPLE_BALL_QUERY_SAMPLE_NUM
         nusc_info['downsample_ball_query_anchor_points'] = cfg.DOWNSAMPLE_BALL_QUERY_ANCHOR_POINTS
+        nusc_info['post_processing_pipeline'] = cfg.POST_PROCESSING_PIPELINE
     
         success, _ = run_inference_for_frame(
             model=model,
