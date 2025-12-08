@@ -10,7 +10,6 @@ Usage:
 import argparse
 import csv
 import os
-import sys
 import threading
 
 import numpy as np
@@ -18,20 +17,20 @@ import open3d as o3d
 import torch
 import cv2
 from scipy.spatial import cKDTree
-from depth_anything_3.api import DepthAnything3
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
-from post_process_utils import build_post_processing_pipeline, run_post_processing_pipeline
+from mmcv import Config, DictAction
+from mmcv.utils import import_modules_from_strings
 
-# Import inference configuration
-# Add scripts directory to path to allow importing infer_config
-script_dir = os.path.dirname(os.path.abspath(__file__))
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
-import infer_config as cfg
+# Project package imports (projects is a package with __init__.py)
+from projects.mmdet3d_plugin.models.depth_anything_3.api import DepthAnything3
+from projects.mmdet3d_plugin.core.post_processing.da3_post_processing import (
+    build_post_processing_pipeline,
+    run_post_processing_pipeline,
+)
 
 
-def get_nusc_info(nusc, sample):
+def get_nusc_info(nusc, sample, cfg):
     """
     Get nuScenes information for all cameras from a sample.
     Extracts camera-to-LiDAR transformations for all cameras in the sample.
@@ -94,7 +93,7 @@ def get_nusc_info(nusc, sample):
     return nusc_info
 
 
-def get_camera_images_from_sample(nusc, sample, data_dir):
+def get_camera_images_from_sample(nusc, sample, data_dir, cfg):
     """
     Get camera image paths from a sample in CAM_TYPES order.
     
@@ -325,6 +324,7 @@ def load_point_cloud_from_prediction(
     conf_thresh_percentile=None,
     filter_sky=True,
     polygon_by_camera=None,
+    cfg=None,
 ):
     """
     Load point cloud from prediction results.
@@ -491,7 +491,7 @@ def load_point_cloud_from_prediction(
     return result
 
 
-def display_camera_images(image_paths, sample_token, polygon_by_camera=None):
+def display_camera_images(image_paths, sample_token, polygon_by_camera=None, cfg=None):
     """
     Display all 6 camera images in a 2x3 grid layout using OpenCV (thread-safe).
     
@@ -602,7 +602,7 @@ def display_camera_images(image_paths, sample_token, polygon_by_camera=None):
         cv2.destroyWindow(window_name)
 
 
-def display_camera_images_threaded(image_paths, sample_token, polygon_by_camera=None):
+def display_camera_images_threaded(image_paths, sample_token, polygon_by_camera=None, cfg=None):
     """
     Display camera images in a separate thread (for simultaneous windows).
     
@@ -611,7 +611,7 @@ def display_camera_images_threaded(image_paths, sample_token, polygon_by_camera=
         sample_token: Sample token for window title
     """
     def _display():
-        display_camera_images(image_paths, sample_token, polygon_by_camera)
+        display_camera_images(image_paths, sample_token, polygon_by_camera, cfg)
     
     thread = threading.Thread(target=_display, daemon=False)
     thread.start()
@@ -1040,10 +1040,7 @@ def run_inference_for_frame(
     image_paths,
     output_dir,
     device,
-    export_format="glb",
-    ref_view_strategy="saddle_balanced",
-    use_ray_pose=False,
-    max_points=1_000_000,
+    cfg,
     display=True,
     nusc_info=None,
 ):
@@ -1079,193 +1076,199 @@ def run_inference_for_frame(
     
     
     
-    try:
-        # Prepare export_kwargs for GLB export filtering options
-        export_kwargs = {}
-        if "glb" in export_format:
-            export_kwargs["glb"] = {
-                "sky_depth_def": cfg.GLB_CONFIG["sky_depth_def"],
-                "conf_thresh_percentile": cfg.GLB_CONFIG["conf_thresh_percentile"],
-                "filter_black_bg": cfg.GLB_CONFIG["filter_black_bg"],
-                "filter_white_bg": cfg.GLB_CONFIG["filter_white_bg"],
-            }
-        
-        # Run inference (no extrinsics/intrinsics - model estimates them!)
-        prediction = model.inference(
-            image=image_files,
-            export_dir=frame_output_dir,
-            export_format=export_format,
-            ref_view_strategy=ref_view_strategy,
-            use_ray_pose=use_ray_pose,
-            num_max_points=max_points,
-            export_kwargs=export_kwargs if export_kwargs else None,
+    # Prepare export_kwargs for GLB export filtering options
+    export_kwargs = {}
+    if "glb" in cfg.EXPORT_FORMAT:
+        export_kwargs["glb"] = {
+            "sky_depth_def": cfg.GLB_CONFIG["sky_depth_def"],
+            "conf_thresh_percentile": cfg.GLB_CONFIG["conf_thresh_percentile"],
+            "filter_black_bg": cfg.GLB_CONFIG["filter_black_bg"],
+            "filter_white_bg": cfg.GLB_CONFIG["filter_white_bg"],
+        }
+
+    # Run inference (no extrinsics/intrinsics - model estimates them!)
+    prediction = model.inference(
+        image=image_files,
+        export_dir=frame_output_dir,
+        export_format=cfg.EXPORT_FORMAT,
+        ref_view_strategy=cfg.REF_VIEW_STRATEGY,
+        use_ray_pose=cfg.USE_RAY_POSE,
+        num_max_points=cfg.MAX_POINTS,
+        export_kwargs=export_kwargs if export_kwargs else None,
+    )
+
+    print(f"✓ Successfully processed sample {sample_token}")
+    print(f"  Output directory: {frame_output_dir}")
+
+    # Display camera images and point cloud simultaneously
+    if display:
+        # Display camera images (all 6 cameras) in a separate thread (OpenCV is thread-safe)
+        camera_thread = display_camera_images_threaded(image_paths, sample_token, nusc_info['polygon_by_camera'], cfg)
+
+        # Load point clouds from prediction (points stay in camera coordinates)
+        # Apply filtering for sky, confidence, and max depth
+        pcd_data = load_point_cloud_from_prediction(
+            prediction, 
+            image_paths,
+            max_depth=cfg.GLB_CONFIG["max_depth"],
+            conf_thresh_percentile=cfg.GLB_CONFIG["conf_thresh_percentile"],
+            polygon_by_camera=nusc_info['polygon_by_camera'],
+            cfg=cfg,
         )
-        
-        print(f"✓ Successfully processed sample {sample_token}")
-        print(f"  Output directory: {frame_output_dir}")
-        
-        # Display camera images and point cloud simultaneously
-        if display:
-            # Display camera images (all 6 cameras) in a separate thread (OpenCV is thread-safe)
-            camera_thread = display_camera_images_threaded(image_paths, sample_token, nusc_info['polygon_by_camera'])
-            
-            
-            # Load point clouds from prediction (points stay in camera coordinates)
-            # Apply filtering for sky, confidence, and max depth
-            pcd_data = load_point_cloud_from_prediction(
-                prediction, 
-                image_paths,
-                max_depth=cfg.GLB_CONFIG["max_depth"],
-                conf_thresh_percentile=cfg.GLB_CONFIG["conf_thresh_percentile"],
-                polygon_by_camera=nusc_info['polygon_by_camera'],
-            )
-            
-            if pcd_data and pcd_data['points_by_camera']:
-                # Transform each camera's points from camera coordinates to LiDAR coordinates
-                # using ground truth extrinsics from nuScenes (not model's predicted extrinsics)
-                all_points_lidar = []
-                all_colors = []
-                all_polygon_mask = []
-                
-                print(f"  Transforming points from camera coordinates to LiDAR coordinates...")
-                total_points_before_downsample = 0
-                for cam_name in pcd_data['camera_order']:
-                    if cam_name in pcd_data['points_by_camera']:
-                        points_cam = pcd_data['points_by_camera'][cam_name]
-                        
-                        # Check if we have transformation for this camera
-                        if cam_name in nusc_info:
-                            # Transform points from camera coordinates to LiDAR coordinates
-                            # using ground truth extrinsics from nuScenes
-                            R = nusc_info[cam_name]['cam2lidar_rotation']
-                            T = nusc_info[cam_name]['cam2lidar_translation']
-                            
-                            # Transform: points_lidar = points_cam @ R.T + T
-                            points_lidar = points_cam @ R.T + T
-                            
-                            # Get colors if available
-                            cam_colors = None
-                            if cam_name in pcd_data['colors_by_camera']:
-                                cam_colors = pcd_data['colors_by_camera'][cam_name]
-                            
-                            # Get polygon mask if available
-                            cam_polygon_mask = None
-                            if cam_name in pcd_data['polygon_mask_by_camera']:
-                                cam_polygon_mask = pcd_data['polygon_mask_by_camera'][cam_name]
-                            
-                            # DOWNSAMPLE PER CAMERA BEFORE COMBINING (much more memory efficient!)
-                            # This avoids building huge KDTree on 600k+ points
-                            if nusc_info.get('downsample_voxel_size', None) is not None:
-                                num_points_before = len(points_lidar)
-                                total_points_before_downsample += num_points_before
-                                
-                                downsample_result = downsample_point_cloud_mmcv(
-                                    points_lidar,
-                                    colors=cam_colors,
-                                    polygon_mask=cam_polygon_mask,
-                                    voxel_size=nusc_info.get('downsample_voxel_size', 0.1),
-                                    use_fps=False,  # Don't use FPS per camera, only on final combined if needed
-                                    fps_num_points=None,
-                                    point_cloud_range=nusc_info.get('downsample_point_cloud_range', None),
-                                    use_ball_query=False,  # Don't use ball_query per camera, only on final combined if needed
-                                    ball_query_min_radius=nusc_info.get('downsample_ball_query_min_radius', 0.0),
-                                    ball_query_max_radius=nusc_info.get('downsample_ball_query_max_radius', 0.5),
-                                    ball_query_sample_num=nusc_info.get('downsample_ball_query_sample_num', 16),
-                                    ball_query_anchor_points=nusc_info.get('downsample_ball_query_anchor_points', 25000),
-                                )
-                                
-                                points_lidar = downsample_result['points']
-                                cam_colors = downsample_result['colors']
-                                cam_polygon_mask = downsample_result['polygon_mask']
-                                
-                                num_points_after = len(points_lidar)
-                                reduction = num_points_before - num_points_after
-                                reduction_pct = (reduction / num_points_before * 100) if num_points_before > 0 else 0
-                                print(f"    {cam_name}: {len(points_cam)} points -> {num_points_before} points in LiDAR -> {num_points_after} after downsampling ({reduction_pct:.1f}% reduction)")
-                            else:
-                                total_points_before_downsample += len(points_lidar)
-                                print(f"    {cam_name}: {len(points_cam)} points -> {len(points_lidar)} points in LiDAR frame")
-                            
-                            all_points_lidar.append(points_lidar)
-                            
-                            if cam_colors is not None:
-                                all_colors.append(cam_colors)
-                            
-                            if cam_polygon_mask is not None:
-                                all_polygon_mask.append(cam_polygon_mask)
+
+        if pcd_data and pcd_data['points_by_camera']:
+            # Transform each camera's points from camera coordinates to LiDAR coordinates
+            # using ground truth extrinsics from nuScenes (not model's predicted extrinsics)
+            all_points_lidar = []
+            all_colors = []
+            all_polygon_mask = []
+
+            print(f"  Transforming points from camera coordinates to LiDAR coordinates...")
+            total_points_before_downsample = 0
+            for cam_name in pcd_data['camera_order']:
+                if cam_name in pcd_data['points_by_camera']:
+                    points_cam = pcd_data['points_by_camera'][cam_name]
+
+                    # Check if we have transformation for this camera
+                    if cam_name in nusc_info:
+                        # Transform points from camera coordinates to LiDAR coordinates
+                        # using ground truth extrinsics from nuScenes
+                        R = nusc_info[cam_name]['cam2lidar_rotation']
+                        T = nusc_info[cam_name]['cam2lidar_translation']
+
+                        # Transform: points_lidar = points_cam @ R.T + T
+                        points_lidar = points_cam @ R.T + T
+
+                        # Get colors if available
+                        cam_colors = None
+                        if cam_name in pcd_data['colors_by_camera']:
+                            cam_colors = pcd_data['colors_by_camera'][cam_name]
+
+                        # Get polygon mask if available
+                        cam_polygon_mask = None
+                        if cam_name in pcd_data['polygon_mask_by_camera']:
+                            cam_polygon_mask = pcd_data['polygon_mask_by_camera'][cam_name]
+
+                        # DOWNSAMPLE PER CAMERA BEFORE COMBINING (much more memory efficient!)
+                        # This avoids building huge KDTree on 600k+ points
+                        if nusc_info.get('downsample_voxel_size', None) is not None:
+                            num_points_before = len(points_lidar)
+                            total_points_before_downsample += num_points_before
+
+                            downsample_result = downsample_point_cloud_mmcv(
+                                points_lidar,
+                                colors=cam_colors,
+                                polygon_mask=cam_polygon_mask,
+                                voxel_size=nusc_info.get('downsample_voxel_size', 0.1),
+                                use_fps=False,  # Don't use FPS per camera, only on final combined if needed
+                                fps_num_points=None,
+                                point_cloud_range=nusc_info.get('downsample_point_cloud_range', None),
+                                use_ball_query=False,  # Don't use ball_query per camera, only on final combined if needed
+                                ball_query_min_radius=nusc_info.get('downsample_ball_query_min_radius', 0.0),
+                                ball_query_max_radius=nusc_info.get('downsample_ball_query_max_radius', 0.5),
+                                ball_query_sample_num=nusc_info.get('downsample_ball_query_sample_num', 16),
+                                ball_query_anchor_points=nusc_info.get('downsample_ball_query_anchor_points', 25000),
+                            )
+
+                            points_lidar = downsample_result['points']
+                            cam_colors = downsample_result['colors']
+                            cam_polygon_mask = downsample_result['polygon_mask']
+
+                            num_points_after = len(points_lidar)
+                            reduction = num_points_before - num_points_after
+                            reduction_pct = (reduction / num_points_before * 100) if num_points_before > 0 else 0
+                            print(f"    {cam_name}: {len(points_cam)} points -> {num_points_before} points in LiDAR -> {num_points_after} after downsampling ({reduction_pct:.1f}% reduction)")
                         else:
-                            print(f"    WARNING: No transformation found for {cam_name}, skipping...")
-                
-                if all_points_lidar:
-                    # Concatenate all points (already downsampled per camera)
-                    combined_points = np.concatenate(all_points_lidar, axis=0)
-                    combined_colors = None
-                    combined_polygon_mask = None
-                    
-                    if all_colors:
-                        combined_colors = np.concatenate(all_colors, axis=0)
-                    
-                    if all_polygon_mask:
-                        combined_polygon_mask = np.concatenate(all_polygon_mask, axis=0)
-                    
-                    num_points_after_camera_downsample = len(combined_points)
-                    print(f"  Total points in LiDAR frame (after per-camera downsampling): {num_points_after_camera_downsample} (was {total_points_before_downsample} before)")
+                            total_points_before_downsample += len(points_lidar)
+                            print(f"    {cam_name}: {len(points_cam)} points -> {len(points_lidar)} points in LiDAR frame")
 
-                    # Apply configurable post-processing pipeline (mmdet3d-style)
-                    pipeline_input = {
-                        'points': combined_points,
-                        'colors': combined_colors,
-                        'polygon_mask': combined_polygon_mask,
-                        'indices': None,
-                    }
-                    pipeline_output = run_post_processing_pipeline(
-                        pipeline_input,
-                        pipeline_processors,
-                    )
+                        all_points_lidar.append(points_lidar)
 
-                    combined_points = pipeline_output.get('points', combined_points)
-                    combined_colors = pipeline_output.get('colors', combined_colors)
-                    combined_polygon_mask = pipeline_output.get('polygon_mask', combined_polygon_mask)
-                    print(f"  Points after pipeline: {len(combined_points)}")
-                    
-                    # Create point cloud
-                    pcd = o3d.geometry.PointCloud()
-                    pcd.points = o3d.utility.Vector3dVector(combined_points)
-                    
-                    if combined_colors is not None:
-                        # Override colors for polygon points (red)
-                        if combined_polygon_mask is not None:
-                            # Set polygon points to red [1, 0, 0]
-                            combined_colors[combined_polygon_mask] = [1.0, 0.0, 0.0]
-                            print(f"  Colored {combined_polygon_mask.sum()} polygon points in red")
-                        
-                        pcd.colors = o3d.utility.Vector3dVector(combined_colors)
-                    
-                    print(f"  Total points in LiDAR frame (final): {len(combined_points)}")
-                    
-                    # Display point cloud in MAIN thread (Open3D/Qt requires main thread)
-                    print(f"  Both windows are open. Close both windows to continue...")
-                    display_point_cloud(pcd, sample_token, nusc_info['gt_lidar_boxes'])
-                else:
-                    print(f"  Warning: No valid points to display")
+                        if cam_colors is not None:
+                            all_colors.append(cam_colors)
+
+                        if cam_polygon_mask is not None:
+                            all_polygon_mask.append(cam_polygon_mask)
+                    else:
+                        print(f"    WARNING: No transformation found for {cam_name}, skipping...")
+
+            if all_points_lidar:
+                # Concatenate all points (already downsampled per camera)
+                combined_points = np.concatenate(all_points_lidar, axis=0)
+                combined_colors = None
+                combined_polygon_mask = None
+
+                if all_colors:
+                    combined_colors = np.concatenate(all_colors, axis=0)
+
+                if all_polygon_mask:
+                    combined_polygon_mask = np.concatenate(all_polygon_mask, axis=0)
+
+                num_points_after_camera_downsample = len(combined_points)
+                print(f"  Total points in LiDAR frame (after per-camera downsampling): {num_points_after_camera_downsample} (was {total_points_before_downsample} before)")
+
+                # Apply configurable post-processing pipeline (mmdet3d-style)
+                pipeline_input = {
+                    'points': combined_points,
+                    'colors': combined_colors,
+                    'polygon_mask': combined_polygon_mask,
+                    'indices': None,
+                }
+                pipeline_output = run_post_processing_pipeline(
+                    pipeline_input,
+                    pipeline_processors,
+                )
+
+                combined_points = pipeline_output.get('points', combined_points)
+                combined_colors = pipeline_output.get('colors', combined_colors)
+                combined_polygon_mask = pipeline_output.get('polygon_mask', combined_polygon_mask)
+                print(f"  Points after pipeline: {len(combined_points)}")
+
+                # Create point cloud
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(combined_points)
+
+                if combined_colors is not None:
+                    # Override colors for polygon points (red)
+                    if combined_polygon_mask is not None:
+                        # Set polygon points to red [1, 0, 0]
+                        combined_colors[combined_polygon_mask] = [1.0, 0.0, 0.0]
+                        print(f"  Colored {combined_polygon_mask.sum()} polygon points in red")
+
+                    pcd.colors = o3d.utility.Vector3dVector(combined_colors)
+
+                print(f"  Total points in LiDAR frame (final): {len(combined_points)}")
+
+                # Display point cloud in MAIN thread (Open3D/Qt requires main thread)
+                print(f"  Both windows are open. Close both windows to continue...")
+                display_point_cloud(pcd, sample_token, nusc_info['gt_lidar_boxes'])
             else:
-                print(f"  Warning: Could not load point cloud for display")
-            
-            # Wait for camera images window to close
-            camera_thread.join()
-        
-        return True, prediction
-        
-    except Exception as e:
-        print(f"✗ Error processing sample {sample_token}: {e}")
-        import traceback
-        traceback.print_exc()
-        return False, None
+                print(f"  Warning: No valid points to display")
+        else:
+            print(f"  Warning: Could not load point cloud for display")
+
+        # Wait for camera images window to close
+        camera_thread.join()
+
+    return True, prediction
 
 
 def main():
+    default_config = os.path.join("projects", "configs", "3d_reconstruction_detection_config.py")
     parser = argparse.ArgumentParser(
         description="Depth Anything 3 Inference for nuScenes-format datasets (sample-based iteration)"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=default_config,
+        help="Path to config file (mmdet3d-style)",
+    )
+    parser.add_argument(
+        "--cfg-options",
+        nargs="+",
+        action=DictAction,
+        help="Override config options, key=value format",
     )
     parser.add_argument(
         "--data_dir",
@@ -1305,6 +1308,34 @@ def main():
 
     args = parser.parse_args()
 
+    # Load config (mimic mmdet3d behavior)
+    cfg = Config.fromfile(args.config)
+    if args.cfg_options is not None:
+        cfg.merge_from_dict(args.cfg_options)
+
+    # Handle custom imports/plugins (mimic mmdet3d)
+    if cfg.get('custom_imports', None):
+        import_modules_from_strings(**cfg['custom_imports'])
+
+    if hasattr(cfg, 'plugin') and cfg.plugin:
+        import importlib
+        if hasattr(cfg, 'plugin_dir'):
+            plugin_dir = cfg.plugin_dir
+            _module_dir = os.path.dirname(plugin_dir)
+            _module_dir = _module_dir.split('/')
+            _module_path = _module_dir[0]
+            for m in _module_dir[1:]:
+                _module_path = _module_path + '.' + m
+            importlib.import_module(_module_path)
+        else:
+            _module_dir = os.path.dirname(args.config)
+            _module_dir = _module_dir.split('/')
+            _module_path = _module_dir[0]
+            for m in _module_dir[1:]:
+                _module_path = _module_path + '.' + m
+            import importlib
+            importlib.import_module(_module_path)
+
     # Check data directory
     if not os.path.isdir(args.data_dir):
         print(f"Error: Data directory does not exist: {args.data_dir}")
@@ -1324,9 +1355,9 @@ def main():
     print(f"{'='*60}")
     print(f"Data directory: {args.data_dir}")
     print(f"Output directory: {args.output_dir}")
-    print(f"Model: {cfg.MODEL_NAME} (from infer_config.py)")
+    print(f"Model: {cfg.MODEL_NAME} (from config)")
     print(f"Device: {device}")
-    print(f"Export format: {cfg.EXPORT_FORMAT} (from infer_config.py)")
+    print(f"Export format: {cfg.EXPORT_FORMAT} (from config)")
     print(f"Display point clouds: {not args.no_display}")
     print(f"{'='*60}\n")
 
@@ -1385,7 +1416,7 @@ def main():
         print(f"\n[{i}/{len(samples)}] Processing sample: {sample_token}")
         
         # Get camera images from sample in cfg.CAM_TYPES order
-        image_paths = get_camera_images_from_sample(nusc, sample, args.data_dir)
+        image_paths = get_camera_images_from_sample(nusc, sample, args.data_dir, cfg)
         
         if not image_paths:
             print(f"  Warning: No camera images found for sample {sample_token}, skipping...")
@@ -1410,7 +1441,7 @@ def main():
         
         
         # Get nuScenes info (transformations, boxes, etc.)
-        nusc_info = get_nusc_info(nusc, sample)
+        nusc_info = get_nusc_info(nusc, sample, cfg)
         if polygon_by_camera is not None:
             nusc_info['polygon_by_camera'] = polygon_by_camera
         else:
@@ -1434,12 +1465,9 @@ def main():
             image_paths=image_paths,
             output_dir=args.output_dir,
             device=device,
-            export_format=cfg.EXPORT_FORMAT,
-            ref_view_strategy=cfg.REF_VIEW_STRATEGY,
-            use_ray_pose=cfg.USE_RAY_POSE,
-            max_points=cfg.MAX_POINTS,
             display=not args.no_display,
             nusc_info=nusc_info,
+            cfg=cfg,
         )
         
         if success:

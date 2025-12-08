@@ -3,6 +3,9 @@ Inference configuration file for nuScenes inference script.
 Modify these settings to control model behavior and post-processing.
 """
 
+plugin = True
+plugin_dir = "projects/mmdet3d_plugin/"
+
 # ============================================================================
 # Camera Configuration
 # ============================================================================

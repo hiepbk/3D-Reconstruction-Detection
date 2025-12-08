@@ -80,7 +80,6 @@ pip install e3nn==0.4.0
 Navigate to the repository directory and install in editable mode:
 
 ```bash
-cd /hdd/hiep/CODE/Depth-Anything-3
 
 pip install -e . 
 ```
@@ -169,14 +168,15 @@ find mmdetection3d/mmdet3d/ops -name "*.so" -type f -delete
 ### Inference with nuScenes (Sample-based iteration)
 
 ```bash
-python -m scripts.inference_nuscenes \
+python -m tools.inference_nuscenes \
+    --config projects/configs/3d_reconstruction_detection_config.py \
     --data_dir /hdd/automotive_perception_group/kadif/NAS_KATECH_3D_DATASET/BATCH1/nuscenes_katech \
     --output_dir result \
     --sample_index 0 \
     --version v1.0-trainval
 
-
-python -m scripts.inference_nuscenes \
+python -m tools.inference_nuscenes \
+    --config projects/configs/3d_reconstruction_detection_config.py \
     --data_dir data/nuscenes_mini \
     --output_dir result \
     --sample_index 0 \
