@@ -77,7 +77,17 @@ train_pipeline = [
     # dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     # dict(type='PadMultiViewImage', size_divisor=32),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
-    dict(type='Collect3D', keys=['points', 'gt_bboxes_3d', 'gt_labels_3d'])
+    dict(
+        type='Collect3D',
+        keys=['points', 'gt_bboxes_3d', 'gt_labels_3d'],
+        meta_keys=(
+            'filename', 'ori_shape', 'img_shape',
+            'lidar2img', 'cam2lidar_rts',
+            'pad_shape', 'scale_factor',
+            'flip', 'pcd_horizontal_flip', 'pcd_vertical_flip',
+            'box_mode_3d', 'box_type_3d', 'img_norm_cfg',
+        ),
+    )
     # dict(type='Collect3D', keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'])
 ]
 test_pipeline = [
@@ -112,7 +122,17 @@ test_pipeline = [
                 type='DefaultFormatBundle3D',
                 class_names=class_names,
                 with_label=False),
-            dict(type='Collect3D', keys=['points', 'img'])
+            dict(
+                type='Collect3D',
+                keys=['points', 'img'],
+                meta_keys=(
+                    'filename', 'ori_shape', 'img_shape',
+                    'lidar2img', 'cam2lidar_rts',
+                    'pad_shape', 'scale_factor',
+                    'flip', 'pcd_horizontal_flip', 'pcd_vertical_flip',
+                    'box_mode_3d', 'box_type_3d', 'img_norm_cfg',
+                ),
+            )
         ])
 ]
 
@@ -128,22 +148,22 @@ respoint_post_processing_pipeline = [
                 type='VoxelDownsample',
                 voxel_size=0.1,
                 point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
-            ),
-            # Density-aware ball query (optional)
-            dict(
-                type='BallQueryDownsample',
-                enabled=True,
-                min_radius=0.0,
-                max_radius=0.5,
-                sample_num=16,
-                anchor_points=25000,
-            ),
-            # Uniform cap with FPS (optional)
-            dict(
-                type='FPSDownsample',
-                enabled=True,
-                num_points=40000,
-            ),
+            )
+            # # Density-aware ball query (optional)
+            # dict(
+            #     type='BallQueryDownsample',
+            #     enabled=True,
+            #     min_radius=0.0,
+            #     max_radius=0.5,
+            #     sample_num=16,
+            #     anchor_points=25000,
+            # ),
+            # # Uniform cap with FPS (optional)
+            # dict(
+            #     type='FPSDownsample',
+            #     enabled=True,
+            #     num_points=40000,
+            # ),
         ]
     ),
 ]

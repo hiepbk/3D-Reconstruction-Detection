@@ -109,7 +109,7 @@ class ResDet3D(MVXTwoStageDetector):
             # Set use_image_paths=True to use image paths directly (debug mode)
             # This bypasses preprocessing and uses DepthAnything3's inference() method
             # Change this to True to debug LoadMultiViewImageFromFiles preprocessing issues
-            generated_points = self.reconstruction_backbone(img, img_metas, use_image_paths=False)
+            generated_points = self.reconstruction_backbone(img, img_metas)
             # Store colors if available (from reconstruction_backbone._batch_colors)
             if hasattr(self.reconstruction_backbone, '_batch_colors'):
                 self._generated_colors = self.reconstruction_backbone._batch_colors

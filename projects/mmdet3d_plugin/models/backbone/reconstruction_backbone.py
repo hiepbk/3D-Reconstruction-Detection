@@ -1,6 +1,6 @@
 """
 Reconstruction Backbone for ResDet3D.
-Inherits from DepthAnything3 to generate point clouds from multi-view images.
+Wraps DepthAnything3 to generate point clouds from multi-view images.
 """
 
 import numpy as np
@@ -8,22 +8,30 @@ import copy
 import torch
 import torch.nn as nn
 from typing import Dict, List, Optional, Tuple
-
+from copy import deepcopy
 from mmdet.models.builder import BACKBONES
 from mmcv.parallel import DataContainer as DC
 from mmdet.datasets.pipelines import Compose
+
 
 from projects.mmdet3d_plugin.models.depth_anything_3.api import DepthAnything3
 from projects.mmdet3d_plugin.models.depth_anything_3.specs import Prediction
 from projects.mmdet3d_plugin.datasets.pipelines.respoint_post_processing import ResPointCloudPipeline
 
 
+
+
+# for debubggin
+import matplotlib.pyplot as plt
+import PIL.Image as Image
+import os
+
 @BACKBONES.register_module()
-class ReconstructionBackbone(DepthAnything3):
+class ReconstructionBackbone(nn.Module):
     """Reconstruction backbone that generates point clouds from multi-view images.
     
-    Inherits from DepthAnything3 to reuse its functionality (input_processor, model, etc.)
-    and overrides forward() to work with mmdet3d's data format.
+    Wraps DepthAnything3 (composition) instead of inheriting from it.
+    This avoids method signature conflicts and provides cleaner separation.
     
     This backbone:
     1. Takes multi-view images from mmdet3d data pipeline
@@ -33,15 +41,6 @@ class ReconstructionBackbone(DepthAnything3):
     5. Applies post-processing pipeline (voxel, ball_query, FPS)
     6. Returns point cloud in same format as bin file (numpy array or tensor)
     """
-    
-    def __new__(cls, pretrained: str, cache_dir: Optional[str] = None, **kwargs):
-        """Create instance using from_pretrained to avoid temporary instance."""
-        # Use parent's from_pretrained to create the instance with pretrained weights
-        # This already calls __init__ on the DepthAnything3 instance
-        instance = DepthAnything3.from_pretrained(pretrained, cache_dir=cache_dir)
-        # Change the class to ReconstructionBackbone
-        instance.__class__ = cls
-        return instance
     
     def __init__(
         self,
@@ -70,18 +69,17 @@ class ReconstructionBackbone(DepthAnything3):
             max_depth: Maximum depth threshold
             conf_thresh_percentile: Confidence threshold percentile
         """
-        # Note: __new__ already created and initialized the instance using from_pretrained
-        # So self.model, self.config, self.input_processor, etc. are already set up
-        # We just need to set ReconstructionBackbone-specific attributes
-        # Check if already initialized (from __new__) to avoid re-initialization
-        if hasattr(self, 'model') and hasattr(self, 'input_processor'):
-            # Already initialized by from_pretrained in __new__
-            print(f"[DEBUG] ReconstructionBackbone: Model already loaded from {pretrained}")
-        else:
-            # This shouldn't happen, but handle it just in case
-            raise RuntimeError("ReconstructionBackbone instance not properly initialized")
+        super(ReconstructionBackbone, self).__init__()
         
-        self.eval()  # Ensure eval mode
+        # Create wrapped DepthAnything3 model
+        print(f"[DEBUG] ReconstructionBackbone: Loading DepthAnything3 model from {pretrained}")
+        print(f"[DEBUG] ReconstructionBackbone: cache_dir = {cache_dir}")
+        self.da3_model = DepthAnything3.from_pretrained(pretrained, cache_dir=cache_dir)
+        self.da3_model.eval()
+        print(f"[DEBUG] ReconstructionBackbone: DepthAnything3 model loaded successfully")
+        
+        # Set to eval mode
+        self.eval()
         print(f"[DEBUG] ReconstructionBackbone: Model set to eval mode")
         
         # Store ReconstructionBackbone-specific config
@@ -99,6 +97,24 @@ class ReconstructionBackbone(DepthAnything3):
         self.filter_sky = filter_sky
         self.max_depth = max_depth or self.glb_config.get('max_depth', None)
         self.conf_thresh_percentile = conf_thresh_percentile or self.glb_config.get('conf_thresh_percentile', None)
+    
+    @property
+    def input_processor(self):
+        """Access wrapped model's input_processor."""
+        return self.da3_model.input_processor
+    
+    @property
+    def output_processor(self):
+        """Access wrapped model's output_processor."""
+        return self.da3_model.output_processor
+    
+    def _convert_to_prediction(self, raw_output: dict[str, torch.Tensor]) -> Prediction:
+        """Convert raw model output to Prediction object."""
+        return self.da3_model._convert_to_prediction(raw_output)
+    
+    def _add_processed_images(self, prediction: Prediction, imgs_cpu: torch.Tensor) -> Prediction:
+        """Add processed images to prediction for visualization."""
+        return self.da3_model._add_processed_images(prediction, imgs_cpu)
     
     def _extract_images_from_data(self, img: torch.Tensor) -> torch.Tensor:
         """Extract images from mmdet3d data format.
@@ -216,63 +232,194 @@ class ReconstructionBackbone(DepthAnything3):
     def _transform_points_cam_to_lidar(
         self,
         points_cam: np.ndarray,
-        lidar2img: np.ndarray,
+        cam2lidar_rt: np.ndarray,
         intrinsics: np.ndarray,
     ) -> np.ndarray:
         """Transform points from camera to LiDAR coordinates.
         
         Args:
             points_cam: Points in camera coordinates (N, 3)
-            lidar2img: LiDAR to image transformation (4, 4)
+            cam2lidar_rt: Camera to LiDAR transformation (4, 4)
             intrinsics: Camera intrinsics (3, 3)
         
         Returns:
             Points in LiDAR coordinates (N, 3)
         """
-        # From nuscenes_dataset.py:
-        # lidar2cam_r = inv(sensor2lidar_rotation)
-        # lidar2cam_t = sensor2lidar_translation @ lidar2cam_r.T
-        # lidar2cam_rt[:3, :3] = lidar2cam_r.T
-        # lidar2cam_rt[3, :3] = -lidar2cam_t
-        # viewpad[:3, :3] = intrinsic
-        # lidar2img = viewpad @ lidar2cam_rt.T
-        
-        # To extract cam2lidar:
-        # 1. Extract lidar2cam_rt from lidar2img
-        viewpad = np.eye(4)
-        viewpad[:3, :3] = intrinsics
-        viewpad_inv = np.linalg.inv(viewpad)
-        lidar2cam_rt_T = viewpad_inv @ lidar2img
-        lidar2cam_rt = lidar2cam_rt_T.T
-        
-        # 2. Extract rotation and translation from lidar2cam_rt
-        # lidar2cam_rt[:3, :3] = lidar2cam_r.T
-        # lidar2cam_rt[3, :3] = -lidar2cam_t
-        lidar2cam_r_T = lidar2cam_rt[:3, :3]
-        lidar2cam_r = lidar2cam_r_T.T
-        lidar2cam_t = -lidar2cam_rt[3, :3]
-        
-        # 3. Compute cam2lidar
-        cam2lidar_r = lidar2cam_r.T
-        cam2lidar_t = -lidar2cam_r.T @ lidar2cam_t
-        
-        # Transform points: points_lidar = points_cam @ R.T + T
-        points_lidar = points_cam @ cam2lidar_r.T + cam2lidar_t
-        
+        points_lidar = points_cam @ cam2lidar_rt[:3, :3] + cam2lidar_rt[3, :3]
+
         return points_lidar
+    
+    def _extract_image_paths_from_meta(self, img_meta: Dict) -> List[str]:
+        """Extract image file paths from img_meta.
+        
+        Args:
+            img_meta: Image metadata dict from mmdet3d pipeline
+        
+        Returns:
+            List of image file paths
+        """
+        # Try different possible keys where filenames might be stored
+        if 'filename' in img_meta:
+            filenames = img_meta['filename']
+            if isinstance(filenames, list):
+                return filenames
+            elif isinstance(filenames, str):
+                return [filenames]
+        elif 'img_filename' in img_meta:
+            filenames = img_meta['img_filename']
+            if isinstance(filenames, list):
+                return filenames
+            elif isinstance(filenames, str):
+                return [filenames]
+        
+        raise ValueError(f"Could not find image paths in img_meta. Available keys: {list(img_meta.keys())}")
+    
+    # def _forward_with_image_paths(self, img_metas: List[Dict], device: torch.device) -> List[torch.Tensor]:
+    #     """Forward pass using image paths directly (debug mode).
+        
+    #     This bypasses all preprocessing and uses DepthAnything3's inference() method
+    #     which handles image loading and preprocessing itself.
+        
+    #     Args:
+    #         img_metas: Image metadata list (one dict per batch item)
+    #         device: Device to place tensors on
+        
+    #     Returns:
+    #         List of point cloud tensors, one per batch item
+    #     """
+    #     batch_point_clouds = []
+        
+    #     for b_idx, meta_batch in enumerate(img_metas):
+    #         # Extract image paths
+    #         image_paths = self._extract_image_paths_from_meta(meta_batch)
+    #         print(f"[DEBUG] Using image paths mode for batch {b_idx}: {len(image_paths)} images")
+            
+    #         # Extract lidar2img transformations
+    #         lidar2img_list = self._extract_lidar2img_from_meta(meta_batch)
+            
+    #         # Use DepthAnything3's inference() method directly
+    #         # This handles all preprocessing internally
+    #         with torch.no_grad():
+    #             prediction = self.da3_model.inference(
+    #                 image=image_paths,  # List of image paths
+    #                 extrinsics=None,  # Let model estimate
+    #                 intrinsics=None,  # Let model estimate
+    #                 use_ray_pose=self.use_ray_pose,
+    #                 ref_view_strategy=self.ref_view_strategy,
+    #                 process_res=504,
+    #                 process_res_method="upper_bound_resize",
+    #             )
+            
+    #         # Get processed images for color extraction (already added by inference())
+    #         processed_images = None
+    #         if hasattr(prediction, 'processed_images') and prediction.processed_images is not None:
+    #             processed_images = prediction.processed_images  # (N, H, W, 3) in [0, 255]
+            
+    #         # Compute confidence threshold if needed
+    #         conf_thresh = None
+    #         if self.conf_thresh_percentile is not None and hasattr(prediction, 'conf') and prediction.conf is not None:
+    #             sky = getattr(prediction, 'sky', None)
+    #             if sky is not None and (~sky).sum() > 10:
+    #                 conf_pixels = prediction.conf[~sky]
+    #             else:
+    #                 conf_pixels = prediction.conf.flatten()
+    #             conf_thresh = np.percentile(conf_pixels, self.conf_thresh_percentile)
+            
+    #         # Back-project depth maps to point clouds (debug: keep camera-frame points)
+    #         all_points_lidar = []
+    #         all_colors = []
+            
+    #         # Debug: use only the first camera and keep camera-frame points (no cam->lidar transform)
+    #         for i in range(len(prediction.depth)):
+                
+    #             # debug 
+    #             i=0
+                
+    #             depth = prediction.depth[i]
+    #             intrinsics = prediction.intrinsics[i] if hasattr(prediction, 'intrinsics') else None
+                
+    #             if intrinsics is None:
+    #                 raise ValueError(f"Intrinsics not available for view {i} in batch {b_idx}")
+                
+    #             # Get sky mask and confidence for this view
+    #             sky_mask = prediction.sky[i] if hasattr(prediction, 'sky') and prediction.sky is not None else None
+    #             conf = prediction.conf[i] if hasattr(prediction, 'conf') and prediction.conf is not None else None
+                
+    #             # Get image for color extraction
+    #             image = None
+    #             if processed_images is not None and i < len(processed_images):
+    #                 image = processed_images[i]  # (H, W, 3) in [0, 255]
+                
+    #             # Back-project to camera coordinates
+    #             points_cam, colors = self._backproject_depth_to_points(
+    #                 depth,
+    #                 intrinsics,
+    #                 image=image,  # Pass image for color extraction
+    #                 max_depth=self.max_depth,
+    #                 conf=conf,
+    #                 conf_thresh=conf_thresh,
+    #                 sky_mask=sky_mask,
+    #                 filter_sky=self.filter_sky,
+    #             )
+                
+    #             if len(points_cam) == 0:
+    #                 raise ValueError(f"No points were generated for view {i} in batch {b_idx}")
+                
+    #             # Debug: do not transform to lidar; use camera-frame points directly
+    #             points_cam_dbg = points_cam
+    #             all_points_lidar.append(points_cam_dbg)
+    #             if colors is not None:
+    #                 all_colors.append(colors)
+
+    #             # Debug: only use the first camera/view
+    #             break
+            
+    #         if not all_points_lidar:
+    #             raise ValueError(f"No points were generated for batch {b_idx}")
+            
+    #         # Concatenate all points for this batch item
+    #         combined_points = np.concatenate(all_points_lidar, axis=0)
+    #         combined_colors = None
+    #         # Check if all_colors has elements and all are not None
+    #         if all_colors and all(c is not None for c in all_colors):
+    #             combined_colors = np.concatenate(all_colors, axis=0)
+            
+    #         # Apply post-processing pipeline
+    #         if self.post_pipeline is not None:
+    #             pipeline_input = {
+    #                 'points': combined_points,
+    #                 'colors': combined_colors,
+    #                 'polygon_mask': None,
+    #                 'indices': None,
+    #             }
+    #             pipeline_output = self.post_pipeline(pipeline_input)
+    #             combined_points = pipeline_output['points']
+    #             combined_colors = pipeline_output.get('colors')
+            
+    #         # Convert to tensor and add to batch results
+    #         points_tensor = torch.from_numpy(combined_points).float().to(device)
+    #         batch_point_clouds.append(points_tensor)
+            
+    #         # Store colors if available (for later access in inference)
+    #         if not hasattr(self, '_batch_colors'):
+    #             self._batch_colors = []
+    #         if combined_colors is not None:
+    #             # Store as numpy array (will be converted to tensor later if needed)
+    #             self._batch_colors.append(combined_colors)
+    #         else:
+    #             self._batch_colors.append(None)
+        
+    #     # Return list of point clouds, one per batch item
+    #     return batch_point_clouds
     
     def forward(
         self,
         img: torch.Tensor,
         img_metas: List[Dict],
         return_loss: bool = False,
-        use_image_paths: bool = False,  # Debug mode: use image paths instead of preprocessed tensors
+        # use_image_paths: bool = False,  # Debug mode: use image paths instead of preprocessed tensors
     ) -> List[torch.Tensor]:
         """Forward pass: generate point cloud from images.
-        
-        Overrides DepthAnything3.forward() to work with mmdet3d's data format.
-        Uses parent's forward() method to get depth maps, then back-projects to point clouds.
-        Supports batch size > 1 for training.
         
         Args:
             img: Multi-view images (B, N, 3, H, W) or DataContainer
@@ -292,13 +439,10 @@ class ReconstructionBackbone(DepthAnything3):
         if isinstance(img_metas, DC):
             img_metas = img_metas.data
         
-        # Debug mode: use image paths directly with inference() method
-        if use_image_paths:
-            return self._forward_with_image_paths(img_metas, device)
-        
         # Extract images from mmdet3d data format
         img_tensor = self._extract_images_from_data(img)
         B, N, C, H, W = img_tensor.shape
+        
         
         # Process each batch item separately
         batch_point_clouds = []
@@ -331,16 +475,10 @@ class ReconstructionBackbone(DepthAnything3):
             device = next(self.parameters()).device
             imgs_for_da3 = imgs_batch.to(device, non_blocking=True)[None].float()  # (1, N, 3, H, W)
             
-            # Extract metadata for this batch item
-            meta_batch = img_metas[b_idx] if isinstance(img_metas, list) else img_metas
-            
-            # Extract lidar2img transformations for this batch item
-            lidar2img_list = self._extract_lidar2img_from_meta(meta_batch)
-            
-            # Run DepthAnything3 forward (parent's forward method)
+            # Run DepthAnything3 forward (wrapped model's forward method)
             # This matches what _run_model_forward does in inference()
             with torch.no_grad():
-                da3_output = super().forward(
+                da3_output = self.da3_model.forward(
                     image=imgs_for_da3,
                     extrinsics=None,  # Let model estimate
                     intrinsics=None,  # Let model estimate
@@ -372,25 +510,39 @@ class ReconstructionBackbone(DepthAnything3):
                     conf_pixels = prediction.conf.flatten()
                 conf_thresh = np.percentile(conf_pixels, self.conf_thresh_percentile)
             
-            # Back-project depth maps to point clouds and transform to LiDAR
+            # Back-project depth maps to point clouds (debug: keep camera-frame points)
             all_points_lidar = []
             all_colors = []
-            
-            for i in range(len(prediction.depth)):
-                depth = prediction.depth[i]
-                intrinsics = prediction.intrinsics[i] if hasattr(prediction, 'intrinsics') else None
+            cam2lidar_rts = img_metas[b_idx]['cam2lidar_rts']
+            # Debug: use only the first camera and keep camera-frame points (no cam->lidar transform)
+            for cam_idx in range(len(prediction.depth)):
+                
+                
+                
+                # save raw image to output folder for debug
+                
+                output_dir = f"output/debug/batch_{b_idx}/cam_{cam_idx}"
+                os.makedirs(output_dir, exist_ok=True)
+                img = Image.fromarray(img_tensor[b_idx, cam_idx].cpu().numpy().transpose(1, 2, 0).astype(np.uint8))
+                
+                
+                
+                
+                
+                depth = prediction.depth[cam_idx]
+                intrinsics = prediction.intrinsics[cam_idx] if hasattr(prediction, 'intrinsics') else None
                 
                 if intrinsics is None:
-                    raise ValueError(f"Intrinsics not available for view {i} in batch {b_idx}")
+                    raise ValueError(f"Intrinsics not available for view {cam_idx} in batch {b_idx}")
                 
                 # Get sky mask and confidence for this view
-                sky_mask = prediction.sky[i] if hasattr(prediction, 'sky') and prediction.sky is not None else None
-                conf = prediction.conf[i] if hasattr(prediction, 'conf') and prediction.conf is not None else None
+                sky_mask = prediction.sky[cam_idx] if hasattr(prediction, 'sky') and prediction.sky is not None else None
+                conf = prediction.conf[cam_idx] if hasattr(prediction, 'conf') and prediction.conf is not None else None
                 
                 # Get image for color extraction
                 image = None
-                if processed_images is not None and i < len(processed_images):
-                    image = processed_images[i]  # (H, W, 3) in [0, 255]
+                if processed_images is not None and cam_idx < len(processed_images):
+                    image = processed_images[cam_idx]  # (H, W, 3) in [0, 255]
                 
                 # Back-project to camera coordinates
                 points_cam, colors = self._backproject_depth_to_points(
@@ -405,21 +557,21 @@ class ReconstructionBackbone(DepthAnything3):
                 )
                 
                 if len(points_cam) == 0:
-                    raise ValueError(f"No points were generated for view {i} in batch {b_idx}")
+                    raise ValueError(f"No points were generated for view {cam_idx} in batch {b_idx}")
                 
                 # Transform to LiDAR coordinates
-                if i < len(lidar2img_list):
-                    points_lidar = self._transform_points_cam_to_lidar(
-                        points_cam,
-                        lidar2img_list[i],
-                        intrinsics,
-                    )
-                else:
-                    raise ValueError(f"No lidar2img transformation available for view {i} in batch {b_idx}")
+                points_lidar = self._transform_points_cam_to_lidar(
+                    points_cam,
+                    cam2lidar_rts[cam_idx],
+                    intrinsics,
+                )
                 
-                all_points_lidar.append(points_lidar)
+                
+                # Debug: do not transform to lidar; use camera-frame points directly
+                all_points_lidar.append(deepcopy(points_lidar))
                 if colors is not None:
                     all_colors.append(colors)
+                
             
             if not all_points_lidar:
                 raise ValueError(f"No points were generated for batch {b_idx}")
@@ -431,7 +583,7 @@ class ReconstructionBackbone(DepthAnything3):
             if all_colors and all(c is not None for c in all_colors):
                 combined_colors = np.concatenate(all_colors, axis=0)
             
-            # Apply post-processing pipeline
+            # Apply post-processing pipeline (skip when debugging camera-frame points)
             if self.post_pipeline is not None:
                 pipeline_input = {
                     'points': combined_points,
