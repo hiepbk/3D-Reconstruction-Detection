@@ -189,9 +189,8 @@ class ReconstructionBackbone(nn.Module):
             filter_sky: Whether to filter sky
         
         Returns:
-            Tuple of (points_cam, colors) where:
-            - points_cam: (N, 3) points in camera coordinates
-            - colors: (N, 3) colors in [0, 1] range or None
+            points_cam: (N, 3) points in camera coordinates
+            colors: (N, 3) in [0,1] or None
         """
         H, W = depth.shape
         u, v = np.meshgrid(np.arange(W), np.arange(H))
@@ -222,21 +221,16 @@ class ReconstructionBackbone(nn.Module):
             valid = valid & (~sky_flat)  # Keep non-sky
         
         points_cam_valid = points_cam[valid]
-        
-        # Extract colors from image if available
-        colors = None
+        colors_valid = None
         if image is not None:
-            # image shape should be (H, W, 3) in [0, 255] range
-            # Reshape to (H*W, 3) and filter by valid mask
             colors_flat = image.reshape(-1, 3)[valid]
-            # Normalize to [0, 1] range
-            colors = colors_flat.astype(np.float32) / 255.0
-        
-        return points_cam_valid, colors
+            colors_valid = colors_flat.astype(np.float32) / 255.0  # [0,1]
+        return points_cam_valid, colors_valid
     
     def _transform_points_cam_to_lidar(
         self,
         points_cam: np.ndarray,
+        colors_cam: np.ndarray,
         cam2lidar_rt: np.ndarray,
         intrinsics: np.ndarray,
     ) -> np.ndarray:
@@ -244,6 +238,7 @@ class ReconstructionBackbone(nn.Module):
         
         Args:
             points_cam: Points in camera coordinates (N, 3)
+            colors_cam: Colors in camera coordinates (N, 3)
             cam2lidar_rt: Camera to LiDAR transformation (4, 4)
             intrinsics: Camera intrinsics (3, 3)
         
@@ -252,7 +247,7 @@ class ReconstructionBackbone(nn.Module):
         """
         points_lidar = points_cam @ cam2lidar_rt[:3, :3] + cam2lidar_rt[3, :3]
 
-        return points_lidar
+        return points_lidar, colors_cam
     
     def _extract_image_paths_from_meta(self, img_meta: Dict) -> List[str]:
         """Extract image file paths from img_meta.
@@ -517,12 +512,9 @@ class ReconstructionBackbone(nn.Module):
             
             # Back-project depth maps to point clouds
             all_points_lidar = []
-            all_colors = []
+            all_colors_lidar = []
             cam2lidar_rts = img_metas[b_idx]['cam2lidar_rts']
             for cam_idx in range(len(prediction.depth)):
-                
-                
-                
                 depth = prediction.depth[cam_idx]
                 intrinsics = prediction.intrinsics[cam_idx] if hasattr(prediction, 'intrinsics') else None
                 
@@ -540,11 +532,11 @@ class ReconstructionBackbone(nn.Module):
                     raw_img = np.array(Image.fromarray(raw_img).resize((depth.shape[1], depth.shape[0]), Image.BILINEAR))
                 image = raw_img
                 
-                # Back-project to camera coordinates
-                points_cam, colors = self._backproject_depth_to_points(
+                # Back-project to camera coordinates (returns xyz + colors)
+                points_cam, colors_cam = self._backproject_depth_to_points(
                     depth,
                     intrinsics,
-                    image=image,  # Pass image for color extraction
+                    image=image,
                     max_depth=self.max_depth,
                     conf=conf,
                     conf_thresh=conf_thresh,
@@ -554,31 +546,26 @@ class ReconstructionBackbone(nn.Module):
                 
                 if len(points_cam) == 0:
                     raise ValueError(f"No points were generated for view {cam_idx} in batch {b_idx}")
-                
+
                 # Transform to LiDAR coordinates
-                points_lidar = self._transform_points_cam_to_lidar(
+                points_lidar, colors_lidar = self._transform_points_cam_to_lidar(
                     points_cam,
+                    colors_cam,
                     cam2lidar_rts[cam_idx],
                     intrinsics,
                 )
                 
-                
                 all_points_lidar.append(points_lidar.copy())
-                if colors is not None:
-                    all_colors.append(colors)
-                
+                all_colors_lidar.append(colors_lidar.copy())
             
             if not all_points_lidar:
                 raise ValueError(f"No points were generated for batch {b_idx}")
             
             # Concatenate all points for this batch item
             combined_points = np.concatenate(all_points_lidar, axis=0)
-            combined_colors = None
-            # Check if all_colors has elements and all are not None
-            if all_colors and all(c is not None for c in all_colors):
-                combined_colors = np.concatenate(all_colors, axis=0)
+            combined_colors = np.concatenate(all_colors_lidar, axis=0)
             
-            # Apply post-processing pipeline (skip when debugging camera-frame points)
+            # Apply post-processing pipeline
             if self.post_pipeline is not None:
                 pipeline_input = {
                     'points': combined_points,
@@ -588,21 +575,12 @@ class ReconstructionBackbone(nn.Module):
                 }
                 pipeline_output = self.post_pipeline(pipeline_input)
                 combined_points = pipeline_output['points']
-                combined_colors = pipeline_output.get('colors')
-            
-            # Convert to tensor and add to batch results
-            points_tensor = torch.from_numpy(combined_points).float().to(device)
-            batch_point_clouds.append(points_tensor)
-            
-            # Store colors if available (for later access in inference)
-            if not hasattr(self, '_batch_colors'):
-                self._batch_colors = []
-            if combined_colors is not None:
-                # Store as numpy array (will be converted to tensor later if needed)
-                self._batch_colors.append(combined_colors)
-            else:
-                self._batch_colors.append(None)
-        
-        # Return list of point clouds, one per batch item
-        # This matches mmdet3d's convention: list[torch.Tensor] where each tensor is (N_points, 3)
+                combined_colors = pipeline_output['colors']
+                
+                
+                # merged points and colors to (N,6) xyzrgb
+ 
+                points_tensor = torch.from_numpy(np.concatenate([combined_points, combined_colors], axis=1)).float().to(device)
+                batch_point_clouds.append(points_tensor)
+
         return batch_point_clouds

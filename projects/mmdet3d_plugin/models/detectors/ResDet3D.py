@@ -105,14 +105,11 @@ class ResDet3D(MVXTwoStageDetector):
             tuple: (img_feats, pts_feats) where pts_feats is the generated point cloud
         """
         if self.reconstruction_backbone is not None:
-            # Generate point cloud from images
-            # Set use_image_paths=True to use image paths directly (debug mode)
-            # This bypasses preprocessing and uses DepthAnything3's inference() method
-            # Change this to True to debug LoadMultiViewImageFromFiles preprocessing issues
-            generated_points = self.reconstruction_backbone(img, img_metas)
+
+            pseudo_points = self.reconstruction_backbone(img, img_metas)
             # Return format matching parent class: (img_feats, pts_feats)
             # For now, img_feats is None since we're only using reconstruction
-            return (None, generated_points)
+            return (None, pseudo_points)
         else:
             # No reconstruction backbone, fall back to parent behavior
             return super().extract_feat(points, img, img_metas)
@@ -125,16 +122,16 @@ class ResDet3D(MVXTwoStageDetector):
         """
         if self.reconstruction_backbone is not None:
             # Extract features (generates point cloud)
-            img_feats, pts_feats = self.extract_feat(points, img=img, img_metas=img_metas)
+            img_feats, pseudo_points = self.extract_feat(points, img=img, img_metas=img_metas)
             
             # For now, return empty results since we don't have head/neck
             # Later, when head/neck are added, this will call simple_test_pts
             bbox_list = [dict() for i in range(len(img_metas))]
             
             # Store pseudo points and colors in result for potential use
-            if pts_feats is not None:
+            if pseudo_points is not None:
                 for i, result_dict in enumerate(bbox_list):
-                    result_dict['pseudo_points'] = pts_feats
+                    result_dict['pseudo_points'] = pseudo_points
                     # Colors are handled by backbone; none stored here
             
             return bbox_list

@@ -97,11 +97,6 @@ test_pipeline = [
         load_dim=5,
         use_dim=[0, 1, 2, 3, 4],
     ),
-    dict(
-        type='LoadPointsFromMultiSweeps',
-        sweeps_num=10,
-        use_dim=[0, 1, 2, 3, 4],
-    ),
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
     dict(
         type='MultiScaleFlipAug3D',

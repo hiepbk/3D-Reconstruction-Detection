@@ -407,38 +407,36 @@ def main():
     for i, result in enumerate(outputs):
         # Extract pseudo points from result if available
         if isinstance(result, dict) and 'pseudo_points' in result:
-            points = result['pseudo_points']
+            pseudo_points = result['pseudo_points']
+
+            # Unwrap list if single element
+            if isinstance(pseudo_points, list):
+                pseudo_points = pseudo_points[0] if len(pseudo_points) > 0 else None
             
-            # Handle list of tensors (batch size > 1) or single tensor
-            if isinstance(points, list):
-                # Take first item if it's a list (for batch processing)
-                points = points[0] if len(points) > 0 else None
-            
-            if points is not None:
+            if pseudo_points is not None:
                 # Convert to numpy if tensor
-                if isinstance(points, torch.Tensor):
-                    points = points.cpu().numpy()
+                if isinstance(pseudo_points, torch.Tensor):
+                    pseudo_points = pseudo_points.cpu().numpy()
                 
                 sample_token = f"sample_{i}"
-                print(f"✓ Generated pseudo point cloud with {len(points)} points for {sample_token}")
                 
-                # Extract colors if available
-                colors = result.get('pseudo_colors', None)
+                # Split xyz / colors if available
+                colors = None
+                points = pseudo_points
+                if pseudo_points.shape[1] >= 6:
+                    colors = pseudo_points[:, 3:]
+                    points = pseudo_points[:, :3]
+                
+                print(f"✓ Generated pseudo point cloud with {len(points)} points for {sample_token}")
                 if colors is not None:
-                    # Colors are already in [0, 1] range from reconstruction_backbone
-                    if isinstance(colors, np.ndarray):
-                        print(f"  Found colors with shape {colors.shape}")
-                    else:
-                        colors = None
+                    print(f"  Found colors with shape {colors.shape}")
                 
                 # Optionally save point cloud as PCD file
                 if args.output_dir:
-                    # Save as PCD file with colors
                     pcd_path = os.path.join(args.output_dir, f"{sample_token}_points.pcd")
                     save_point_cloud_pcd(points, pcd_path, colors=colors)
                     print(f"  Saved point cloud to {pcd_path}")
                     
-                    # Also save as numpy for compatibility
                     npy_path = os.path.join(args.output_dir, f"{sample_token}_points.npy")
                     np.save(npy_path, points)
                     print(f"  Saved point cloud (numpy) to {npy_path}")
