@@ -139,7 +139,12 @@ class ReconstructionBackbone(nn.Module):
         # Ensure batch dimension
         if img.dim() == 4:  # (N, 3, H, W)
             img = img.unsqueeze(0)  # (1, N, 3, H, W)
-        
+
+        # Convert BGR -> RGB (mmcv loads images in BGR by default).
+        # img shape is (B, N, 3, H, W); channel dimension is index 2
+        if img.shape[2] == 3:
+            img = img[:, :, [2, 1, 0], ...]
+
         return img
     
     def _extract_lidar2img_from_meta(self, meta: Dict) -> List[np.ndarray]:
@@ -510,22 +515,11 @@ class ReconstructionBackbone(nn.Module):
                     conf_pixels = prediction.conf.flatten()
                 conf_thresh = np.percentile(conf_pixels, self.conf_thresh_percentile)
             
-            # Back-project depth maps to point clouds (debug: keep camera-frame points)
+            # Back-project depth maps to point clouds
             all_points_lidar = []
             all_colors = []
             cam2lidar_rts = img_metas[b_idx]['cam2lidar_rts']
-            # Debug: use only the first camera and keep camera-frame points (no cam->lidar transform)
             for cam_idx in range(len(prediction.depth)):
-                
-                
-                
-                # save raw image to output folder for debug
-                
-                output_dir = f"output/debug/batch_{b_idx}/cam_{cam_idx}"
-                os.makedirs(output_dir, exist_ok=True)
-                img = Image.fromarray(img_tensor[b_idx, cam_idx].cpu().numpy().transpose(1, 2, 0).astype(np.uint8))
-                
-                
                 
                 
                 
@@ -539,10 +533,12 @@ class ReconstructionBackbone(nn.Module):
                 sky_mask = prediction.sky[cam_idx] if hasattr(prediction, 'sky') and prediction.sky is not None else None
                 conf = prediction.conf[cam_idx] if hasattr(prediction, 'conf') and prediction.conf is not None else None
                 
-                # Get image for color extraction
-                image = None
-                if processed_images is not None and cam_idx < len(processed_images):
-                    image = processed_images[cam_idx]  # (H, W, 3) in [0, 255]
+                # Get image for color extraction: use raw input only (true colors)
+                raw_img = img_tensor[b_idx, cam_idx].cpu().numpy().transpose(1, 2, 0).astype(np.uint8)
+                if raw_img.shape[0] != depth.shape[0] or raw_img.shape[1] != depth.shape[1]:
+                    from PIL import Image
+                    raw_img = np.array(Image.fromarray(raw_img).resize((depth.shape[1], depth.shape[0]), Image.BILINEAR))
+                image = raw_img
                 
                 # Back-project to camera coordinates
                 points_cam, colors = self._backproject_depth_to_points(
@@ -567,8 +563,7 @@ class ReconstructionBackbone(nn.Module):
                 )
                 
                 
-                # Debug: do not transform to lidar; use camera-frame points directly
-                all_points_lidar.append(deepcopy(points_lidar))
+                all_points_lidar.append(points_lidar.copy())
                 if colors is not None:
                     all_colors.append(colors)
                 

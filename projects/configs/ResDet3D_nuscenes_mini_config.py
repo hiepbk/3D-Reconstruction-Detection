@@ -144,26 +144,26 @@ respoint_post_processing_pipeline = [
         type='ResPointCloudPipeline',
         transforms=[
             # Voxel downsample (always runs if voxel_size is not None)
+            # dict(
+            #     type='VoxelDownsample',
+            #     voxel_size=0.1,
+            #     point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
+            # )
+            # Density-aware ball query (optional)
             dict(
-                type='VoxelDownsample',
-                voxel_size=0.1,
-                point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
-            )
-            # # Density-aware ball query (optional)
-            # dict(
-            #     type='BallQueryDownsample',
-            #     enabled=True,
-            #     min_radius=0.0,
-            #     max_radius=0.5,
-            #     sample_num=16,
-            #     anchor_points=25000,
-            # ),
-            # # Uniform cap with FPS (optional)
-            # dict(
-            #     type='FPSDownsample',
-            #     enabled=True,
-            #     num_points=40000,
-            # ),
+                type='BallQueryDownsample',
+                enabled=True,
+                min_radius=0.0,
+                max_radius=0.5,
+                sample_num=16,
+                anchor_points=25000,
+            ),
+            # Uniform cap with FPS (optional)
+            dict(
+                type='FPSDownsample',
+                enabled=True,
+                num_points=40000,
+            ),
         ]
     ),
 ]
