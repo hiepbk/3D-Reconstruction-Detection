@@ -39,7 +39,7 @@ class OutputProcessor:
     def __init__(self) -> None:
         """Initialize the output processor."""
 
-    def __call__(self, model_output: dict[str, torch.Tensor]) -> Prediction:
+    def __call__(self, model_output: dict[str, torch.Tensor], return_torch: bool = False) -> Prediction:
         """
         Convert model output to Prediction object.
 
@@ -52,13 +52,15 @@ class OutputProcessor:
             Prediction: Object containing depth estimation results with shapes:
                        depth (N, H, W), conf (N, H, W), extrinsics (N, 4, 4), intrinsics (N, 3, 3)
         """
+        device = self._infer_device(model_output)
+
         # Extract data from batch dimension (B=1, N=number of images)
-        depth = self._extract_depth(model_output)
-        conf = self._extract_conf(model_output)
-        extrinsics = self._extract_extrinsics(model_output)
-        intrinsics = self._extract_intrinsics(model_output)
-        sky = self._extract_sky(model_output)
-        aux = self._extract_aux(model_output)
+        depth = self._extract_depth(model_output, return_torch, device)
+        conf = self._extract_conf(model_output, return_torch, device)
+        extrinsics = self._extract_extrinsics(model_output, return_torch, device)
+        intrinsics = self._extract_intrinsics(model_output, return_torch, device)
+        sky = self._extract_sky(model_output, return_torch, device)
+        aux = self._extract_aux(model_output, return_torch, device)
         gaussians = model_output.get("gaussians", None)
         scale_factor = model_output.get("scale_factor", None)
 
@@ -74,7 +76,7 @@ class OutputProcessor:
             scale_factor=scale_factor,
         )
 
-    def _extract_depth(self, model_output: dict[str, torch.Tensor]) -> np.ndarray:
+    def _extract_depth(self, model_output: dict[str, torch.Tensor], return_torch: bool, device: torch.device):
         """
         Extract depth tensor from model output and convert to numpy.
 
@@ -82,12 +84,14 @@ class OutputProcessor:
             model_output: Model output dictionary
 
         Returns:
-            Depth array with shape (N, H, W)
+            Depth array/tensor with shape (N, H, W)
         """
-        depth = model_output["depth"].squeeze(0).squeeze(-1).cpu().numpy()  # (N, H, W)
-        return depth
+        depth_t = model_output["depth"].squeeze(0).squeeze(-1)  # (N, H, W)
+        if return_torch:
+            return depth_t.to(device)
+        return depth_t.cpu().numpy()
 
-    def _extract_conf(self, model_output: dict[str, torch.Tensor]) -> np.ndarray | None:
+    def _extract_conf(self, model_output: dict[str, torch.Tensor], return_torch: bool, device: torch.device):
         """
         Extract confidence tensor from model output and convert to numpy.
 
@@ -95,14 +99,18 @@ class OutputProcessor:
             model_output: Model output dictionary
 
         Returns:
-            Confidence array with shape (N, H, W) or None
+            Confidence array/tensor with shape (N, H, W) or None
         """
         conf = model_output.get("depth_conf", None)
         if conf is not None:
-            conf = conf.squeeze(0).cpu().numpy()  # (N, H, W)
+            conf = conf.squeeze(0)  # (N, H, W)
+            if return_torch:
+                conf = conf.to(device)
+            else:
+                conf = conf.cpu().numpy()
         return conf
 
-    def _extract_extrinsics(self, model_output: dict[str, torch.Tensor]) -> np.ndarray | None:
+    def _extract_extrinsics(self, model_output: dict[str, torch.Tensor], return_torch: bool, device: torch.device):
         """
         Extract extrinsics tensor from model output and convert to numpy.
 
@@ -110,14 +118,18 @@ class OutputProcessor:
             model_output: Model output dictionary
 
         Returns:
-            Extrinsics array with shape (N, 4, 4) or None
+            Extrinsics array/tensor with shape (N, 4, 4) or None
         """
         extrinsics = model_output.get("extrinsics", None)
         if extrinsics is not None:
-            extrinsics = extrinsics.squeeze(0).cpu().numpy()  # (N, 4, 4)
+            extrinsics = extrinsics.squeeze(0)  # (N, 4, 4)
+            if return_torch:
+                extrinsics = extrinsics.to(device)
+            else:
+                extrinsics = extrinsics.cpu().numpy()
         return extrinsics
 
-    def _extract_intrinsics(self, model_output: dict[str, torch.Tensor]) -> np.ndarray | None:
+    def _extract_intrinsics(self, model_output: dict[str, torch.Tensor], return_torch: bool, device: torch.device):
         """
         Extract intrinsics tensor from model output and convert to numpy.
 
@@ -125,14 +137,18 @@ class OutputProcessor:
             model_output: Model output dictionary
 
         Returns:
-            Intrinsics array with shape (N, 3, 3) or None
+            Intrinsics array/tensor with shape (N, 3, 3) or None
         """
         intrinsics = model_output.get("intrinsics", None)
         if intrinsics is not None:
-            intrinsics = intrinsics.squeeze(0).cpu().numpy()  # (N, 3, 3)
+            intrinsics = intrinsics.squeeze(0)  # (N, 3, 3)
+            if return_torch:
+                intrinsics = intrinsics.to(device)
+            else:
+                intrinsics = intrinsics.cpu().numpy()
         return intrinsics
 
-    def _extract_sky(self, model_output: dict[str, torch.Tensor]) -> np.ndarray | None:
+    def _extract_sky(self, model_output: dict[str, torch.Tensor], return_torch: bool, device: torch.device):
         """
         Extract sky tensor from model output and convert to numpy.
 
@@ -140,14 +156,18 @@ class OutputProcessor:
             model_output: Model output dictionary
 
         Returns:
-            Sky mask array with shape (N, H, W) or None
+            Sky mask array/tensor with shape (N, H, W) or None
         """
         sky = model_output.get("sky", None)
         if sky is not None:
-            sky = sky.squeeze(0).cpu().numpy() >= 0.5  # (N, H, W)
+            sky = sky.squeeze(0)  # (N, H, W)
+            if return_torch:
+                sky = (sky >= 0.5).to(device)
+            else:
+                sky = (sky.cpu().numpy() >= 0.5)
         return sky
 
-    def _extract_aux(self, model_output: dict[str, torch.Tensor]) -> AddictDict:
+    def _extract_aux(self, model_output: dict[str, torch.Tensor], return_torch: bool, device: torch.device) -> AddictDict:
         """
         Extract auxiliary data from model output and convert to numpy.
 
@@ -162,10 +182,18 @@ class OutputProcessor:
         if aux is not None:
             for k in aux.keys():
                 if isinstance(aux[k], torch.Tensor):
-                    ret[k] = aux[k].squeeze(0).cpu().numpy()
+                    tensor_k = aux[k].squeeze(0)
+                    ret[k] = tensor_k.to(device) if return_torch else tensor_k.cpu().numpy()
                 else:
                     ret[k] = aux[k]
         return ret
+
+    def _infer_device(self, model_output: dict[str, torch.Tensor]) -> torch.device:
+        """Infer device from any tensor in model_output; default to CPU."""
+        for v in model_output.values():
+            if isinstance(v, torch.Tensor):
+                return v.device
+        return torch.device("cpu")
 
 
 # Backward compatibility alias

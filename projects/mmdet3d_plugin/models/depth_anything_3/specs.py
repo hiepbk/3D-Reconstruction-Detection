@@ -33,13 +33,14 @@ class Gaussians:
 
 @dataclass
 class Prediction:
-    depth: np.ndarray  # N, H, W
+    # Accept either numpy arrays or torch tensors to support torch-only pipelines
+    depth: np.ndarray | torch.Tensor  # N, H, W
     is_metric: int
-    sky: np.ndarray | None = None  # N, H, W
-    conf: np.ndarray | None = None  # N, H, W
-    extrinsics: np.ndarray | None = None  # N, 4, 4
-    intrinsics: np.ndarray | None = None  # N, 3, 3
-    processed_images: np.ndarray | None = None  # N, H, W, 3 - processed images for visualization
+    sky: np.ndarray | torch.Tensor | None = None  # N, H, W
+    conf: np.ndarray | torch.Tensor | None = None  # N, H, W
+    extrinsics: np.ndarray | torch.Tensor | None = None  # N, 4, 4
+    intrinsics: np.ndarray | torch.Tensor | None = None  # N, 3, 3
+    processed_images: np.ndarray | torch.Tensor | None = None  # N, H, W, 3 - for visualization
     gaussians: Gaussians | None = None  # 3D gaussians
     aux: dict[str, Any] = None  #
     scale_factor: Optional[float] = None  # metric scale

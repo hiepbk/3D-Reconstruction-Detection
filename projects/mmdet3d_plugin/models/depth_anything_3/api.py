@@ -228,7 +228,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         )
 
         # Convert raw output to prediction
-        prediction = self._convert_to_prediction(raw_output)
+        prediction = self._convert_to_prediction(raw_output, return_torch=True)
 
         # Align prediction to extrinsincs
         prediction = self._align_to_input_extrinsics_intrinsics(
@@ -405,10 +405,10 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         logger.info(f"Model Forward Pass Done. Time: {end_time - start_time} seconds")
         return output
 
-    def _convert_to_prediction(self, raw_output: dict[str, torch.Tensor]) -> Prediction:
+    def _convert_to_prediction(self, raw_output: dict[str, torch.Tensor], return_torch: bool = False) -> Prediction:
         """Convert raw model output to Prediction object."""
         start_time = time.time()
-        output = self.output_processor(raw_output)
+        output = self.output_processor(raw_output, return_torch=return_torch)
         end_time = time.time()
         logger.info(f"Conversion to Prediction Done. Time: {end_time - start_time} seconds")
         return output

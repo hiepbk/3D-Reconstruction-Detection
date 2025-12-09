@@ -265,7 +265,8 @@ def main():
     )
     parser.add_argument(
         "--display",
-        action='store_true',
+        type=bool,
+        default=True,
         help="Display point cloud with colors",
     )
 
