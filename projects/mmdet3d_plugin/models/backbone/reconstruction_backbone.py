@@ -1,6 +1,6 @@
 """
 Reconstruction Backbone for ResDet3D.
-Wraps DepthAnything3 to generate point clouds from multi-view images.
+Inherits from DepthAnything3 to generate point clouds from multi-view images.
 """
 
 import numpy as np
@@ -13,24 +13,35 @@ from mmdet.models.builder import BACKBONES
 from mmcv.parallel import DataContainer as DC
 from mmdet.datasets.pipelines import Compose
 
-
 from projects.mmdet3d_plugin.models.depth_anything_3.api import DepthAnything3
 from projects.mmdet3d_plugin.models.depth_anything_3.specs import Prediction
 from projects.mmdet3d_plugin.datasets.pipelines.respoint_post_processing import ResPointCloudPipeline
 
 
 @BACKBONES.register_module()
-class ReconstructionBackbone(nn.Module):
+class ReconstructionBackbone(DepthAnything3):
     """Reconstruction backbone that generates point clouds from multi-view images.
+    
+    Inherits from DepthAnything3 to reuse its functionality (input_processor, model, etc.)
+    and overrides forward() to work with mmdet3d's data format.
     
     This backbone:
     1. Takes multi-view images from mmdet3d data pipeline
-    2. Runs DepthAnything3 forward to get depth maps
+    2. Uses DepthAnything3's forward() to get depth maps
     3. Back-projects depth maps to 3D point clouds
     4. Transforms points from camera to LiDAR coordinates using lidar2img
     5. Applies post-processing pipeline (voxel, ball_query, FPS)
     6. Returns point cloud in same format as bin file (numpy array or tensor)
     """
+    
+    def __new__(cls, pretrained: str, cache_dir: Optional[str] = None, **kwargs):
+        """Create instance using from_pretrained to avoid temporary instance."""
+        # Use parent's from_pretrained to create the instance with pretrained weights
+        # This already calls __init__ on the DepthAnything3 instance
+        instance = DepthAnything3.from_pretrained(pretrained, cache_dir=cache_dir)
+        # Change the class to ReconstructionBackbone
+        instance.__class__ = cls
+        return instance
     
     def __init__(
         self,
@@ -48,9 +59,9 @@ class ReconstructionBackbone(nn.Module):
         """Initialize ReconstructionBackbone.
         
         Args:
-            pretrained: Pretrained DepthAnything3 model name or path
+            pretrained: Pretrained DepthAnything3 model name or path (HuggingFace Hub identifier)
             cache_dir: Cache directory for model
-            post_processing_pipeline: List of post-processing step configs
+            respoint_post_processing_pipeline: List of post-processing step configs
             glb_config: GLB export config (for filtering)
             ref_view_strategy: Reference view selection strategy
             use_ray_pose: Use ray-based pose estimation
@@ -59,27 +70,28 @@ class ReconstructionBackbone(nn.Module):
             max_depth: Maximum depth threshold
             conf_thresh_percentile: Confidence threshold percentile
         """
-        super().__init__()
+        # Note: __new__ already created and initialized the instance using from_pretrained
+        # So self.model, self.config, self.input_processor, etc. are already set up
+        # We just need to set ReconstructionBackbone-specific attributes
+        # Check if already initialized (from __new__) to avoid re-initialization
+        if hasattr(self, 'model') and hasattr(self, 'input_processor'):
+            # Already initialized by from_pretrained in __new__
+            print(f"[DEBUG] ReconstructionBackbone: Model already loaded from {pretrained}")
+        else:
+            # This shouldn't happen, but handle it just in case
+            raise RuntimeError("ReconstructionBackbone instance not properly initialized")
         
-        # Store cache directory
-        self.cache_dir = cache_dir
-        
-        # Build DepthAnything3 model
-        print(f"[DEBUG] ReconstructionBackbone: Loading DepthAnything3 model from {pretrained}")
-        print(f"[DEBUG] ReconstructionBackbone: cache_dir = {cache_dir}")
-        self.da3_model = DepthAnything3.from_pretrained(pretrained, cache_dir=cache_dir)
-        print(f"[DEBUG] ReconstructionBackbone: DepthAnything3 model loaded successfully")
-        self.da3_model.eval()
+        self.eval()  # Ensure eval mode
         print(f"[DEBUG] ReconstructionBackbone: Model set to eval mode")
-        print(f"[DEBUG] ReconstructionBackbone: Cache directory = {cache_dir}")
         
-        # Store config
+        # Store ReconstructionBackbone-specific config
         self.respoint_post_processing_pipeline_cfg = respoint_post_processing_pipeline
         print(f"[DEBUG] ReconstructionBackbone: Building post-processing pipeline...")
         print(f"[DEBUG] ReconstructionBackbone: Pipeline config length = {len(self.respoint_post_processing_pipeline_cfg) if self.respoint_post_processing_pipeline_cfg else 0}")
-        # post-processing pipeline will be built on first forward
-        self.post_pipeline = Compose(self.respoint_post_processing_pipeline_cfg)
+        # Build post-processing pipeline using Compose
+        self.post_pipeline = Compose(self.respoint_post_processing_pipeline_cfg) if self.respoint_post_processing_pipeline_cfg else None
         print(f"[DEBUG] ReconstructionBackbone: Post-processing pipeline built successfully")
+        
         self.glb_config = glb_config or {}
         self.ref_view_strategy = ref_view_strategy
         self.use_ray_pose = use_ray_pose
@@ -87,9 +99,6 @@ class ReconstructionBackbone(nn.Module):
         self.filter_sky = filter_sky
         self.max_depth = max_depth or self.glb_config.get('max_depth', None)
         self.conf_thresh_percentile = conf_thresh_percentile or self.glb_config.get('conf_thresh_percentile', None)
-        
-
-    
     
     def _extract_images_from_data(self, img: torch.Tensor) -> torch.Tensor:
         """Extract images from mmdet3d data format.
@@ -99,11 +108,17 @@ class ReconstructionBackbone(nn.Module):
                 Shape: (B, N, 3, H, W) or (N, 3, H, W) after unwrapping
         
         Returns:
-            Image tensor with shape (B, N, 3, H, W) where B=1
+            Image tensor with shape (B, N, 3, H, W)
         """
         # Handle DataContainer
         if isinstance(img, DC):
-            img = img.data[0]  # Get first batch item
+            # DataContainer.data is a list of tensors, one per batch item
+            # Stack them to get (B, N, 3, H, W)
+            img_list = img.data
+            if isinstance(img_list, list):
+                img = torch.stack(img_list, dim=0)  # (B, N, 3, H, W)
+            else:
+                img = img_list  # Already a tensor
         
         # Ensure batch dimension
         if img.dim() == 4:  # (N, 3, H, W)
@@ -111,24 +126,18 @@ class ReconstructionBackbone(nn.Module):
         
         return img
     
-    def _extract_lidar2img_from_data(self, img_metas: List[Dict]) -> List[np.ndarray]:
-        """Extract lidar2img transformations from mmdet3d data.
+    def _extract_lidar2img_from_meta(self, meta: Dict) -> List[np.ndarray]:
+        """Extract lidar2img transformations from a single metadata dict.
         
         Args:
-            img_metas: List of image metadata dicts
+            meta: Image metadata dict for one sample
         
         Returns:
             List of lidar2img 4x4 matrices (one per camera)
         """
-        if not img_metas or len(img_metas) == 0:
+        if not meta:
             return []
         
-        # Handle DataContainer
-        if isinstance(img_metas, DC):
-            img_metas = img_metas.data[0]
-        
-        # Get lidar2img from first metadata (should be same for all in batch)
-        meta = img_metas[0] if isinstance(img_metas, list) else img_metas
         lidar2img = meta.get('lidar2img', [])
         
         if isinstance(lidar2img, list):
@@ -249,130 +258,166 @@ class ReconstructionBackbone(nn.Module):
         img: torch.Tensor,
         img_metas: List[Dict],
         return_loss: bool = False,
-    ) -> torch.Tensor:
+    ) -> List[torch.Tensor]:
         """Forward pass: generate point cloud from images.
+        
+        Overrides DepthAnything3.forward() to work with mmdet3d's data format.
+        Uses parent's forward() method to get depth maps, then back-projects to point clouds.
+        Supports batch size > 1 for training.
         
         Args:
             img: Multi-view images (B, N, 3, H, W) or DataContainer
-            img_metas: Image metadata list
+            img_metas: Image metadata list (one dict per batch item)
             return_loss: Whether to return loss (unused, for compatibility)
         
         Returns:
-            Point cloud tensor (N, 3) or (N, 4/5) in LiDAR coordinates
+            List of point cloud tensors, one per batch item
+            Each tensor has shape (N_points, 3) in LiDAR coordinates
             Same format as point cloud from bin file
         """
         device = next(self.parameters()).device
         
-        # Extract images
+        # Extract images from mmdet3d data format
         img_tensor = self._extract_images_from_data(img)
         B, N, C, H, W = img_tensor.shape
-        assert B == 1, "Batch size must be 1"
         
-        # Extract lidar2img transformations
-        lidar2img_list = self._extract_lidar2img_from_data(img_metas)
+        # Handle DataContainer for img_metas
+        if isinstance(img_metas, DC):
+            img_metas = img_metas.data
         
-        # Run DepthAnything3 forward
-        # DepthAnything3.forward expects (B, N, 3, H, W) on model device
-        da3_device = next(self.da3_model.parameters()).device
-        img_for_da3 = img_tensor.to(da3_device)
+        # Process each batch item separately
+        batch_point_clouds = []
         
-        with torch.no_grad():
-            da3_output = self.da3_model.forward(
-                image=img_for_da3,
-                extrinsics=None,  # Let model estimate
-                intrinsics=None,  # Let model estimate
-                use_ray_pose=self.use_ray_pose,
-                ref_view_strategy=self.ref_view_strategy,
+        for b_idx in range(B):
+            # Extract images for this batch item
+            img_batch = img_tensor[b_idx:b_idx+1]  # (1, N, 3, H, W)
+            
+            # Extract metadata for this batch item
+            meta_batch = img_metas[b_idx] if isinstance(img_metas, list) else img_metas
+            
+            # Use InputProcessor to preprocess images (ensures they're multiples of patch size)
+            # Convert tensor to list of numpy arrays for InputProcessor
+            img_list = []
+            for i in range(N):
+                # Convert tensor to numpy and transpose from (C, H, W) to (H, W, C)
+                img_np = img_batch[0, i].cpu().numpy().transpose(1, 2, 0)
+                # Denormalize if needed (InputProcessor will normalize again)
+                if img_np.max() <= 1.0:
+                    img_np = (img_np * 255).astype(np.uint8)
+                else:
+                    img_np = img_np.astype(np.uint8)
+                img_list.append(img_np)
+            
+            # Use InputProcessor to preprocess (resize to multiples of patch size, normalize, etc.)
+            imgs_processed, _, _ = self.input_processor(
+                image=img_list,
+                extrinsics=None,
+                intrinsics=None,
+                process_res=504,  # Default processing resolution
+                process_res_method="upper_bound_resize",
             )
-        
-        # Convert output to Prediction object
-        # da3_output is a dict, we need to create Prediction
-        # Use the same method as DepthAnything3.inference
-        prediction = self.da3_model._convert_to_prediction(da3_output)
-        
-        # Compute confidence threshold if needed
-        conf_thresh = None
-        if self.conf_thresh_percentile is not None and hasattr(prediction, 'conf') and prediction.conf is not None:
-            sky = getattr(prediction, 'sky', None)
-            if sky is not None and (~sky).sum() > 10:
-                conf_pixels = prediction.conf[~sky]
-            else:
-                conf_pixels = prediction.conf.flatten()
-            conf_thresh = np.percentile(conf_pixels, self.conf_thresh_percentile)
-        
-        # Back-project depth maps to point clouds and transform to LiDAR
-        all_points_lidar = []
-        all_colors = []
-        
-        for i in range(len(prediction.depth)):
-            depth = prediction.depth[i]
-            intrinsics = prediction.intrinsics[i] if hasattr(prediction, 'intrinsics') else None
+            # InputProcessor returns (N, 3, H, W), add batch dimension
+            if imgs_processed.dim() == 4:  # (N, 3, H, W)
+                imgs_processed = imgs_processed.unsqueeze(0)  # (1, N, 3, H, W)
             
-            if intrinsics is None:
-                raise ValueError(f"Intrinsics not available for view {i}")
+            # Extract lidar2img transformations for this batch item
+            lidar2img_list = self._extract_lidar2img_from_meta(meta_batch)
             
-            # Get sky mask and confidence for this view
-            sky_mask = prediction.sky[i] if hasattr(prediction, 'sky') and prediction.sky is not None else None
-            conf = prediction.conf[i] if hasattr(prediction, 'conf') and prediction.conf is not None else None
+            # Move processed images to model device
+            da3_device = next(self.model.parameters()).device
+            imgs_for_da3 = imgs_processed.to(da3_device)
             
-            # Back-project to camera coordinates
-            points_cam, colors = self._backproject_depth_to_points(
-                depth,
-                intrinsics,
-                max_depth=self.max_depth,
-                conf=conf,
-                conf_thresh=conf_thresh,
-                sky_mask=sky_mask,
-                filter_sky=self.filter_sky,
-            )
-            
-            if len(points_cam) == 0:
-                raise ValueError(f"No points were generated for view {i}")
-            
-            # Transform to LiDAR coordinates
-            if i < len(lidar2img_list):
-                points_lidar = self._transform_points_cam_to_lidar(
-                    points_cam,
-                    lidar2img_list[i],
-                    intrinsics,
+            # Run DepthAnything3 forward (parent's forward method)
+            with torch.no_grad():
+                da3_output = super().forward(
+                    image=imgs_for_da3,
+                    extrinsics=None,  # Let model estimate
+                    intrinsics=None,  # Let model estimate
+                    use_ray_pose=self.use_ray_pose,
+                    ref_view_strategy=self.ref_view_strategy,
                 )
-            else:
-                raise ValueError(f"No lidar2img transformation available for view {i}")
             
-            all_points_lidar.append(points_lidar)
-            if colors is not None:
-                all_colors.append(colors)
+            # Convert output to Prediction object
+            prediction = self._convert_to_prediction(da3_output)
+            
+            # Compute confidence threshold if needed
+            conf_thresh = None
+            if self.conf_thresh_percentile is not None and hasattr(prediction, 'conf') and prediction.conf is not None:
+                sky = getattr(prediction, 'sky', None)
+                if sky is not None and (~sky).sum() > 10:
+                    conf_pixels = prediction.conf[~sky]
+                else:
+                    conf_pixels = prediction.conf.flatten()
+                conf_thresh = np.percentile(conf_pixels, self.conf_thresh_percentile)
+            
+            # Back-project depth maps to point clouds and transform to LiDAR
+            all_points_lidar = []
+            all_colors = []
+            
+            for i in range(len(prediction.depth)):
+                depth = prediction.depth[i]
+                intrinsics = prediction.intrinsics[i] if hasattr(prediction, 'intrinsics') else None
+                
+                if intrinsics is None:
+                    raise ValueError(f"Intrinsics not available for view {i} in batch {b_idx}")
+                
+                # Get sky mask and confidence for this view
+                sky_mask = prediction.sky[i] if hasattr(prediction, 'sky') and prediction.sky is not None else None
+                conf = prediction.conf[i] if hasattr(prediction, 'conf') and prediction.conf is not None else None
+                
+                # Back-project to camera coordinates
+                points_cam, colors = self._backproject_depth_to_points(
+                    depth,
+                    intrinsics,
+                    max_depth=self.max_depth,
+                    conf=conf,
+                    conf_thresh=conf_thresh,
+                    sky_mask=sky_mask,
+                    filter_sky=self.filter_sky,
+                )
+                
+                if len(points_cam) == 0:
+                    raise ValueError(f"No points were generated for view {i} in batch {b_idx}")
+                
+                # Transform to LiDAR coordinates
+                if i < len(lidar2img_list):
+                    points_lidar = self._transform_points_cam_to_lidar(
+                        points_cam,
+                        lidar2img_list[i],
+                        intrinsics,
+                    )
+                else:
+                    raise ValueError(f"No lidar2img transformation available for view {i} in batch {b_idx}")
+                
+                all_points_lidar.append(points_lidar)
+                if colors is not None:
+                    all_colors.append(colors)
+            
+            if not all_points_lidar:
+                raise ValueError(f"No points were generated for batch {b_idx}")
+            
+            # Concatenate all points for this batch item
+            combined_points = np.concatenate(all_points_lidar, axis=0)
+            combined_colors = None
+            if all_colors and all(all_colors):
+                combined_colors = np.concatenate(all_colors, axis=0)
+            
+            # Apply post-processing pipeline
+            if self.post_pipeline is not None:
+                pipeline_input = {
+                    'points': combined_points,
+                    'colors': combined_colors,
+                    'polygon_mask': None,
+                    'indices': None,
+                }
+                pipeline_output = self.post_pipeline(pipeline_input)
+                combined_points = pipeline_output['points']
+                combined_colors = pipeline_output.get('colors')
+            
+            # Convert to tensor and add to batch results
+            points_tensor = torch.from_numpy(combined_points).float().to(device)
+            batch_point_clouds.append(points_tensor)
         
-        if not all_points_lidar:
-            raise ValueError("No points were generated")
-        
-        # Concatenate all points
-        combined_points = np.concatenate(all_points_lidar, axis=0)
-        combined_colors = None
-        if all_colors and all(all_colors):
-            combined_colors = np.concatenate(all_colors, axis=0)
-        
-        # Build post-processing pipeline if needed
-        self._build_post_pipeline(device)
-        
-        # Apply post-processing
-        if self.post_pipeline is not None:
-            pipeline_input = {
-                'points': combined_points,
-                'colors': combined_colors,
-                'polygon_mask': None,
-                'indices': None,
-            }
-            # ResPointCloudPipeline is callable directly
-            pipeline_output = self.post_pipeline(pipeline_input)
-            combined_points = pipeline_output['points']
-            combined_colors = pipeline_output.get('colors')
-        
-        # Convert to tensor and return in same format as bin file
-        # Bin file format: (N, 3) for xyz or (N, 4) for xyz+intensity or (N, 5) for xyz+intensity+ring
-        points_tensor = torch.from_numpy(combined_points).float().to(device)
-        
-        # If colors available, could append as intensity
-        # For now, return just xyz (N, 3) to match standard point cloud format
-        return points_tensor
-
+        # Return list of point clouds, one per batch item
+        # This matches mmdet3d's convention: list[torch.Tensor] where each tensor is (N_points, 3)
+        return batch_point_clouds
