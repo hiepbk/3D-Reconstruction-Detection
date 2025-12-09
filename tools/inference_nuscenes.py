@@ -710,330 +710,6 @@ def display_point_cloud_threaded(pcd, frame_timestamp, gt_lidar_boxes=None):
     return thread
 
 
-def downsample_point_cloud_mmcv(
-    points,
-    colors=None,
-    polygon_mask=None,
-    voxel_size=0.1,
-    use_fps=False,
-    fps_num_points=None,
-    point_cloud_range=None,
-    use_ball_query=False,
-    ball_query_min_radius=0.0,
-    ball_query_max_radius=0.5,
-    ball_query_sample_num=16,
-    ball_query_anchor_points=25000,
-):
-    """
-    Downsample point cloud using mmdet3d.ops operations (voxelization + optional FPS/ball_query).
-    This helps reduce overlapping points and manage large point clouds.
-    
-    Args:
-        points: numpy array of shape (N, 3) - point coordinates
-        colors: numpy array of shape (N, 3) - point colors (optional)
-        polygon_mask: numpy array of shape (N,) - boolean mask for polygon points (optional)
-        voxel_size: float or list of 3 floats - size of voxel for downsampling (default: 0.1m)
-        use_fps: bool - whether to apply FPS after voxelization (default: False)
-        fps_num_points: int - number of points to sample with FPS (required if use_fps=True)
-        point_cloud_range: list of 6 floats [x_min, y_min, z_min, x_max, y_max, z_max] - 
-                          point cloud range for voxelization (optional, auto-computed if None)
-        use_ball_query: bool - whether to use ball_query for density-aware sampling (default: False)
-        ball_query_min_radius: float - minimum radius for ball_query (meters, default: 0.0)
-        ball_query_max_radius: float - maximum radius for ball_query (meters, default: 0.5)
-        ball_query_sample_num: int - max neighbors per anchor point (default: 16)
-        ball_query_anchor_points: int - number of FPS anchor points for ball_query (default: 25000)
-    
-    Returns:
-        Dictionary with:
-        - 'points': downsampled points (M, 3)
-        - 'colors': downsampled colors (M, 3) if colors provided
-        - 'polygon_mask': downsampled polygon mask (M,) if polygon_mask provided
-        - 'indices': indices of selected points in original point cloud (M,)
-    """
-    # Import mmdet3d ops at the start
-    try:
-        from mmdet3d.ops import Voxelization, furthest_point_sample, ball_query
-    except ImportError as e:
-        raise ImportError(
-            "mmdet3d.ops is required for point cloud downsampling but could not be imported.\n"
-            f"Error: {e}\n"
-            "Please ensure mmdet3d ops are properly compiled. "
-            "You may need to rebuild the ops extensions for your Python version."
-        )
-    
-    if len(points) == 0:
-        return {
-            'points': points,
-            'colors': colors if colors is not None else None,
-            'polygon_mask': polygon_mask if polygon_mask is not None else None,
-            'indices': np.array([], dtype=np.int64)
-        }
-    
-    # Convert to torch tensor
-    points_tensor = torch.from_numpy(points).float()
-    
-    # Detect device for GPU operations (FPS needs GPU)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Handle FPS-only or ball_query-only mode (no voxelization)
-    if voxel_size is None:
-        # Check ball_query first (takes precedence over FPS)
-        if use_ball_query and device.type == "cuda":
-            # Ball query mode without voxelization
-            if len(points) > ball_query_anchor_points:
-                print(f"  Applying ball_query-only: {len(points)} points -> {ball_query_anchor_points} anchors -> neighbors...")
-                # Step 1: Use FPS to get anchor points
-                points_for_fps = points_tensor.to(device).unsqueeze(0)  # (1, N, 3)
-                anchor_indices = furthest_point_sample(points_for_fps, ball_query_anchor_points)
-                anchor_indices = anchor_indices.squeeze(0)  # (anchor_points,)
-                anchor_points = points[anchor_indices.cpu().numpy()]  # (anchor_points, 3)
-                
-                # Step 2: Use ball_query to find neighbors around each anchor
-                points_tensor_gpu = points_tensor.to(device).unsqueeze(0).contiguous()  # (1, N, 3)
-                anchor_tensor_gpu = torch.from_numpy(anchor_points).float().to(device).unsqueeze(0).contiguous()  # (1, anchor_points, 3)
-                
-                with torch.no_grad():
-                    ball_query_indices = ball_query(
-                        ball_query_min_radius,
-                        ball_query_max_radius,
-                        ball_query_sample_num,
-                        points_tensor_gpu,
-                        anchor_tensor_gpu
-                    )  # (1, anchor_points, sample_num)
-                
-                # Step 3: Collect unique indices
-                ball_query_indices = ball_query_indices.squeeze(0).cpu().numpy()  # (anchor_points, sample_num)
-                all_indices = ball_query_indices.flatten()
-                valid_mask = (all_indices >= 0) & (all_indices < len(points))
-                unique_indices = np.unique(all_indices[valid_mask])
-                anchor_indices_np = anchor_indices.cpu().numpy()
-                final_indices = np.unique(np.concatenate([unique_indices, anchor_indices_np]))
-                
-                print(f"    Ball query found {len(final_indices)} unique points")
-                
-                downsampled_points = points[final_indices]
-                downsampled_colors = colors[final_indices] if colors is not None else None
-                downsampled_polygon_mask = polygon_mask[final_indices] if polygon_mask is not None else None
-                
-                return {
-                    'points': downsampled_points,
-                    'colors': downsampled_colors,
-                    'polygon_mask': downsampled_polygon_mask,
-                    'indices': final_indices
-                }
-            else:
-                # Too few points, return original
-                return {
-                    'points': points,
-                    'colors': colors if colors is not None else None,
-                    'polygon_mask': polygon_mask if polygon_mask is not None else None,
-                    'indices': np.arange(len(points))
-                }
-        elif use_ball_query and device.type != "cuda":
-            # ball_query requested but CUDA not available, warn and fall through
-            print(f"  Warning: ball_query requires CUDA but device is {device.type}, skipping...")
-        
-        # FPS-only mode: skip voxelization, apply FPS directly
-        if use_fps and fps_num_points is not None and len(points) > fps_num_points:
-            # FPS-only mode: skip voxelization, apply FPS directly
-            print(f"  Applying FPS-only to downsample from {len(points)} to {fps_num_points} points...")
-            # Move tensor to GPU for FPS operation
-            points_for_fps = points_tensor.to(device).unsqueeze(0)  # (1, N, 3)
-            fps_indices = furthest_point_sample(points_for_fps, fps_num_points)
-            fps_indices = fps_indices.squeeze(0).cpu().numpy()  # (fps_num_points,)
-            
-            downsampled_points = points[fps_indices]
-            downsampled_colors = colors[fps_indices] if colors is not None else None
-            downsampled_polygon_mask = polygon_mask[fps_indices] if polygon_mask is not None else None
-            
-            return {
-                'points': downsampled_points,
-                'colors': downsampled_colors,
-                'polygon_mask': downsampled_polygon_mask,
-                'indices': fps_indices
-            }
-        
-        # No downsampling requested or already fewer points than requested, return original
-        return {
-            'points': points,
-            'colors': colors if colors is not None else None,
-            'polygon_mask': polygon_mask if polygon_mask is not None else None,
-            'indices': np.arange(len(points))
-        }
-    
-    # Voxelization mode (with optional FPS after)
-    # Auto-compute point cloud range if not provided
-    if point_cloud_range is None:
-        x_min, y_min, z_min = points.min(axis=0) - 1.0
-        x_max, y_max, z_max = points.max(axis=0) + 1.0
-        point_cloud_range = [x_min, y_min, z_min, x_max, y_max, z_max]
-    
-    # Convert voxel_size to list if single float
-    if isinstance(voxel_size, (int, float)):
-        voxel_size = [voxel_size, voxel_size, voxel_size]
-    
-    # Initialize voxelization
-    # Note: mmdet3d Voxelization takes input directly (no batch dimension needed in forward)
-    max_num_points = 100  # Max points per voxel (we'll average them)
-    max_voxels = 200000  # Max number of voxels
-    
-    try:
-        voxel_layer = Voxelization(
-            voxel_size=voxel_size,
-            point_cloud_range=point_cloud_range,
-            max_num_points=max_num_points,
-            max_voxels=max_voxels
-        )
-        # Set to eval mode to use max_voxels[1] (testing mode)
-        voxel_layer.eval()
-        
-        # mmdet3d Voxelization.forward() takes input directly (NC points)
-        # Input shape: (N, C) where N is number of points, C is number of channels (3 for xyz)
-        points_input = points_tensor  # (N, 3)
-        
-        # Apply voxelization
-        with torch.no_grad():
-            voxels, coors, num_points_per_voxel = voxel_layer(points_input)
-        
-        # Extract voxel centers (mean of points in each voxel)
-        # voxels shape: (num_voxels, max_num_points, 3)
-        # num_points_per_voxel shape: (num_voxels,)
-        
-        # Compute mean of points in each voxel
-        num_voxels = voxels.shape[0]
-        voxel_centers = []
-        
-        # For each voxel, compute mean position (voxel center)
-        for i in range(num_voxels):
-            n_points = num_points_per_voxel[i].item()
-            if n_points > 0:
-                voxel_points = voxels[i, :n_points, :]  # (n_points, 3)
-                center = voxel_points.mean(dim=0).numpy()  # (3,)
-                voxel_centers.append(center)
-        
-        if len(voxel_centers) == 0:
-            print("  Warning: Voxelization produced no voxels, using original points")
-            return {
-                'points': points,
-                'colors': colors,
-                'polygon_mask': polygon_mask,
-                'indices': np.arange(len(points))
-            }
-        
-        voxel_centers = np.array(voxel_centers)  # (M, 3)
-        
-        # If colors or polygon_mask provided, we need to map voxels back to original points
-        # This is complex with mmdet3d Voxelization, so we'll use a simpler approach:
-        # Find closest original point to each voxel center using KDTree for memory efficiency
-        if colors is not None or polygon_mask is not None:
-            # Use KDTree for efficient nearest neighbor search (memory efficient)
-            # This avoids creating a huge (M, N, 3) array
-            tree = cKDTree(points)
-            _, closest_indices = tree.query(voxel_centers, k=1)  # (M,)
-            
-            if colors is not None:
-                voxel_colors = colors[closest_indices]
-            else:
-                voxel_colors = None
-            
-            if polygon_mask is not None:
-                voxel_polygon_mask = polygon_mask[closest_indices]
-            else:
-                voxel_polygon_mask = None
-        else:
-            voxel_colors = None
-            voxel_polygon_mask = None
-            closest_indices = np.arange(len(voxel_centers))
-        
-        downsampled_points = voxel_centers
-        
-        # Apply ball_query if requested (density-aware sampling)
-        if use_ball_query:
-            if device.type != "cuda":
-                print(f"  Warning: ball_query requires CUDA but device is {device.type}, skipping ball_query...")
-                use_ball_query = False  # Disable for this path
-        
-        if use_ball_query and device.type == "cuda":
-            if len(downsampled_points) > ball_query_anchor_points:
-                print(f"  Applying ball_query: {len(downsampled_points)} points -> {ball_query_anchor_points} anchors -> neighbors...")
-                # Step 1: Use FPS to get anchor points
-                points_for_fps = torch.from_numpy(downsampled_points).float().to(device).unsqueeze(0)  # (1, M, 3)
-                anchor_indices = furthest_point_sample(points_for_fps, ball_query_anchor_points)
-                anchor_indices = anchor_indices.squeeze(0)  # (anchor_points,)
-                anchor_points = downsampled_points[anchor_indices.cpu().numpy()]  # (anchor_points, 3)
-                
-                # Step 2: Use ball_query to find neighbors around each anchor
-                # ball_query expects: (B, N, 3) xyz, (B, npoint, 3) center_xyz
-                # Returns: (B, npoint, nsample) indices into xyz
-                points_tensor_gpu = torch.from_numpy(downsampled_points).float().to(device).unsqueeze(0)  # (1, M, 3)
-                anchor_tensor_gpu = torch.from_numpy(anchor_points).float().to(device).unsqueeze(0)  # (1, anchor_points, 3)
-                
-                # Ensure tensors are contiguous (required by ball_query)
-                points_tensor_gpu = points_tensor_gpu.contiguous()
-                anchor_tensor_gpu = anchor_tensor_gpu.contiguous()
-                
-                with torch.no_grad():
-                    ball_query_indices = ball_query(
-                        ball_query_min_radius,
-                        ball_query_max_radius,
-                        ball_query_sample_num,
-                        points_tensor_gpu,
-                        anchor_tensor_gpu
-                    )  # (1, anchor_points, sample_num) - indices into downsampled_points
-                
-                # Step 3: Collect unique indices from all ball queries
-                ball_query_indices = ball_query_indices.squeeze(0).cpu().numpy()  # (anchor_points, sample_num)
-                # Flatten and get unique indices
-                all_indices = ball_query_indices.flatten()
-                # Filter out invalid indices (ball_query may return duplicates or invalid values)
-                # Valid indices are >= 0 and < len(downsampled_points)
-                valid_mask = (all_indices >= 0) & (all_indices < len(downsampled_points))
-                unique_indices = np.unique(all_indices[valid_mask])
-                
-                # Also include anchor points themselves
-                anchor_indices_np = anchor_indices.cpu().numpy()
-                final_indices = np.unique(np.concatenate([unique_indices, anchor_indices_np]))
-                
-                print(f"    Ball query found {len(final_indices)} unique voxel points (from {len(downsampled_points)} input, {ball_query_anchor_points} anchors)")
-                
-                # final_indices are indices into downsampled_points (voxel centers)
-                downsampled_points = downsampled_points[final_indices]
-                if voxel_colors is not None:
-                    voxel_colors = voxel_colors[final_indices]
-                if voxel_polygon_mask is not None:
-                    voxel_polygon_mask = voxel_polygon_mask[final_indices]
-                # Map back to original point indices
-                closest_indices = closest_indices[final_indices]
-            else:
-                print(f"  Skipping ball_query: only {len(downsampled_points)} points (need > {ball_query_anchor_points})")
-        
-        # Apply FPS if requested (and ball_query was not used)
-        elif use_fps and fps_num_points is not None and len(downsampled_points) > fps_num_points:
-            print(f"  Applying FPS to downsample from {len(downsampled_points)} to {fps_num_points} points...")
-            # FPS expects batch dimension: (1, N, 3)
-            # Move tensor to GPU for FPS operation
-            points_for_fps = torch.from_numpy(downsampled_points).float().to(device).unsqueeze(0)
-            fps_indices = furthest_point_sample(points_for_fps, fps_num_points)
-            fps_indices = fps_indices.squeeze(0).cpu().numpy()  # (fps_num_points,)
-            
-            downsampled_points = downsampled_points[fps_indices]
-            if voxel_colors is not None:
-                voxel_colors = voxel_colors[fps_indices]
-            if voxel_polygon_mask is not None:
-                voxel_polygon_mask = voxel_polygon_mask[fps_indices]
-            closest_indices = closest_indices[fps_indices]
-        
-        return {
-            'points': downsampled_points,
-            'colors': voxel_colors,
-            'polygon_mask': voxel_polygon_mask,
-            'indices': closest_indices
-        }
-        
-    except Exception as e:
-        raise RuntimeError(f"mmdet3d voxelization failed: {e}")
-
-
 def run_inference_for_frame(
     model,
     sample_token,
@@ -1059,10 +735,9 @@ def run_inference_for_frame(
     # Normalize device to torch.device for post-processing checks
     device_obj = torch.device(device)
 
-    # Build post-processing pipeline processors (mmdet3d-style)
-    pipeline_processors = build_post_processing_pipeline(
+    # Build post-processing pipeline (Compose)
+    post_pipeline = build_post_processing_pipeline(
         nusc_info.get('post_processing_pipeline', []),
-        downsample_fn=downsample_point_cloud_mmcv,
         device=device_obj,
     )
     
@@ -1076,181 +751,183 @@ def run_inference_for_frame(
     
     
     
-    # Prepare export_kwargs for GLB export filtering options
-    export_kwargs = {}
+        # Prepare export_kwargs for GLB export filtering options
+        export_kwargs = {}
     if "glb" in cfg.EXPORT_FORMAT:
-        export_kwargs["glb"] = {
-            "sky_depth_def": cfg.GLB_CONFIG["sky_depth_def"],
-            "conf_thresh_percentile": cfg.GLB_CONFIG["conf_thresh_percentile"],
-            "filter_black_bg": cfg.GLB_CONFIG["filter_black_bg"],
-            "filter_white_bg": cfg.GLB_CONFIG["filter_white_bg"],
-        }
-
-    # Run inference (no extrinsics/intrinsics - model estimates them!)
-    prediction = model.inference(
-        image=image_files,
-        export_dir=frame_output_dir,
+            export_kwargs["glb"] = {
+                "sky_depth_def": cfg.GLB_CONFIG["sky_depth_def"],
+                "conf_thresh_percentile": cfg.GLB_CONFIG["conf_thresh_percentile"],
+                "filter_black_bg": cfg.GLB_CONFIG["filter_black_bg"],
+                "filter_white_bg": cfg.GLB_CONFIG["filter_white_bg"],
+            }
+        
+        # Run inference (no extrinsics/intrinsics - model estimates them!)
+        prediction = model.inference(
+            image=image_files,
+            export_dir=frame_output_dir,
         export_format=cfg.EXPORT_FORMAT,
         ref_view_strategy=cfg.REF_VIEW_STRATEGY,
         use_ray_pose=cfg.USE_RAY_POSE,
         num_max_points=cfg.MAX_POINTS,
-        export_kwargs=export_kwargs if export_kwargs else None,
-    )
-
-    print(f"✓ Successfully processed sample {sample_token}")
-    print(f"  Output directory: {frame_output_dir}")
-
-    # Display camera images and point cloud simultaneously
-    if display:
-        # Display camera images (all 6 cameras) in a separate thread (OpenCV is thread-safe)
-        camera_thread = display_camera_images_threaded(image_paths, sample_token, nusc_info['polygon_by_camera'], cfg)
-
-        # Load point clouds from prediction (points stay in camera coordinates)
-        # Apply filtering for sky, confidence, and max depth
-        pcd_data = load_point_cloud_from_prediction(
-            prediction, 
-            image_paths,
-            max_depth=cfg.GLB_CONFIG["max_depth"],
-            conf_thresh_percentile=cfg.GLB_CONFIG["conf_thresh_percentile"],
-            polygon_by_camera=nusc_info['polygon_by_camera'],
-            cfg=cfg,
+            export_kwargs=export_kwargs if export_kwargs else None,
         )
+        
+        print(f"✓ Successfully processed sample {sample_token}")
+        print(f"  Output directory: {frame_output_dir}")
+        
+        # Display camera images and point cloud simultaneously
+        if display:
+            # Display camera images (all 6 cameras) in a separate thread (OpenCV is thread-safe)
+        camera_thread = display_camera_images_threaded(image_paths, sample_token, nusc_info['polygon_by_camera'], cfg)
+            
+            # Load point clouds from prediction (points stay in camera coordinates)
+            # Apply filtering for sky, confidence, and max depth
+            pcd_data = load_point_cloud_from_prediction(
+                prediction, 
+                image_paths,
+                max_depth=cfg.GLB_CONFIG["max_depth"],
+                conf_thresh_percentile=cfg.GLB_CONFIG["conf_thresh_percentile"],
+                polygon_by_camera=nusc_info['polygon_by_camera'],
+            cfg=cfg,
+            )
+            
+            if pcd_data and pcd_data['points_by_camera']:
+                # Transform each camera's points from camera coordinates to LiDAR coordinates
+                # using ground truth extrinsics from nuScenes (not model's predicted extrinsics)
+                all_points_lidar = []
+                all_colors = []
+                all_polygon_mask = []
+                
+                print(f"  Transforming points from camera coordinates to LiDAR coordinates...")
+                total_points_before_downsample = 0
+                for cam_name in pcd_data['camera_order']:
+                    if cam_name in pcd_data['points_by_camera']:
+                        points_cam = pcd_data['points_by_camera'][cam_name]
+                        
+                        # Check if we have transformation for this camera
+                        if cam_name in nusc_info:
+                            # Transform points from camera coordinates to LiDAR coordinates
+                            # using ground truth extrinsics from nuScenes
+                            R = nusc_info[cam_name]['cam2lidar_rotation']
+                            T = nusc_info[cam_name]['cam2lidar_translation']
+                            
+                            # Transform: points_lidar = points_cam @ R.T + T
+                            points_lidar = points_cam @ R.T + T
+                            
+                            # Get colors if available
+                            cam_colors = None
+                            if cam_name in pcd_data['colors_by_camera']:
+                                cam_colors = pcd_data['colors_by_camera'][cam_name]
+                            
+                            # Get polygon mask if available
+                            cam_polygon_mask = None
+                            if cam_name in pcd_data['polygon_mask_by_camera']:
+                                cam_polygon_mask = pcd_data['polygon_mask_by_camera'][cam_name]
+                            
+                            # DOWNSAMPLE PER CAMERA BEFORE COMBINING (much more memory efficient!)
+                            # This avoids building huge KDTree on 600k+ points
+                            if nusc_info.get('downsample_voxel_size', None) is not None:
+                                num_points_before = len(points_lidar)
+                                total_points_before_downsample += num_points_before
+                                
+                            # Per-camera voxel downsample via pipeline (only VoxelDownsample step)
+                            per_cam_pipeline_cfg = [
+                                dict(
+                                    type='VoxelDownsample',
+                                    voxel_size=nusc_info.get('downsample_voxel_size', 0.1),
+                                    point_cloud_range=nusc_info.get('downsample_point_cloud_range', None),
+                                )
+                            ]
+                            per_cam_pipeline = build_post_processing_pipeline(per_cam_pipeline_cfg, device_obj)
+                            per_cam_input = {
+                                'points': points_lidar,
+                                'colors': cam_colors,
+                                'polygon_mask': cam_polygon_mask,
+                                'indices': None,
+                            }
+                            per_cam_output = run_post_processing_pipeline(per_cam_input, per_cam_pipeline)
 
-        if pcd_data and pcd_data['points_by_camera']:
-            # Transform each camera's points from camera coordinates to LiDAR coordinates
-            # using ground truth extrinsics from nuScenes (not model's predicted extrinsics)
-            all_points_lidar = []
-            all_colors = []
-            all_polygon_mask = []
-
-            print(f"  Transforming points from camera coordinates to LiDAR coordinates...")
-            total_points_before_downsample = 0
-            for cam_name in pcd_data['camera_order']:
-                if cam_name in pcd_data['points_by_camera']:
-                    points_cam = pcd_data['points_by_camera'][cam_name]
-
-                    # Check if we have transformation for this camera
-                    if cam_name in nusc_info:
-                        # Transform points from camera coordinates to LiDAR coordinates
-                        # using ground truth extrinsics from nuScenes
-                        R = nusc_info[cam_name]['cam2lidar_rotation']
-                        T = nusc_info[cam_name]['cam2lidar_translation']
-
-                        # Transform: points_lidar = points_cam @ R.T + T
-                        points_lidar = points_cam @ R.T + T
-
-                        # Get colors if available
-                        cam_colors = None
-                        if cam_name in pcd_data['colors_by_camera']:
-                            cam_colors = pcd_data['colors_by_camera'][cam_name]
-
-                        # Get polygon mask if available
-                        cam_polygon_mask = None
-                        if cam_name in pcd_data['polygon_mask_by_camera']:
-                            cam_polygon_mask = pcd_data['polygon_mask_by_camera'][cam_name]
-
-                        # DOWNSAMPLE PER CAMERA BEFORE COMBINING (much more memory efficient!)
-                        # This avoids building huge KDTree on 600k+ points
-                        if nusc_info.get('downsample_voxel_size', None) is not None:
-                            num_points_before = len(points_lidar)
-                            total_points_before_downsample += num_points_before
-
-                            downsample_result = downsample_point_cloud_mmcv(
-                                points_lidar,
-                                colors=cam_colors,
-                                polygon_mask=cam_polygon_mask,
-                                voxel_size=nusc_info.get('downsample_voxel_size', 0.1),
-                                use_fps=False,  # Don't use FPS per camera, only on final combined if needed
-                                fps_num_points=None,
-                                point_cloud_range=nusc_info.get('downsample_point_cloud_range', None),
-                                use_ball_query=False,  # Don't use ball_query per camera, only on final combined if needed
-                                ball_query_min_radius=nusc_info.get('downsample_ball_query_min_radius', 0.0),
-                                ball_query_max_radius=nusc_info.get('downsample_ball_query_max_radius', 0.5),
-                                ball_query_sample_num=nusc_info.get('downsample_ball_query_sample_num', 16),
-                                ball_query_anchor_points=nusc_info.get('downsample_ball_query_anchor_points', 25000),
-                            )
-
-                            points_lidar = downsample_result['points']
-                            cam_colors = downsample_result['colors']
-                            cam_polygon_mask = downsample_result['polygon_mask']
-
-                            num_points_after = len(points_lidar)
-                            reduction = num_points_before - num_points_after
-                            reduction_pct = (reduction / num_points_before * 100) if num_points_before > 0 else 0
-                            print(f"    {cam_name}: {len(points_cam)} points -> {num_points_before} points in LiDAR -> {num_points_after} after downsampling ({reduction_pct:.1f}% reduction)")
+                            points_lidar = per_cam_output.get('points', points_lidar)
+                            cam_colors = per_cam_output.get('colors', cam_colors)
+                            cam_polygon_mask = per_cam_output.get('polygon_mask', cam_polygon_mask)
+                                
+                                num_points_after = len(points_lidar)
+                                reduction = num_points_before - num_points_after
+                                reduction_pct = (reduction / num_points_before * 100) if num_points_before > 0 else 0
+                                print(f"    {cam_name}: {len(points_cam)} points -> {num_points_before} points in LiDAR -> {num_points_after} after downsampling ({reduction_pct:.1f}% reduction)")
+                            else:
+                                total_points_before_downsample += len(points_lidar)
+                                print(f"    {cam_name}: {len(points_cam)} points -> {len(points_lidar)} points in LiDAR frame")
+                            
+                            all_points_lidar.append(points_lidar)
+                            
+                            if cam_colors is not None:
+                                all_colors.append(cam_colors)
+                            
+                            if cam_polygon_mask is not None:
+                                all_polygon_mask.append(cam_polygon_mask)
                         else:
-                            total_points_before_downsample += len(points_lidar)
-                            print(f"    {cam_name}: {len(points_cam)} points -> {len(points_lidar)} points in LiDAR frame")
+                            print(f"    WARNING: No transformation found for {cam_name}, skipping...")
+                
+                if all_points_lidar:
+                    # Concatenate all points (already downsampled per camera)
+                    combined_points = np.concatenate(all_points_lidar, axis=0)
+                    combined_colors = None
+                    combined_polygon_mask = None
+                    
+                    if all_colors:
+                        combined_colors = np.concatenate(all_colors, axis=0)
+                    
+                    if all_polygon_mask:
+                        combined_polygon_mask = np.concatenate(all_polygon_mask, axis=0)
+                    
+                    num_points_after_camera_downsample = len(combined_points)
+                    print(f"  Total points in LiDAR frame (after per-camera downsampling): {num_points_after_camera_downsample} (was {total_points_before_downsample} before)")
 
-                        all_points_lidar.append(points_lidar)
+                    # Apply configurable post-processing pipeline (mmdet3d-style)
+                    pipeline_input = {
+                        'points': combined_points,
+                        'colors': combined_colors,
+                        'polygon_mask': combined_polygon_mask,
+                        'indices': None,
+                    }
+                    pipeline_output = run_post_processing_pipeline(
+                        pipeline_input,
+                    post_pipeline,
+                    )
 
-                        if cam_colors is not None:
-                            all_colors.append(cam_colors)
-
-                        if cam_polygon_mask is not None:
-                            all_polygon_mask.append(cam_polygon_mask)
-                    else:
-                        print(f"    WARNING: No transformation found for {cam_name}, skipping...")
-
-            if all_points_lidar:
-                # Concatenate all points (already downsampled per camera)
-                combined_points = np.concatenate(all_points_lidar, axis=0)
-                combined_colors = None
-                combined_polygon_mask = None
-
-                if all_colors:
-                    combined_colors = np.concatenate(all_colors, axis=0)
-
-                if all_polygon_mask:
-                    combined_polygon_mask = np.concatenate(all_polygon_mask, axis=0)
-
-                num_points_after_camera_downsample = len(combined_points)
-                print(f"  Total points in LiDAR frame (after per-camera downsampling): {num_points_after_camera_downsample} (was {total_points_before_downsample} before)")
-
-                # Apply configurable post-processing pipeline (mmdet3d-style)
-                pipeline_input = {
-                    'points': combined_points,
-                    'colors': combined_colors,
-                    'polygon_mask': combined_polygon_mask,
-                    'indices': None,
-                }
-                pipeline_output = run_post_processing_pipeline(
-                    pipeline_input,
-                    pipeline_processors,
-                )
-
-                combined_points = pipeline_output.get('points', combined_points)
-                combined_colors = pipeline_output.get('colors', combined_colors)
-                combined_polygon_mask = pipeline_output.get('polygon_mask', combined_polygon_mask)
-                print(f"  Points after pipeline: {len(combined_points)}")
-
-                # Create point cloud
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(combined_points)
-
-                if combined_colors is not None:
-                    # Override colors for polygon points (red)
-                    if combined_polygon_mask is not None:
-                        # Set polygon points to red [1, 0, 0]
-                        combined_colors[combined_polygon_mask] = [1.0, 0.0, 0.0]
-                        print(f"  Colored {combined_polygon_mask.sum()} polygon points in red")
-
-                    pcd.colors = o3d.utility.Vector3dVector(combined_colors)
-
-                print(f"  Total points in LiDAR frame (final): {len(combined_points)}")
-
-                # Display point cloud in MAIN thread (Open3D/Qt requires main thread)
-                print(f"  Both windows are open. Close both windows to continue...")
-                display_point_cloud(pcd, sample_token, nusc_info['gt_lidar_boxes'])
+                    combined_points = pipeline_output.get('points', combined_points)
+                    combined_colors = pipeline_output.get('colors', combined_colors)
+                    combined_polygon_mask = pipeline_output.get('polygon_mask', combined_polygon_mask)
+                    print(f"  Points after pipeline: {len(combined_points)}")
+                    
+                    # Create point cloud
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(combined_points)
+                    
+                    if combined_colors is not None:
+                        # Override colors for polygon points (red)
+                        if combined_polygon_mask is not None:
+                            # Set polygon points to red [1, 0, 0]
+                            combined_colors[combined_polygon_mask] = [1.0, 0.0, 0.0]
+                            print(f"  Colored {combined_polygon_mask.sum()} polygon points in red")
+                        
+                        pcd.colors = o3d.utility.Vector3dVector(combined_colors)
+                    
+                    print(f"  Total points in LiDAR frame (final): {len(combined_points)}")
+                    
+                    # Display point cloud in MAIN thread (Open3D/Qt requires main thread)
+                    print(f"  Both windows are open. Close both windows to continue...")
+                    display_point_cloud(pcd, sample_token, nusc_info['gt_lidar_boxes'])
+                else:
+                    print(f"  Warning: No valid points to display")
             else:
-                print(f"  Warning: No valid points to display")
-        else:
-            print(f"  Warning: Could not load point cloud for display")
-
-        # Wait for camera images window to close
-        camera_thread.join()
-
-    return True, prediction
+                print(f"  Warning: Could not load point cloud for display")
+            
+            # Wait for camera images window to close
+            camera_thread.join()
+        
+        return True, prediction
 
 
 def main():

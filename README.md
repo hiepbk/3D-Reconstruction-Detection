@@ -1,4 +1,4 @@
-# 📦 Depth Anything 3 - Installation Guide
+# 📦 3D Reconstruction Detection - Installation Guide
 
 This guide will walk you through setting up the Depth Anything 3 environment step by step.
 
@@ -130,6 +130,8 @@ pip install mmsegmentation==0.30.0
 
 pip install numba==0.56.4 llvmlite==0.39.1
 
+pip install scikit-image
+
 cd mmdetection3d
 
 
@@ -165,6 +167,16 @@ Remove all `.so` files from mmdet3d ops directories (useful before rebuilding):
 find mmdetection3d/mmdet3d/ops -name "*.so" -type f -delete
 ```
 
+
+#### Data Preparation
+
+```bash
+python -m tools.create_data nuscenes --version v1.0-mini --root-path ./data/nuscenes_mini --out-dir ./data/nuscenes_mini --extra-tag nuscenes_mini
+
+```
+
+
+
 ### Inference with nuScenes (Sample-based iteration)
 
 ```bash
@@ -181,6 +193,30 @@ python -m tools.inference_nuscenes \
     --output_dir result \
     --sample_index 0 \
     --version v1.0-mini
+```
+
+### Inference with mmdet3d (ResDet3D with DepthAnything3)
+
+Run inference using the integrated mmdet3d pipeline:
+
+```bash
+python -m tools.inference_mmdet3d \
+    --config projects/configs/ResDet3D_nuscenes_mini_config.py \
+    --output_dir output \
+    --sample_index 0
+
+# Process multiple samples
+python -m tools.inference_mmdet3d \
+    --config projects/configs/ResDet3D_nuscenes_mini_config.py \
+    --output_dir output \
+    --max_samples 10
+
+# With checkpoint (if training was done)
+python -m tools.inference_mmdet3d \
+    --config projects/configs/ResDet3D_nuscenes_mini_config.py \
+    --checkpoint path/to/checkpoint.pth \
+    --output_dir output \
+    --sample_index 0
 ```
 
 
