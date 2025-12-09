@@ -263,6 +263,11 @@ def main():
         default='none',
         help="Job launcher for distributed training (default: none = single GPU)",
     )
+    parser.add_argument(
+        "--display",
+        action='store_true',
+        help="Display point cloud with colors",
+    )
 
     args = parser.parse_args()
 
@@ -436,13 +441,9 @@ def main():
                     pcd_path = os.path.join(args.output_dir, f"{sample_token}_points.pcd")
                     save_point_cloud_pcd(points, pcd_path, colors=colors)
                     print(f"  Saved point cloud to {pcd_path}")
-                    
-                    npy_path = os.path.join(args.output_dir, f"{sample_token}_points.npy")
-                    np.save(npy_path, points)
-                    print(f"  Saved point cloud (numpy) to {npy_path}")
                 
                 # Display point cloud with colors
-                if points is not None and len(points) > 0:
+                if args.display and points is not None and len(points) > 0:
                     display_point_cloud(points, sample_token, colors=colors, gt_bboxes_3d=None)
     
     print(f"\n{'='*60}")

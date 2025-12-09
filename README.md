@@ -209,7 +209,7 @@ python -m tools.inference_mmdet3d \
 python -m tools.inference_mmdet3d \
     --config projects/configs/ResDet3D_nuscenes_mini_config.py \
     --output_dir output \
-    --max_samples 10
+    --max_samples 20
 
 # With checkpoint (if training was done)
 python -m tools.inference_mmdet3d \
