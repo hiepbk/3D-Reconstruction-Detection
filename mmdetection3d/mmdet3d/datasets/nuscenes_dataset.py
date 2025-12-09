@@ -274,7 +274,7 @@ class NuScenesDataset(Custom3DDataset):
                 cam2lidar_r = cam_info['sensor2lidar_rotation']
                 cam2lidar_t = cam_info['sensor2lidar_translation']
                 cam2lidar_rt = np.eye(4)
-                cam2lidar_rt[:3, :3] = cam2lidar_r.T
+                cam2lidar_rt[:3, :3] = cam2lidar_r
                 cam2lidar_rt[3, :3] = -cam2lidar_t
                 cam2lidar_rts.append(cam2lidar_rt)
                 

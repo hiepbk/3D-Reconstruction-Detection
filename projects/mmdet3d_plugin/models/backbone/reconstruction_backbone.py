@@ -7,6 +7,7 @@ import numpy as np
 import copy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 from copy import deepcopy
 from mmdet.models.builder import BACKBONES
@@ -167,86 +168,98 @@ class ReconstructionBackbone(nn.Module):
     
     def _backproject_depth_to_points(
         self,
-        depth: np.ndarray,
-        intrinsics: np.ndarray,
-        image: Optional[np.ndarray] = None,
+        depth: torch.Tensor,
+        intrinsics: torch.Tensor,
+        image: Optional[torch.Tensor] = None,
         max_depth: Optional[float] = None,
-        conf: Optional[np.ndarray] = None,
-        conf_thresh: Optional[float] = None,
-        sky_mask: Optional[np.ndarray] = None,
+        conf: Optional[torch.Tensor] = None,
+        conf_thresh: Optional[torch.Tensor] = None,
+        sky_mask: Optional[torch.Tensor] = None,
         filter_sky: bool = True,
-    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        """Back-project depth map to 3D points in camera coordinates.
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Back-project depth map to 3D points in camera coordinates (torch only).
         
         Args:
-            depth: Depth map (H, W)
-            intrinsics: Camera intrinsics (3, 3)
-            image: Processed image (H, W, 3) in [0, 255] range, optional
+            depth: Depth map (H, W) torch
+            intrinsics: Camera intrinsics (3, 3) torch
+            image: Image (3, H, W) torch in [0,255] or [0,1], optional
             max_depth: Maximum depth threshold
             conf: Confidence map (H, W)
-            conf_thresh: Confidence threshold
+            conf_thresh: Confidence threshold (scalar tensor)
             sky_mask: Sky mask (H, W), True=sky
             filter_sky: Whether to filter sky
         
         Returns:
-            points_cam: (N, 3) points in camera coordinates
-            colors: (N, 3) in [0,1] or None
+            points_cam: (N, 3) torch
+            colors: (N, 3) torch in [0,1] or None
         """
-        H, W = depth.shape
-        u, v = np.meshgrid(np.arange(W), np.arange(H))
+        device = depth.device
+        H, W = depth.shape[-2], depth.shape[-1]
+        u = torch.arange(W, device=device, dtype=depth.dtype)
+        v = torch.arange(H, device=device, dtype=depth.dtype)
+        vv, uu = torch.meshgrid(v, u, indexing='ij')
         
-        # Back-project to 3D
         fx, fy = intrinsics[0, 0], intrinsics[1, 1]
         cx, cy = intrinsics[0, 2], intrinsics[1, 2]
         
-        x = (u - cx) * depth / fx
-        y = (v - cy) * depth / fy
         z = depth
+        x = (uu - cx) * z / fx
+        y = (vv - cy) * z / fy
         
-        points_cam = np.stack([x.flatten(), y.flatten(), z.flatten()], axis=1)
+        points_cam = torch.stack([x.reshape(-1), y.reshape(-1), z.reshape(-1)], dim=1)
         
-        # Filter valid points
-        valid = depth.flatten() > 0
-        valid = valid & np.isfinite(depth.flatten())
-        
+        # Valid mask
+        valid = (z.reshape(-1) > 0) & torch.isfinite(z.reshape(-1))
         if max_depth is not None:
-            valid = valid & (depth.flatten() <= max_depth)
-        
+            valid = valid & (z.reshape(-1) <= max_depth)
         if conf is not None and conf_thresh is not None:
-            conf_flat = conf.flatten()
+            conf_flat = conf.reshape(-1)
             valid = valid & (conf_flat >= conf_thresh)
-        
         if filter_sky and sky_mask is not None:
-            sky_flat = sky_mask.flatten()
-            valid = valid & (~sky_flat)  # Keep non-sky
+            sky_flat = sky_mask.reshape(-1)
+            valid = valid & (~sky_flat)
         
-        points_cam_valid = points_cam[valid]
-        colors_valid = None
+        points_cam = points_cam[valid]
+        
+        colors = None
         if image is not None:
-            colors_flat = image.reshape(-1, 3)[valid]
-            colors_valid = colors_flat.astype(np.float32) / 255.0  # [0,1]
-        return points_cam_valid, colors_valid
+            # Ensure image is float and resized to depth resolution
+            img = image
+            if img.dtype != torch.float:
+                img = img.float()
+            if img.shape[1] != H or img.shape[2] != W:
+                img = F.interpolate(
+                    img.unsqueeze(0),
+                    size=(H, W),
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(0)
+            img_flat = img.permute(1, 2, 0).reshape(-1, 3)  # (H*W,3)
+            colors = img_flat[valid]
+            if colors.numel() > 0 and colors.max() > 1.5:
+                colors = colors / 255.0
+        return points_cam, colors
     
     def _transform_points_cam_to_lidar(
         self,
-        points_cam: np.ndarray,
-        colors_cam: np.ndarray,
-        cam2lidar_rt: np.ndarray,
-        intrinsics: np.ndarray,
-    ) -> np.ndarray:
-        """Transform points from camera to LiDAR coordinates.
-        
-        Args:
-            points_cam: Points in camera coordinates (N, 3)
-            colors_cam: Colors in camera coordinates (N, 3)
-            cam2lidar_rt: Camera to LiDAR transformation (4, 4)
-            intrinsics: Camera intrinsics (3, 3)
-        
-        Returns:
-            Points in LiDAR coordinates (N, 3)
-        """
-        points_lidar = points_cam @ cam2lidar_rt[:3, :3] + cam2lidar_rt[3, :3]
-
+        points_cam: torch.Tensor,
+        colors_cam: Optional[torch.Tensor],
+        cam2lidar_rt: torch.Tensor,
+        intrinsics: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Transform points from camera to LiDAR coordinates (torch)."""
+        device = points_cam.device
+        R = cam2lidar_rt[:3, :3]
+        t = cam2lidar_rt[3, :3]
+        if not torch.is_tensor(R):
+            R = torch.as_tensor(R, device=device, dtype=points_cam.dtype)
+        else:
+            R = R.to(device=device, dtype=points_cam.dtype)
+        if not torch.is_tensor(t):
+            t = torch.as_tensor(t, device=device, dtype=points_cam.dtype)
+        else:
+            t = t.to(device=device, dtype=points_cam.dtype)
+        points_lidar = points_cam @ R.T + t
         return points_lidar, colors_cam
     
     def _extract_image_paths_from_meta(self, img_meta: Dict) -> List[str]:
@@ -487,15 +500,19 @@ class ReconstructionBackbone(nn.Module):
             # Convert output to Prediction object (matches inference())
             prediction = self._convert_to_prediction(da3_output, return_torch=True)
             
-            # Compute confidence threshold if needed
-            conf_thresh = None
-            if self.conf_thresh_percentile is not None and hasattr(prediction, 'conf') and prediction.conf is not None:
-                sky = getattr(prediction, 'sky', None)
-                if sky is not None and (~sky).sum() > 10:
-                    conf_pixels = prediction.conf[~sky]
-                else:
-                    conf_pixels = prediction.conf.flatten()
-                conf_thresh = np.percentile(conf_pixels, self.conf_thresh_percentile)
+        # Compute confidence threshold if needed (torch only)
+        conf_thresh = None
+        if self.conf_thresh_percentile is not None and hasattr(prediction, 'conf') and prediction.conf is not None:
+            sky = getattr(prediction, 'sky', None)
+            conf_map = prediction.conf
+            if sky is not None and sky.dtype != torch.bool:
+                sky = sky >= 0.5
+            if sky is not None and (~sky).sum() > 10:
+                conf_pixels = conf_map[~sky]
+            else:
+                conf_pixels = conf_map.reshape(-1)
+            if conf_pixels.numel() > 0:
+                conf_thresh = torch.quantile(conf_pixels, self.conf_thresh_percentile / 100.0)
             
             # Back-project depth maps to point clouds
             all_points_lidar = []
@@ -512,18 +529,11 @@ class ReconstructionBackbone(nn.Module):
                 sky_mask = prediction.sky[cam_idx] if hasattr(prediction, 'sky') and prediction.sky is not None else None
                 conf = prediction.conf[cam_idx] if hasattr(prediction, 'conf') and prediction.conf is not None else None
                 
-                # Get image for color extraction: use raw input only (true colors)
-                raw_img = img_tensor[b_idx, cam_idx].cpu().numpy().transpose(1, 2, 0).astype(np.uint8)
-                if raw_img.shape[0] != depth.shape[0] or raw_img.shape[1] != depth.shape[1]:
-                    from PIL import Image
-                    raw_img = np.array(Image.fromarray(raw_img).resize((depth.shape[1], depth.shape[0]), Image.BILINEAR))
-                image = raw_img
-                
                 # Back-project to camera coordinates (returns xyz + colors)
                 points_cam, colors_cam = self._backproject_depth_to_points(
                     depth,
                     intrinsics,
-                    image=image,
+                    image=img_tensor[b_idx, cam_idx],
                     max_depth=self.max_depth,
                     conf=conf,
                     conf_thresh=conf_thresh,
@@ -543,15 +553,19 @@ class ReconstructionBackbone(nn.Module):
                     intrinsics,
                 )
                 
-                all_points_lidar.append(points_lidar.copy())
-                all_colors_lidar.append(colors_lidar.copy())
+                all_points_lidar.append(points_lidar.clone())
+                all_colors_lidar.append(colors_lidar.clone() if colors_lidar is not None else None)
             
             if not all_points_lidar:
                 raise ValueError(f"No points were generated for batch {b_idx} (all views empty after filtering)")
             
             # Concatenate all points for this batch item
-            combined_points = np.concatenate(all_points_lidar, axis=0)
-            combined_colors = np.concatenate(all_colors_lidar, axis=0) if all_colors_lidar else None
+            combined_points = torch.cat(all_points_lidar, dim=0)
+            combined_colors = None
+            if all_colors_lidar:
+                valid_color_lists = [c for c in all_colors_lidar if c is not None and c.numel() > 0]
+                if valid_color_lists:
+                    combined_colors = torch.cat(valid_color_lists, dim=0)
             
             # Apply post-processing pipeline
             if self.post_pipeline is not None:
@@ -569,12 +583,12 @@ class ReconstructionBackbone(nn.Module):
                 # merged points and colors to (N,6) xyzrgb
  
             # merged points and colors to (N,6) xyzrgb
-            if combined_colors is not None and len(combined_colors) == len(combined_points):
-                merged = np.concatenate([combined_points, combined_colors], axis=1)
+            if combined_colors is not None and combined_colors.shape[0] == combined_points.shape[0]:
+                merged = torch.cat([combined_points, combined_colors], dim=1)
             else:
                 merged = combined_points
             
-            points_tensor = torch.from_numpy(merged).float().to(device)
+            points_tensor = merged.float().to(device)
             batch_point_clouds.append(points_tensor)
 
         return batch_point_clouds
