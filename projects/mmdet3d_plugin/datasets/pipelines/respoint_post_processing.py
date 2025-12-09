@@ -9,9 +9,7 @@ directly in mmdet3d's data pipeline configuration.
 """
 
 from typing import List, Dict, Any, Optional
-import numpy as np
 import torch
-from scipy.spatial import cKDTree
 from mmdet.datasets.builder import PIPELINES
 from mmdet.datasets.pipelines import Compose
 from mmdet3d.ops import Voxelization, furthest_point_sample, ball_query
@@ -36,12 +34,15 @@ class VoxelDownsample:
         colors = data.get('colors')
         polygon_mask = data.get('polygon_mask')
 
-        points_tensor = torch.from_numpy(points).float()
+        device = points.device if torch.is_tensor(points) else (self.device or torch.device("cpu"))
+        points_tensor = points if torch.is_tensor(points) else torch.as_tensor(points, device=device, dtype=torch.float32)
+        if not torch.is_floating_point(points_tensor):
+            points_tensor = points_tensor.float()
 
         if self.point_cloud_range is None:
-            x_min, y_min, z_min = points.min(axis=0) - 1.0
-            x_max, y_max, z_max = points.max(axis=0) + 1.0
-            pcr = [x_min, y_min, z_min, x_max, y_max, z_max]
+            mins = points_tensor.min(dim=0).values - 1.0
+            maxs = points_tensor.max(dim=0).values + 1.0
+            pcr = mins.tolist() + maxs.tolist()
         else:
             pcr = self.point_cloud_range
 
@@ -61,33 +62,39 @@ class VoxelDownsample:
             voxels, coors, num_points_per_voxel = voxel_layer(points_tensor)
 
         num_voxels = voxels.shape[0]
+        if num_voxels == 0:
+            return {
+                'points': points_tensor,
+                'colors': colors,
+                'polygon_mask': polygon_mask,
+                'indices': torch.arange(points_tensor.shape[0], device=device),
+            }
+
         voxel_centers = []
         for i in range(num_voxels):
             n_points = num_points_per_voxel[i].item()
             if n_points > 0:
                 voxel_points = voxels[i, :n_points, :]
-                center = voxel_points.mean(dim=0).numpy()
+                center = voxel_points.mean(dim=0)
                 voxel_centers.append(center)
-
         if len(voxel_centers) == 0:
             return {
-                'points': points,
+                'points': points_tensor,
                 'colors': colors,
                 'polygon_mask': polygon_mask,
-                'indices': np.arange(len(points))
+                'indices': torch.arange(points_tensor.shape[0], device=device),
             }
+        voxel_centers = torch.stack(voxel_centers, dim=0)
 
-        voxel_centers = np.array(voxel_centers)
-
+        voxel_colors = None
+        voxel_polygon_mask = None
+        closest_indices = torch.arange(voxel_centers.shape[0], device=device)
         if colors is not None or polygon_mask is not None:
-            tree = cKDTree(points)
-            _, closest_indices = tree.query(voxel_centers, k=1)
+            # Use nearest neighbor via torch.cdist
+            dists = torch.cdist(voxel_centers, points_tensor)
+            closest_indices = torch.argmin(dists, dim=1)
             voxel_colors = colors[closest_indices] if colors is not None else None
             voxel_polygon_mask = polygon_mask[closest_indices] if polygon_mask is not None else None
-        else:
-            voxel_colors = None
-            voxel_polygon_mask = None
-            closest_indices = np.arange(len(voxel_centers))
 
         return {
             'points': voxel_centers,
@@ -115,33 +122,36 @@ class BallQueryDownsample:
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
         if not self.enabled or self.anchor_points is None:
             return data
-        if self.device is None or self.device.type != "cuda":
-            print(f"  Warning: BallQueryDownsample requires CUDA but device is {self.device}, skipping...")
-            return data
-
         points = data['points']
         colors = data.get('colors')
         polygon_mask = data.get('polygon_mask')
 
-        points_tensor = torch.from_numpy(points).float()
-        device = self.device
+        # Resolve device: prioritize points' device, fallback to self.device, else CPU/GPU default
+        device = points.device if torch.is_tensor(points) else (self.device or torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        if device.type != "cuda":
+            print(f"  Warning: BallQueryDownsample requires CUDA but device is {device}, skipping...")
+            return data
 
-        if len(points) <= self.anchor_points:
+        points_tensor = points if torch.is_tensor(points) else torch.as_tensor(points, device=device, dtype=torch.float32)
+        if not torch.is_floating_point(points_tensor):
+            points_tensor = points_tensor.float()
+
+        if points_tensor.shape[0] <= self.anchor_points:
             return {
-                'points': points,
+                'points': points_tensor,
                 'colors': colors,
                 'polygon_mask': polygon_mask,
-                'indices': np.arange(len(points))
+                'indices': torch.arange(points_tensor.shape[0], device=device)
             }
 
         # FPS to get anchors
         points_for_fps = points_tensor.to(device).unsqueeze(0)
         anchor_indices = furthest_point_sample(points_for_fps, self.anchor_points).squeeze(0)
-        anchor_points = points[anchor_indices.cpu().numpy()]
+        anchor_points = points_tensor[anchor_indices]
 
         # ball_query to gather neighbors
         points_tensor_gpu = points_tensor.to(device).unsqueeze(0).contiguous()
-        anchor_tensor_gpu = torch.from_numpy(anchor_points).float().to(device).unsqueeze(0).contiguous()
+        anchor_tensor_gpu = anchor_points.unsqueeze(0).contiguous()
         with torch.no_grad():
             ball_query_indices = ball_query(
                 self.min_radius,
@@ -150,13 +160,12 @@ class BallQueryDownsample:
                 points_tensor_gpu,
                 anchor_tensor_gpu
             )
-        ball_query_indices = ball_query_indices.squeeze(0).cpu().numpy().flatten()
-        valid_mask = (ball_query_indices >= 0) & (ball_query_indices < len(points))
-        unique_indices = np.unique(ball_query_indices[valid_mask])
-        anchor_indices_np = anchor_indices.cpu().numpy()
-        final_indices = np.unique(np.concatenate([unique_indices, anchor_indices_np]))
+        ball_query_indices = ball_query_indices.squeeze(0).reshape(-1)
+        valid_mask = (ball_query_indices >= 0) & (ball_query_indices < points_tensor.shape[0])
+        unique_indices = torch.unique(ball_query_indices[valid_mask])
+        final_indices = torch.unique(torch.cat([unique_indices, anchor_indices], dim=0))
 
-        downsampled_points = points[final_indices]
+        downsampled_points = points_tensor[final_indices]
         downsampled_colors = colors[final_indices] if colors is not None else None
         downsampled_polygon_mask = polygon_mask[final_indices] if polygon_mask is not None else None
 
@@ -186,17 +195,20 @@ class FilterPointByRange:
         colors = data.get('colors')
         polygon_mask = data.get('polygon_mask')
 
+        device = points.device if torch.is_tensor(points) else (self.device or torch.device("cpu"))
+        pts = points if torch.is_tensor(points) else torch.as_tensor(points, device=device)
+
         x_min, y_min, z_min, x_max, y_max, z_max = self.point_cloud_range
         mask = (
-            (points[:, 0] >= x_min) & (points[:, 0] <= x_max) &
-            (points[:, 1] >= y_min) & (points[:, 1] <= y_max) &
-            (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
+            (pts[:, 0] >= x_min) & (pts[:, 0] <= x_max) &
+            (pts[:, 1] >= y_min) & (pts[:, 1] <= y_max) &
+            (pts[:, 2] >= z_min) & (pts[:, 2] <= z_max)
         )
 
-        filtered_points = points[mask]
+        filtered_points = pts[mask]
         filtered_colors = colors[mask] if colors is not None else None
         filtered_polygon_mask = polygon_mask[mask] if polygon_mask is not None else None
-        indices = np.nonzero(mask)[0]
+        indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
 
         return {
             'points': filtered_points,
@@ -226,19 +238,23 @@ class FPSDownsample:
         colors = data.get('colors')
         polygon_mask = data.get('polygon_mask')
 
-        if len(points) <= self.num_points:
+        device = points.device if torch.is_tensor(points) else (self.device or torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        pts = points if torch.is_tensor(points) else torch.as_tensor(points, device=device, dtype=torch.float32)
+        if not torch.is_floating_point(pts):
+            pts = pts.float()
+
+        if pts.shape[0] <= self.num_points:
             return {
-                'points': points,
+                'points': pts,
                 'colors': colors,
                 'polygon_mask': polygon_mask,
-                'indices': np.arange(len(points))
+                'indices': torch.arange(pts.shape[0], device=device)
             }
 
-        device = self.device if self.device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        points_tensor = torch.from_numpy(points).float().to(device).unsqueeze(0)
-        fps_indices = furthest_point_sample(points_tensor, self.num_points).squeeze(0).cpu().numpy()
+        pts_for_fps = pts.unsqueeze(0)
+        fps_indices = furthest_point_sample(pts_for_fps, self.num_points).squeeze(0)
 
-        downsampled_points = points[fps_indices]
+        downsampled_points = pts[fps_indices]
         downsampled_colors = colors[fps_indices] if colors is not None else None
         downsampled_polygon_mask = polygon_mask[fps_indices] if polygon_mask is not None else None
 
@@ -300,7 +316,11 @@ class ResPointCloudPipeline:
         
         # Initialize indices if not present
         if 'indices' not in data or data['indices'] is None:
-            data['indices'] = np.arange(len(data['points']))
+            if torch.is_tensor(data['points']):
+                data['indices'] = torch.arange(len(data['points']), device=data['points'].device)
+            else:
+                import numpy as np
+                data['indices'] = np.arange(len(data['points']))
         
         # Run pipeline (Compose handles everything)
         result = self.transforms(data)
@@ -311,7 +331,12 @@ class ResPointCloudPipeline:
         
         # Ensure indices are present
         if 'indices' not in result:
-            result['indices'] = np.arange(len(result.get('points', [])))
+            pts = result.get('points', [])
+            if torch.is_tensor(pts):
+                result['indices'] = torch.arange(len(pts), device=pts.device)
+            else:
+                import numpy as np
+                result['indices'] = np.arange(len(pts))
         
         return result
 
