@@ -108,9 +108,9 @@ class ReconstructionBackbone(nn.Module):
         """Access wrapped model's output_processor."""
         return self.da3_model.output_processor
     
-    def _convert_to_prediction(self, raw_output: dict[str, torch.Tensor]) -> Prediction:
+    def _convert_to_prediction(self, raw_output: dict[str, torch.Tensor], return_torch: bool = False) -> Prediction:
         """Convert raw model output to Prediction object."""
-        return self.da3_model._convert_to_prediction(raw_output)
+        return self.da3_model._convert_to_prediction(raw_output, return_torch=return_torch)
     
     def _add_processed_images(self, prediction: Prediction, imgs_cpu: torch.Tensor) -> Prediction:
         """Add processed images to prediction for visualization."""
@@ -485,7 +485,7 @@ class ReconstructionBackbone(nn.Module):
                 )
             
             # Convert output to Prediction object (matches inference())
-            prediction = self._convert_to_prediction(da3_output)
+            prediction = self._convert_to_prediction(da3_output, return_torch=True)
             
             # Compute confidence threshold if needed
             conf_thresh = None
