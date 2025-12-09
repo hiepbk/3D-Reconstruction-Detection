@@ -22,9 +22,41 @@ from mmcv.parallel import MMDataParallel, collate
 from mmcv.runner import load_checkpoint
 from mmcv.utils import import_modules_from_strings
 
-from mmdet3d.apis import init_model
+from mmdet3d.apis import single_gpu_test
 from mmdet3d.datasets import build_dataloader, build_dataset
 from mmdet3d.models import build_model
+
+# Patch mmcv Scatter.forward to handle device indices correctly
+# This fixes a bug where target_gpus contains integers but _get_stream expects device objects
+def _patch_scatter_forward():
+    """Patch mmcv Scatter.forward to convert device indices to device objects."""
+    from mmcv.parallel._functions import Scatter
+    from torch.nn.parallel._functions import _get_stream
+    from typing import List, Union
+    from torch import Tensor
+    
+    original_forward = Scatter.forward
+    
+    @staticmethod
+    def patched_forward(target_gpus: List[int], input: Union[List, Tensor]) -> tuple:
+        from mmcv.parallel._functions import get_input_device, scatter, synchronize_stream
+        
+        input_device = get_input_device(input)
+        streams = None
+        if input_device == -1 and target_gpus != [-1]:
+            # Convert device indices to device objects
+            device_objects = [torch.device(f'cuda:{d}') if isinstance(d, int) else d for d in target_gpus]
+            streams = [_get_stream(device) for device in device_objects]
+        
+        outputs = scatter(input, target_gpus, streams)
+        # Synchronize with the copy stream
+        if streams is not None:
+            synchronize_stream(outputs, target_gpus, streams)
+        
+        return tuple(outputs) if isinstance(outputs, list) else (outputs, )
+    
+    Scatter.forward = patched_forward
+    print("[DEBUG] Patched mmcv Scatter.forward to handle device indices")
 
 
 def display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=None):
@@ -188,6 +220,9 @@ def main():
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
 
+    # Patch mmcv Scatter.forward before building model/data
+    _patch_scatter_forward()
+    
     # Handle custom imports/plugins (mimic mmdet3d)
     if cfg.get('custom_imports', None):
         import_modules_from_strings(**cfg['custom_imports'])
@@ -249,28 +284,24 @@ def main():
     )
     print("Data loader built")
 
-    # Build model using mmdet3d infrastructure
+    # Build model using mmdet3d infrastructure (exactly like test.py)
     print("Building model...")
     print(f"[DEBUG] Model config keys: {list(cfg.model.keys())}")
     if 'reconstruction_backbone' in cfg.model:
         print(f"[DEBUG] Reconstruction backbone config present: {cfg.model['reconstruction_backbone']}")
+    cfg.model.train_cfg = None  # Set train_cfg to None like test.py
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
-    print("[DEBUG] Model built, moving to device...")
     
-    # Load checkpoint if provided
+    # Load checkpoint if provided (load to CPU, like test.py)
     if args.checkpoint is not None:
         print(f"Loading checkpoint: {args.checkpoint}")
-        load_checkpoint(model, args.checkpoint, map_location=device)
+        load_checkpoint(model, args.checkpoint, map_location='cpu')
     
-    print(f"[DEBUG] Moving model to device: {device}")
-    model.to(device)
-    print(f"[DEBUG] Setting model to eval mode")
-    model.eval()
-    
-    # Wrap model based on distributed mode (like test.py)
+    # Wrap model based on distributed mode (exactly like test.py)
     if not distributed:
-        # Single GPU: use MMDataParallel
-        model = MMDataParallel(model, device_ids=[device.index if device.type == 'cuda' else 0])
+        # Single GPU: wrap directly with MMDataParallel (no manual device movement)
+        # MMDataParallel will automatically handle device placement
+        model = MMDataParallel(model, device_ids=[0])
         print("Model wrapped with MMDataParallel (single GPU)")
     else:
         # Multi GPU: use MMDistributedDataParallel (for future implementation)
@@ -282,95 +313,67 @@ def main():
         print("Model wrapped with MMDistributedDataParallel (multi GPU)")
     print("Model built and ready")
 
-    # Process samples
-    print(f"\nProcessing samples...")
-    successful = 0
-    failed = 0
-    
-    # Filter samples if needed
-    indices = list(range(len(dataset)))
+    # Filter dataset if needed
     if args.sample_index is not None:
         if args.sample_index < 0 or args.sample_index >= len(dataset):
             print(f"Error: Sample index {args.sample_index} is out of range (0-{len(dataset)-1})")
             sys.exit(1)
-        indices = [args.sample_index]
+        # Create a subset dataset with only the specified sample
+        from torch.utils.data import Subset
+        dataset = Subset(dataset, [args.sample_index])
         print(f"Processing sample at index {args.sample_index}")
     
     if args.max_samples:
-        indices = indices[:args.max_samples]
-        print(f"Processing first {len(indices)} samples")
+        from torch.utils.data import Subset
+        max_idx = min(args.max_samples, len(dataset))
+        dataset = Subset(dataset, list(range(max_idx)))
+        print(f"Processing first {max_idx} samples")
 
-    # Process each sample
-    for i, idx in enumerate(indices, 1):
-        print(f"\n[{i}/{len(indices)}] Processing sample index: {idx}")
-        
-        # Get data from dataset
-        data = dataset[idx]
-        
-        # Collate data (convert to batch format)
-        data = collate([data], samples_per_gpu=1)
-        
-        # MMDataParallel handles device placement automatically
-        # No need to manually move data - just pass it to the model
-        
-        # Get sample token from data
-        sample_token = None
-        if 'img_metas' in data:
-            img_metas = data['img_metas']
-            if isinstance(img_metas, list) and len(img_metas) > 0:
-                if isinstance(img_metas[0], dict):
-                    sample_token = img_metas[0].get('sample_idx', None)
-        
-        sample_token = sample_token or f"sample_{idx}"
-        
-        try:
-            # Run model forward - reconstruction backbone will be called internally
-            with torch.no_grad():
-                # Call extract_feat to get point cloud from reconstruction backbone
-                points = model.extract_feat(data['img'], data['img_metas'])
-                # Convert to numpy
-                if isinstance(points, torch.Tensor):
-                    points = points.cpu().numpy()
-                print(f"✓ Generated point cloud with {len(points)} points for sample {sample_token}")
-                
-                # Optionally save point cloud
-                if args.output_dir:
-                    output_path = os.path.join(args.output_dir, f"{sample_token}_points.npy")
-                    np.save(output_path, points)
-                    print(f"  Saved point cloud to {output_path}")
-                
-                # Get ground truth boxes if available (for visualization)
-                gt_bboxes_3d = None
-                if 'gt_bboxes_3d' in data:
-                    gt_bboxes_3d = data['gt_bboxes_3d']
-                    if hasattr(gt_bboxes_3d, 'data'):
-                        gt_bboxes_3d = gt_bboxes_3d.data
-                    if isinstance(gt_bboxes_3d, list) and len(gt_bboxes_3d) > 0:
-                        gt_bboxes_3d = gt_bboxes_3d[0]  # Take first batch item
-                
-                # Display point cloud if available
-                if points is not None and len(points) > 0:
-                    display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=gt_bboxes_3d)
-                
-                # Run full model forward for detection (if detection head exists)
-                result = model(return_loss=False, rescale=True, **data)
-                print(f"✓ Successfully processed sample {sample_token}")
+    # Rebuild data loader with filtered dataset
+    data_loader = build_dataloader(
+        dataset,
+        samples_per_gpu=1,
+        workers_per_gpu=cfg.data.get('workers_per_gpu', 4),
+        dist=distributed,
+        shuffle=False,
+    )
+
+    # Use single_gpu_test from mmdet3d (like test.py)
+    print(f"\nProcessing samples...")
+    outputs = single_gpu_test(
+        model=model,
+        data_loader=data_loader,
+        show=False,
+        out_dir=None,
+        UI_result=None
+    )
+    
+    # Process outputs to extract point clouds and visualize
+    print(f"\nProcessing {len(outputs)} results...")
+    for i, result in enumerate(outputs):
+        # Extract generated points from result if available
+        if isinstance(result, dict) and 'generated_points' in result:
+            points = result['generated_points']
+            if isinstance(points, torch.Tensor):
+                points = points.cpu().numpy()
             
-            successful += 1
-        
-        except Exception as e:
-            print(f"✗ Error processing sample {sample_token}: {e}")
-            import traceback
-            traceback.print_exc()
-            failed += 1
-
-    # Summary
+            sample_token = f"sample_{i}"
+            print(f"✓ Generated point cloud with {len(points)} points for {sample_token}")
+            
+            # Optionally save point cloud
+            if args.output_dir:
+                output_path = os.path.join(args.output_dir, f"{sample_token}_points.npy")
+                np.save(output_path, points)
+                print(f"  Saved point cloud to {output_path}")
+            
+            # Display point cloud
+            if points is not None and len(points) > 0:
+                display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=None)
+    
     print(f"\n{'='*60}")
     print("Processing Summary")
     print(f"{'='*60}")
-    print(f"Total samples: {len(indices)}")
-    print(f"Successful: {successful}")
-    print(f"Failed: {failed}")
+    print(f"Total samples processed: {len(outputs)}")
     print(f"Output directory: {args.output_dir}")
     print(f"{'='*60}\n")
 

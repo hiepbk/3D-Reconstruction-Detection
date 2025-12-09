@@ -90,25 +90,52 @@ class ResDet3D(MVXTwoStageDetector):
             self.reconstruction_backbone = None
             print(f"[DEBUG] ResDet3D: No reconstruction backbone configured")
     
-    def extract_feat(self, img, img_metas):
+    def extract_feat(self, points=None, img=None, img_metas=None):
         """Extract features using reconstruction backbone.
         
         This generates point clouds from multi-view images using DepthAnything3.
         The point cloud can then be used by the detection head.
         
         Args:
+            points: Point cloud (optional, not used when reconstruction_backbone exists)
             img: Multi-view images (B, N, 3, H, W) or DataContainer
             img_metas: Image metadata list
         
         Returns:
-            Point cloud tensor (N, 3) in LiDAR coordinates
+            tuple: (img_feats, pts_feats) where pts_feats is the generated point cloud
         """
         if self.reconstruction_backbone is not None:
             # Generate point cloud from images
-            points = self.reconstruction_backbone(img, img_metas)
-            return points
+            generated_points = self.reconstruction_backbone(img, img_metas)
+            # Return format matching parent class: (img_feats, pts_feats)
+            # For now, img_feats is None since we're only using reconstruction
+            return (None, generated_points)
         else:
-            # No reconstruction backbone, return None or empty
-            return None
+            # No reconstruction backbone, fall back to parent behavior
+            return super().extract_feat(points, img, img_metas)
+    
+    def simple_test(self, points, img_metas, img=None, rescale=False):
+        """Test function without augmentation.
+        
+        Override to handle case where we don't have detection head/neck yet.
+        Just pass through the point cloud for now.
+        """
+        if self.reconstruction_backbone is not None:
+            # Extract features (generates point cloud)
+            img_feats, pts_feats = self.extract_feat(points, img=img, img_metas=img_metas)
+            
+            # For now, return empty results since we don't have head/neck
+            # Later, when head/neck are added, this will call simple_test_pts
+            bbox_list = [dict() for i in range(len(img_metas))]
+            
+            # Store generated points in result for potential use
+            if pts_feats is not None:
+                for result_dict in bbox_list:
+                    result_dict['generated_points'] = pts_feats
+            
+            return bbox_list
+        else:
+            # Fall back to parent behavior
+            return super().simple_test(points, img_metas, img=img, rescale=rescale)
         
         
