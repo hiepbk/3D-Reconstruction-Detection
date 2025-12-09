@@ -149,6 +149,12 @@ respoint_post_processing_pipeline = [
             #     voxel_size=0.1,
             #     point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
             # )
+            
+            
+            dict(
+                type='FilterPointByRange', 
+                point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 6.0]),
+            
             # Density-aware ball query (optional)
             dict(
                 type='BallQueryDownsample',

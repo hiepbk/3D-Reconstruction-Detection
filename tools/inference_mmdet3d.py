@@ -405,9 +405,9 @@ def main():
     print('outputs: ', outputs)
     
     for i, result in enumerate(outputs):
-        # Extract generated points from result if available
-        if isinstance(result, dict) and 'generated_points' in result:
-            points = result['generated_points']
+        # Extract pseudo points from result if available
+        if isinstance(result, dict) and 'pseudo_points' in result:
+            points = result['pseudo_points']
             
             # Handle list of tensors (batch size > 1) or single tensor
             if isinstance(points, list):
@@ -420,10 +420,10 @@ def main():
                     points = points.cpu().numpy()
                 
                 sample_token = f"sample_{i}"
-                print(f"✓ Generated point cloud with {len(points)} points for {sample_token}")
+                print(f"✓ Generated pseudo point cloud with {len(points)} points for {sample_token}")
                 
                 # Extract colors if available
-                colors = result.get('generated_colors', None)
+                colors = result.get('pseudo_colors', None)
                 if colors is not None:
                     # Colors are already in [0, 1] range from reconstruction_backbone
                     if isinstance(colors, np.ndarray):

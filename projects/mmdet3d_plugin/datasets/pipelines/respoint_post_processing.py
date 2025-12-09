@@ -169,6 +169,44 @@ class BallQueryDownsample:
 
 
 @PIPELINES.register_module()
+class FilterPointByRange:
+    """Filter points (and aligned colors/masks) by a 3D range.
+
+    Keeps points within [x_min, y_min, z_min, x_max, y_max, z_max].
+    """
+
+    def __init__(self, point_cloud_range=None):
+        self.point_cloud_range = point_cloud_range
+
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        if self.point_cloud_range is None:
+            return data
+
+        points = data['points']
+        colors = data.get('colors')
+        polygon_mask = data.get('polygon_mask')
+
+        x_min, y_min, z_min, x_max, y_max, z_max = self.point_cloud_range
+        mask = (
+            (points[:, 0] >= x_min) & (points[:, 0] <= x_max) &
+            (points[:, 1] >= y_min) & (points[:, 1] <= y_max) &
+            (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
+        )
+
+        filtered_points = points[mask]
+        filtered_colors = colors[mask] if colors is not None else None
+        filtered_polygon_mask = polygon_mask[mask] if polygon_mask is not None else None
+        indices = np.nonzero(mask)[0]
+
+        return {
+            'points': filtered_points,
+            'colors': filtered_colors,
+            'polygon_mask': filtered_polygon_mask,
+            'indices': indices
+        }
+
+
+@PIPELINES.register_module()
 class FPSDownsample:
     """Furthest Point Sampling (FPS) downsampling.
     

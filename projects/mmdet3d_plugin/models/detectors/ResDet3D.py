@@ -110,13 +110,6 @@ class ResDet3D(MVXTwoStageDetector):
             # This bypasses preprocessing and uses DepthAnything3's inference() method
             # Change this to True to debug LoadMultiViewImageFromFiles preprocessing issues
             generated_points = self.reconstruction_backbone(img, img_metas)
-            # Store colors if available (from reconstruction_backbone._batch_colors)
-            if hasattr(self.reconstruction_backbone, '_batch_colors'):
-                self._generated_colors = self.reconstruction_backbone._batch_colors
-                # Clear the temporary storage
-                delattr(self.reconstruction_backbone, '_batch_colors')
-            else:
-                self._generated_colors = None
             # Return format matching parent class: (img_feats, pts_feats)
             # For now, img_feats is None since we're only using reconstruction
             return (None, generated_points)
@@ -138,14 +131,11 @@ class ResDet3D(MVXTwoStageDetector):
             # Later, when head/neck are added, this will call simple_test_pts
             bbox_list = [dict() for i in range(len(img_metas))]
             
-            # Store generated points and colors in result for potential use
+            # Store pseudo points and colors in result for potential use
             if pts_feats is not None:
                 for i, result_dict in enumerate(bbox_list):
-                    result_dict['generated_points'] = pts_feats
-                    # Store colors if available (one per batch item)
-                    if hasattr(self, '_generated_colors') and self._generated_colors is not None:
-                        if i < len(self._generated_colors) and self._generated_colors[i] is not None:
-                            result_dict['generated_colors'] = self._generated_colors[i]
+                    result_dict['pseudo_points'] = pts_feats
+                    # Colors are handled by backbone; none stored here
             
             return bbox_list
         else:
