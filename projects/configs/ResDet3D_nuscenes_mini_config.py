@@ -160,11 +160,11 @@ respoint_post_processing_pipeline = [
                 anchor_points=25000,
             ),
             # Uniform cap with FPS (optional)
-            # dict(
-            #     type='FPSDownsample',
-            #     enabled=True,
-            #     num_points=40000,
-            # ),
+            dict(
+                type='FPSDownsample',
+                enabled=True,
+                num_points=40000,
+            ),
         ]
     ),
 ]
