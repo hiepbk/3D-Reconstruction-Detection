@@ -148,6 +148,7 @@ class ReconstructionBackbone(DepthAnything3):
         self,
         depth: np.ndarray,
         intrinsics: np.ndarray,
+        image: Optional[np.ndarray] = None,
         max_depth: Optional[float] = None,
         conf: Optional[np.ndarray] = None,
         conf_thresh: Optional[float] = None,
@@ -159,6 +160,7 @@ class ReconstructionBackbone(DepthAnything3):
         Args:
             depth: Depth map (H, W)
             intrinsics: Camera intrinsics (3, 3)
+            image: Processed image (H, W, 3) in [0, 255] range, optional
             max_depth: Maximum depth threshold
             conf: Confidence map (H, W)
             conf_thresh: Confidence threshold
@@ -168,7 +170,7 @@ class ReconstructionBackbone(DepthAnything3):
         Returns:
             Tuple of (points_cam, colors) where:
             - points_cam: (N, 3) points in camera coordinates
-            - colors: (N, 3) colors or None
+            - colors: (N, 3) colors in [0, 1] range or None
         """
         H, W = depth.shape
         u, v = np.meshgrid(np.arange(W), np.arange(H))
@@ -200,8 +202,14 @@ class ReconstructionBackbone(DepthAnything3):
         
         points_cam_valid = points_cam[valid]
         
-        # Colors would come from processed_images if available
+        # Extract colors from image if available
         colors = None
+        if image is not None:
+            # image shape should be (H, W, 3) in [0, 255] range
+            # Reshape to (H*W, 3) and filter by valid mask
+            colors_flat = image.reshape(-1, 3)[valid]
+            # Normalize to [0, 1] range
+            colors = colors_flat.astype(np.float32) / 255.0
         
         return points_cam_valid, colors
     
@@ -258,6 +266,7 @@ class ReconstructionBackbone(DepthAnything3):
         img: torch.Tensor,
         img_metas: List[Dict],
         return_loss: bool = False,
+        use_image_paths: bool = False,  # Debug mode: use image paths instead of preprocessed tensors
     ) -> List[torch.Tensor]:
         """Forward pass: generate point cloud from images.
         
@@ -269,6 +278,8 @@ class ReconstructionBackbone(DepthAnything3):
             img: Multi-view images (B, N, 3, H, W) or DataContainer
             img_metas: Image metadata list (one dict per batch item)
             return_loss: Whether to return loss (unused, for compatibility)
+            use_image_paths: If True, extract image paths and use inference() method directly
+                            (bypasses preprocessing, useful for debugging)
         
         Returns:
             List of point cloud tensors, one per batch item
@@ -277,68 +288,79 @@ class ReconstructionBackbone(DepthAnything3):
         """
         device = next(self.parameters()).device
         
-        # Extract images from mmdet3d data format
-        img_tensor = self._extract_images_from_data(img)
-        B, N, C, H, W = img_tensor.shape
-        
         # Handle DataContainer for img_metas
         if isinstance(img_metas, DC):
             img_metas = img_metas.data
         
+        # Debug mode: use image paths directly with inference() method
+        if use_image_paths:
+            return self._forward_with_image_paths(img_metas, device)
+        
+        # Extract images from mmdet3d data format
+        img_tensor = self._extract_images_from_data(img)
+        B, N, C, H, W = img_tensor.shape
+        
         # Process each batch item separately
         batch_point_clouds = []
         
+        # Process all batch items at once using tensor path (more efficient)
+        # InputProcessor now supports tensor inputs directly
+        # Note: input_processor returns tensors on the same device as input
+        imgs_processed, _, _ = self.input_processor(
+            image=img_tensor,  # Pass tensor directly: (B, N, 3, H, W)
+            extrinsics=None,
+            intrinsics=None,
+            process_res=504,  # Default processing resolution
+            process_res_method="upper_bound_resize",
+        )
+        # imgs_processed shape: (B, N, 3, H_new, W_new) on same device as input
+        
+        # Process each batch item separately for point cloud generation
         for b_idx in range(B):
             # Extract images for this batch item
-            img_batch = img_tensor[b_idx:b_idx+1]  # (1, N, 3, H, W)
+            imgs_batch = imgs_processed[b_idx]  # (N, 3, H_new, W_new)
+            
+            # Store CPU version for adding processed images later (matches inference())
+            # _add_processed_images expects CPU tensors
+            imgs_batch_cpu = imgs_batch.cpu() if imgs_batch.is_cuda else imgs_batch
+            
+            # Prepare model inputs exactly like inference() does:
+            # 1. Move to model device
+            # 2. Add batch dimension [None] to make (1, N, 3, H, W)
+            # 3. Convert to float
+            device = next(self.parameters()).device
+            imgs_for_da3 = imgs_batch.to(device, non_blocking=True)[None].float()  # (1, N, 3, H, W)
             
             # Extract metadata for this batch item
             meta_batch = img_metas[b_idx] if isinstance(img_metas, list) else img_metas
             
-            # Use InputProcessor to preprocess images (ensures they're multiples of patch size)
-            # Convert tensor to list of numpy arrays for InputProcessor
-            img_list = []
-            for i in range(N):
-                # Convert tensor to numpy and transpose from (C, H, W) to (H, W, C)
-                img_np = img_batch[0, i].cpu().numpy().transpose(1, 2, 0)
-                # Denormalize if needed (InputProcessor will normalize again)
-                if img_np.max() <= 1.0:
-                    img_np = (img_np * 255).astype(np.uint8)
-                else:
-                    img_np = img_np.astype(np.uint8)
-                img_list.append(img_np)
-            
-            # Use InputProcessor to preprocess (resize to multiples of patch size, normalize, etc.)
-            imgs_processed, _, _ = self.input_processor(
-                image=img_list,
-                extrinsics=None,
-                intrinsics=None,
-                process_res=504,  # Default processing resolution
-                process_res_method="upper_bound_resize",
-            )
-            # InputProcessor returns (N, 3, H, W), add batch dimension
-            if imgs_processed.dim() == 4:  # (N, 3, H, W)
-                imgs_processed = imgs_processed.unsqueeze(0)  # (1, N, 3, H, W)
-            
             # Extract lidar2img transformations for this batch item
             lidar2img_list = self._extract_lidar2img_from_meta(meta_batch)
             
-            # Move processed images to model device
-            da3_device = next(self.model.parameters()).device
-            imgs_for_da3 = imgs_processed.to(da3_device)
-            
             # Run DepthAnything3 forward (parent's forward method)
+            # This matches what _run_model_forward does in inference()
             with torch.no_grad():
                 da3_output = super().forward(
                     image=imgs_for_da3,
                     extrinsics=None,  # Let model estimate
                     intrinsics=None,  # Let model estimate
+                    export_feat_layers=[],  # No feature export needed
+                    infer_gs=False,  # No Gaussian Splatting
                     use_ray_pose=self.use_ray_pose,
                     ref_view_strategy=self.ref_view_strategy,
                 )
             
-            # Convert output to Prediction object
+            # Convert output to Prediction object (matches inference())
             prediction = self._convert_to_prediction(da3_output)
+            
+            # Add processed images to prediction (matches inference())
+            # _add_processed_images expects (N, 3, H, W) on CPU
+            prediction = self._add_processed_images(prediction, imgs_batch_cpu)
+            
+            # Get processed images for color extraction
+            processed_images = None
+            if hasattr(prediction, 'processed_images') and prediction.processed_images is not None:
+                processed_images = prediction.processed_images  # (N, H, W, 3) in [0, 255]
             
             # Compute confidence threshold if needed
             conf_thresh = None
@@ -365,10 +387,16 @@ class ReconstructionBackbone(DepthAnything3):
                 sky_mask = prediction.sky[i] if hasattr(prediction, 'sky') and prediction.sky is not None else None
                 conf = prediction.conf[i] if hasattr(prediction, 'conf') and prediction.conf is not None else None
                 
+                # Get image for color extraction
+                image = None
+                if processed_images is not None and i < len(processed_images):
+                    image = processed_images[i]  # (H, W, 3) in [0, 255]
+                
                 # Back-project to camera coordinates
                 points_cam, colors = self._backproject_depth_to_points(
                     depth,
                     intrinsics,
+                    image=image,  # Pass image for color extraction
                     max_depth=self.max_depth,
                     conf=conf,
                     conf_thresh=conf_thresh,
@@ -399,7 +427,8 @@ class ReconstructionBackbone(DepthAnything3):
             # Concatenate all points for this batch item
             combined_points = np.concatenate(all_points_lidar, axis=0)
             combined_colors = None
-            if all_colors and all(all_colors):
+            # Check if all_colors has elements and all are not None
+            if all_colors and all(c is not None for c in all_colors):
                 combined_colors = np.concatenate(all_colors, axis=0)
             
             # Apply post-processing pipeline
@@ -417,6 +446,15 @@ class ReconstructionBackbone(DepthAnything3):
             # Convert to tensor and add to batch results
             points_tensor = torch.from_numpy(combined_points).float().to(device)
             batch_point_clouds.append(points_tensor)
+            
+            # Store colors if available (for later access in inference)
+            if not hasattr(self, '_batch_colors'):
+                self._batch_colors = []
+            if combined_colors is not None:
+                # Store as numpy array (will be converted to tensor later if needed)
+                self._batch_colors.append(combined_colors)
+            else:
+                self._batch_colors.append(None)
         
         # Return list of point clouds, one per batch item
         # This matches mmdet3d's convention: list[torch.Tensor] where each tensor is (N_points, 3)

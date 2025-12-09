@@ -59,6 +59,37 @@ def _patch_scatter_forward():
     print("[DEBUG] Patched mmcv Scatter.forward to handle device indices")
 
 
+def save_point_cloud_pcd(points, output_path, colors=None):
+    """Save point cloud as PCD file with colors.
+    
+    Args:
+        points (np.ndarray): Point cloud as numpy array of shape (N, 3)
+        output_path (str): Output path for PCD file
+        colors (np.ndarray, optional): Colors as numpy array of shape (N, 3) in [0, 1] or [0, 255]
+    """
+    if points is None or len(points) == 0:
+        print(f"  Warning: No point cloud to save to {output_path}")
+        return
+    
+    # Create open3d PointCloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    
+    # Set colors if provided
+    if colors is not None:
+        # Normalize colors to [0, 1] if needed
+        if colors.max() > 1.0:
+            colors = colors / 255.0
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+    else:
+        # Default gray color (white on white background is invisible)
+        pcd.paint_uniform_color([0.5, 0.5, 0.5])
+    
+    # Save as PCD file
+    o3d.io.write_point_cloud(output_path, pcd)
+    print(f"  Saved PCD file with {len(points)} points to {output_path}")
+
+
 def display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=None):
     """Display point cloud using open3d.
     
@@ -86,20 +117,40 @@ def display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=None):
             colors = colors / 255.0
         pcd.colors = o3d.utility.Vector3dVector(colors)
     else:
-        # Default color (white)
-        pcd.paint_uniform_color([1, 1, 1])
+        # Default gray color (white on white background is invisible)
+        pcd.paint_uniform_color([0.5, 0.5, 0.5])
     
     # Create visualization window
     vis = o3d.visualization.Visualizer()
     vis.create_window(window_name=f"Point Cloud - Sample {sample_token[:8]}", width=1920, height=1080)
     vis.add_geometry(pcd)
     
-    # Set up view
+    # Calculate point cloud center and bounds for proper view setup
+    points_array = np.asarray(pcd.points)
+    if len(points_array) > 0:
+        center = points_array.mean(axis=0)
+        bounds = points_array.max(axis=0) - points_array.min(axis=0)
+        max_bound = bounds.max()
+    else:
+        center = np.array([0, 0, 0])
+        max_bound = 1.0
+    
+    # Set up view to look at the point cloud center
     view_ctl = vis.get_view_control()
     view_ctl.set_front([0, 0, -1])
-    view_ctl.set_lookat([0, 0, 0])
+    view_ctl.set_lookat(center)
     view_ctl.set_up([0, -1, 0])
-    view_ctl.set_zoom(0.7)
+    # Set zoom based on point cloud size
+    if max_bound > 0:
+        # Zoom to fit the point cloud (smaller zoom = wider view)
+        zoom = 0.3 if max_bound > 50 else 0.7
+    else:
+        zoom = 0.7
+    view_ctl.set_zoom(zoom)
+    
+    # Update renderer to apply view changes
+    vis.poll_events()
+    vis.update_renderer()
     
     # Draw the axis of the point cloud
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
@@ -222,7 +273,7 @@ def main():
 
     # Patch mmcv Scatter.forward before building model/data
     _patch_scatter_forward()
-    
+
     # Handle custom imports/plugins (mimic mmdet3d)
     if cfg.get('custom_imports', None):
         import_modules_from_strings(**cfg['custom_imports'])
@@ -296,7 +347,7 @@ def main():
     if args.checkpoint is not None:
         print(f"Loading checkpoint: {args.checkpoint}")
         load_checkpoint(model, args.checkpoint, map_location='cpu')
-    
+
     # Wrap model based on distributed mode (exactly like test.py)
     if not distributed:
         # Single GPU: wrap directly with MMDataParallel (no manual device movement)
@@ -322,7 +373,7 @@ def main():
         from torch.utils.data import Subset
         dataset = Subset(dataset, [args.sample_index])
         print(f"Processing sample at index {args.sample_index}")
-    
+
     if args.max_samples:
         from torch.utils.data import Subset
         max_idx = min(args.max_samples, len(dataset))
@@ -347,28 +398,54 @@ def main():
         out_dir=None,
         UI_result=None
     )
-    
+
     # Process outputs to extract point clouds and visualize
     print(f"\nProcessing {len(outputs)} results...")
+    
+    print('outputs: ', outputs)
+    
     for i, result in enumerate(outputs):
         # Extract generated points from result if available
         if isinstance(result, dict) and 'generated_points' in result:
             points = result['generated_points']
-            if isinstance(points, torch.Tensor):
-                points = points.cpu().numpy()
             
-            sample_token = f"sample_{i}"
-            print(f"✓ Generated point cloud with {len(points)} points for {sample_token}")
+            # Handle list of tensors (batch size > 1) or single tensor
+            if isinstance(points, list):
+                # Take first item if it's a list (for batch processing)
+                points = points[0] if len(points) > 0 else None
             
-            # Optionally save point cloud
-            if args.output_dir:
-                output_path = os.path.join(args.output_dir, f"{sample_token}_points.npy")
-                np.save(output_path, points)
-                print(f"  Saved point cloud to {output_path}")
-            
-            # Display point cloud
-            if points is not None and len(points) > 0:
-                display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=None)
+            if points is not None:
+                # Convert to numpy if tensor
+                if isinstance(points, torch.Tensor):
+                    points = points.cpu().numpy()
+                
+                sample_token = f"sample_{i}"
+                print(f"✓ Generated point cloud with {len(points)} points for {sample_token}")
+                
+                # Extract colors if available
+                colors = result.get('generated_colors', None)
+                if colors is not None:
+                    # Colors are already in [0, 1] range from reconstruction_backbone
+                    if isinstance(colors, np.ndarray):
+                        print(f"  Found colors with shape {colors.shape}")
+                    else:
+                        colors = None
+                
+                # Optionally save point cloud as PCD file
+                if args.output_dir:
+                    # Save as PCD file with colors
+                    pcd_path = os.path.join(args.output_dir, f"{sample_token}_points.pcd")
+                    save_point_cloud_pcd(points, pcd_path, colors=colors)
+                    print(f"  Saved point cloud to {pcd_path}")
+                    
+                    # Also save as numpy for compatibility
+                    npy_path = os.path.join(args.output_dir, f"{sample_token}_points.npy")
+                    np.save(npy_path, points)
+                    print(f"  Saved point cloud (numpy) to {npy_path}")
+                
+                # Display point cloud with colors
+                if points is not None and len(points) > 0:
+                    display_point_cloud(points, sample_token, colors=colors, gt_bboxes_3d=None)
     
     print(f"\n{'='*60}")
     print("Processing Summary")

@@ -64,9 +64,9 @@ class InputProcessor:
     # -----------------------------
     def __call__(
         self,
-        image: list[np.ndarray | Image.Image | str],
-        extrinsics: np.ndarray | None = None,
-        intrinsics: np.ndarray | None = None,
+        image: list[np.ndarray | Image.Image | str] | torch.Tensor,
+        extrinsics: np.ndarray | torch.Tensor | None = None,
+        intrinsics: np.ndarray | torch.Tensor | None = None,
         process_res: int = 504,
         process_res_method: str = "upper_bound_resize",
         *,
@@ -76,10 +76,32 @@ class InputProcessor:
         desc: str | None = "Preprocess",
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """
+        Process images for model inference.
+        
+        Args:
+            image: Can be:
+                - List of images (numpy arrays, PIL Images, or file paths) for CPU processing
+                - torch.Tensor with shape (B, N, 3, H, W) for GPU tensor processing
+            extrinsics: Camera extrinsics
+            intrinsics: Camera intrinsics
+            process_res: Processing resolution
+            process_res_method: Resize method
+            num_workers: Number of workers for parallel processing (only for list inputs)
+            print_progress: Whether to print progress (only for list inputs)
+            sequential: Whether to process sequentially (only for list inputs)
+            desc: Description for progress (only for list inputs)
+        
         Returns:
             (tensor, extrinsics_list, intrinsics_list)
-            tensor shape: (1, N, 3, H, W)
+            tensor shape: (B, N, 3, H_new, W_new) where B is batch size
         """
+        # Check if input is a tensor (GPU tensor path)
+        if isinstance(image, torch.Tensor):
+            return self._process_tensor_batch(
+                image, extrinsics, intrinsics, process_res, process_res_method
+            )
+        
+        # Original CPU/numpy path for list inputs
         sequential = self._resolve_sequential(sequential, num_workers)
         exts_list, ixts_list = self._validate_and_pack_meta(image, extrinsics, intrinsics)
 
@@ -111,6 +133,136 @@ class InputProcessor:
         )
         return (batch_tensor, out_exts, out_ixts)
 
+    def _process_tensor_batch(
+        self,
+        image: torch.Tensor,
+        extrinsics: torch.Tensor | None = None,
+        intrinsics: torch.Tensor | None = None,
+        process_res: int = 504,
+        process_res_method: str = "upper_bound_resize",
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """
+        Process tensor batch directly on GPU without CPU conversion.
+        
+        Args:
+            image: Input tensor with shape (B, N, 3, H, W)
+            extrinsics: Optional camera extrinsics (B, N, 4, 4)
+            intrinsics: Optional camera intrinsics (B, N, 3, 3)
+            process_res: Processing resolution
+            process_res_method: Resize method ("upper_bound_resize" or "lower_bound_resize")
+        
+        Returns:
+            (processed_tensor, extrinsics, intrinsics)
+            processed_tensor shape: (B, N, 3, H_new, W_new)
+        """
+        import torch.nn.functional as F
+        
+        B, N, C, H, W = image.shape
+        device = image.device
+        dtype = image.dtype
+        
+        # Step 1: Boundary resize (preserve aspect ratio)
+        if process_res_method in ("upper_bound_resize", "upper_bound_crop"):
+            # Resize longest side to process_res
+            scale = process_res / max(H, W)
+        elif process_res_method in ("lower_bound_resize", "lower_bound_crop"):
+            # Resize shortest side to process_res
+            scale = process_res / min(H, W)
+        else:
+            raise ValueError(f"Unsupported process_res_method: {process_res_method}")
+        
+        new_H = int(H * scale)
+        new_W = int(W * scale)
+        
+        # Resize using bilinear interpolation
+        # Reshape to (B*N, C, H, W) for batch processing
+        image_reshaped = image.view(B * N, C, H, W)
+        image_resized = F.interpolate(
+            image_reshaped,
+            size=(new_H, new_W),
+            mode='bilinear',
+            align_corners=False
+        )
+        image_resized = image_resized.view(B, N, C, new_H, new_W)
+        
+        # Step 2: Make divisible by PATCH_SIZE (use class attribute)
+        def nearest_multiple(x: int, p: int) -> int:
+            down = (x // p) * p
+            up = down + p
+            return up if abs(up - x) <= abs(x - down) else down
+        
+        final_H = max(1, nearest_multiple(new_H, self.PATCH_SIZE))
+        final_W = max(1, nearest_multiple(new_W, self.PATCH_SIZE))
+        
+        if final_H != new_H or final_W != new_W:
+            # Resize to final size
+            image_reshaped = image_resized.view(B * N, C, new_H, new_W)
+            upscale = (final_H > new_H) or (final_W > new_W)
+            mode = 'bilinear' if upscale else 'area'
+            # align_corners can only be used with linear/bilinear/bicubic/trilinear modes
+            if mode == 'bilinear':
+                image_final = F.interpolate(
+                    image_reshaped,
+                    size=(final_H, final_W),
+                    mode=mode,
+                    align_corners=False
+                )
+            else:  # mode == 'area'
+                image_final = F.interpolate(
+                    image_reshaped,
+                    size=(final_H, final_W),
+                    mode=mode
+                )
+            image_final = image_final.view(B, N, C, final_H, final_W)
+        else:
+            image_final = image_resized
+        
+        # Step 3: Normalize (ImageNet normalization)
+        # Original _normalize_image does: T.ToTensor() then NORMALIZE
+        # ToTensor converts [0, 255] -> [0, 1], then NORMALIZE applies (x - mean) / std
+        # 
+        # Handle different input ranges:
+        # - If max <= 1.0: assume [0, 1] range (already like ToTensor output), just normalize
+        # - If max > 1.0 and max <= 255: assume [0, 255] range, convert to [0, 1] then normalize
+        # - If already normalized (negative values): skip normalization
+        max_val = image_final.max()
+        min_val = image_final.min()
+        
+        # Check if already normalized (has negative values, which indicates ImageNet normalization was applied)
+        is_normalized = min_val < 0
+        
+        if not is_normalized:
+            # Convert to [0, 1] range if needed (mimics T.ToTensor())
+            if max_val > 1.0:
+                # Input is in [0, 255] range, convert to [0, 1]
+                image_final = image_final / 255.0
+            
+            # Apply ImageNet normalization using existing self.NORMALIZE (T.Normalize)
+            # Reshape to (B*N, C, H, W) to apply normalization, then reshape back
+            B, N, C, H, W = image_final.shape
+            image_reshaped = image_final.view(B * N, C, H, W)
+            # self.NORMALIZE is T.Normalize, which expects (B, C, H, W) format
+            image_normalized = self.NORMALIZE(image_reshaped)
+            image_final = image_normalized.view(B, N, C, H, W)
+        
+        # Update intrinsics if provided
+        if intrinsics is not None:
+            # Scale intrinsics by the resize factors
+            scale_h = final_H / H
+            scale_w = final_W / W
+            intrinsics_scaled = intrinsics.clone()
+            intrinsics_scaled[:, :, 0, 0] *= scale_w  # fx
+            intrinsics_scaled[:, :, 1, 1] *= scale_h  # fy
+            intrinsics_scaled[:, :, 0, 2] *= scale_w  # cx
+            intrinsics_scaled[:, :, 1, 2] *= scale_h  # cy
+        else:
+            intrinsics_scaled = None
+        
+        # Extrinsics don't need to be updated
+        extrinsics_scaled = extrinsics
+        
+        return (image_final, extrinsics_scaled, intrinsics_scaled)
+    
     # -----------------------------
     # __call__ helpers
     # -----------------------------
