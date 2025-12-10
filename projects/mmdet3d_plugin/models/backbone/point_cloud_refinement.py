@@ -395,7 +395,6 @@ class PointCloudRefinement(nn.Module):
         padded_pseudo_points = self._pad_point_clouds(pseudo_points, target_num_points)
         padded_gt_points = self._pad_point_clouds(gt_points, target_num_points)
         
-        
         return padded_pseudo_points, padded_gt_points
     
     

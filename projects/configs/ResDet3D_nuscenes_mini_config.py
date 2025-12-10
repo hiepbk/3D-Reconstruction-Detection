@@ -22,8 +22,7 @@ evaluation = dict(interval=1)
 
 
 load_dim = 5
-# use_dim = [0, 1, 2, 3, 4]
-use_dim = [0, 1, 2] # use x,y,z only
+use_dim = [0, 1, 2] # use x,y,z only, set use_color to False because the original point cloud has no color
 use_color = False
 
 dataset_type = 'NuScenesDataset'

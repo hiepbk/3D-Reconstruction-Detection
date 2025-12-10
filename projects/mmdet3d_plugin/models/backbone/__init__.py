@@ -1,7 +1,7 @@
 from .reconstruction_backbone import ReconstructionBackbone
 from .point_cloud_refinement import (
     PointCloudRefinement,
-    PointCloudRefinementNet,
+    PointNetRefinement,
     chamfer_distance_loss,
     emd_loss_approximate,
     smoothness_loss,
@@ -10,7 +10,7 @@ from .point_cloud_refinement import (
 __all__ = [
     'ReconstructionBackbone',
     'PointCloudRefinement',
-    'PointCloudRefinementNet',
+    'PointNetRefinement',
     'chamfer_distance_loss',
     'emd_loss_approximate',
     'smoothness_loss',

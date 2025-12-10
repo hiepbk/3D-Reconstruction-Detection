@@ -98,7 +98,7 @@ class ReconstructionBackbone(nn.Module):
         # Store ReconstructionBackbone-specific config
         self.rescon_pipeline_cfg = rescon_pipeline
         
-        self.da3_pipeline_cfg = [cfg for cfg in rescon_pipeline if cfg['type'] != 'DepthAnything3Filter']
+        self.da3_pipeline_cfg = [cfg for cfg in rescon_pipeline if cfg['type'] == 'DepthAnything3Filter']
         self.refinement_pipeline_cfg = [cfg for cfg in rescon_pipeline if cfg['type'] == 'RefinementProcessor']
         
         self.da3_pipeline = Compose(self.da3_pipeline_cfg) if self.da3_pipeline_cfg else None
@@ -189,7 +189,77 @@ class ReconstructionBackbone(nn.Module):
         multi_batch_cam2lidar_rts = torch.stack(cam2lidar_rts_list, dim=0).to(device=device, dtype=torch.float32)
         return multi_batch_cam2lidar_rts
 
+    def _get_gt_color_points(
+        self, 
+        gt_points_list: List[torch.Tensor], 
+        multi_batch_ori_imgs: Optional[torch.Tensor] = None, 
+        multi_batch_cam2lidar_rts: Optional[torch.Tensor] = None,
+        multi_batch_intrinsics: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        """
+        Colorize GT points (LiDAR frame) by projecting into multi-view images.
+        """
+        if multi_batch_ori_imgs is None or multi_batch_cam2lidar_rts is None or multi_batch_intrinsics is None:
+            # Fallback: no image info, return zero colors
+            zeros_list = [
+                torch.zeros((pts.shape[0], 3), device=pts.device, dtype=pts.dtype)
+                for pts in gt_points_list
+            ]
+            return [torch.cat([pts, cols], dim=1) for pts, cols in zip(gt_points_list, zeros_list)]
 
+        B = len(gt_points_list)
+        _, N, _, H, W = multi_batch_ori_imgs.shape  # (B, N, 3, H, W)
+
+        gt_color_points_list: List[torch.Tensor] = []
+        for b_idx in range(B):
+            pts_lidar = gt_points_list[b_idx]  # (P, 3)
+            colors = torch.zeros((pts_lidar.shape[0], 3), device=pts_lidar.device, dtype=pts_lidar.dtype)
+            filled = torch.zeros((pts_lidar.shape[0],), device=pts_lidar.device, dtype=torch.bool)
+
+            for cam_idx in range(N):
+                cam2lidar = multi_batch_cam2lidar_rts[b_idx, cam_idx]  # (4,4)
+                R_cl = cam2lidar[:3, :3]  # cam -> lidar rotation
+                t_cl = cam2lidar[3, :3]   # cam -> lidar translation
+                # lidar -> cam
+                R_lc = R_cl.transpose(0, 1)
+                t_lc = -R_lc @ t_cl
+
+                pts_cam = pts_lidar @ R_lc.T + t_lc  # (P,3)
+                z = pts_cam[:, 2]
+                valid = z > 0
+
+                K = multi_batch_intrinsics[b_idx, cam_idx]  # (3,3)
+                fx, fy = K[0, 0], K[1, 1]
+                cx, cy = K[0, 2], K[1, 2]
+
+                u = fx * pts_cam[:, 0] / z + cx
+                v = fy * pts_cam[:, 1] / z + cy
+
+                valid = valid & (u >= 0) & (u <= (W - 1)) & (v >= 0) & (v <= (H - 1))
+                if not valid.any():
+                    continue
+
+                idx = valid & (~filled)
+                if not idx.any():
+                    continue
+
+                u_idx = u[idx].long()
+                v_idx = v[idx].long()
+
+                img = multi_batch_ori_imgs[b_idx, cam_idx]  # (3, H, W)
+                img_hw3 = img.permute(1, 2, 0)  # (H, W, 3)
+                sampled = img_hw3[v_idx, u_idx]
+                if not torch.is_floating_point(sampled):
+                    sampled = sampled.float()
+                if sampled.max() > 1.5:
+                    sampled = sampled / 255.0
+
+                colors[idx] = sampled
+                filled[idx] = True
+
+            gt_color_points_list.append(torch.cat([pts_lidar, colors], dim=1))
+
+        return gt_color_points_list
     
     def _backproject_depth_to_points(
         self,
@@ -464,25 +534,35 @@ class ReconstructionBackbone(nn.Module):
             
 
             
-            # Prepare GT points in batch format
-            gt_points_batch = None
+            # Prepare GT points in batch format (list of tensors)
+            gt_points_list = None
             if points is not None:
                 if isinstance(points, list):
-                    # Stack list of tensors
-                    gt_points_list = [p.float().to(device) for p in points if p is not None]  # list of (N, 3) tensors with length B
+                    gt_points_list = [p.float().to(device) for p in points if p is not None]
                 elif isinstance(points, torch.Tensor):
                     if points.dim() == 3:  # (B, N, 3)
                         gt_points_list = [points[i].float().to(device) for i in range(B)]
                     else:  # (N, 3) - single point cloud, expand to batch
                         gt_points_list = [points.unsqueeze(0).expand(B, -1, -1).float().to(device)]
+
+            # Colorize GT points if available
+            if gt_points_list is not None:
+                gt_points_list = self._get_gt_color_points(
+                    gt_points_list=gt_points_list,
+                    multi_batch_ori_imgs=multi_batch_ori_imgs,
+                    multi_batch_cam2lidar_rts=multi_batch_cam2lidar_rts,
+                    multi_batch_intrinsics=multi_batch_intrinsics,
+                )
+                
+                
+            display_point_cloud(pseudo_points_list[0].cpu().numpy(), colors=gt_points_list[0].cpu().numpy()[:, 3:], gt_bboxes_3d=None)
             
             # Apply refinement in batch mode (if enabled)
             if self.refinement is not None:
-                
                 # Refine entire batch at once
                 refined_batch, refinement_losses = self.refinement(
-                    pseudo_points=pseudo_points_list,  # (B, N, C) tensor
-                    gt_points=gt_points_list,  # list of (N, 3) tensors with length B
+                    pseudo_points=pseudo_points_list,  # list of (N, C) tensors
+                    gt_points=gt_points_list,  # list of (N, 3 or 6) tensors
                     return_loss=True,  # Always compute loss in training
                 )
                 
@@ -593,7 +673,7 @@ class ReconstructionBackbone(nn.Module):
             if self.refinement is not None:
                 # Refine entire batch at once (no GT in test mode)
                 refined_batch, _ = self.refinement(
-                    pseudo_points=pseudo_points_list,  # list of (N, 3) tensors with length B
+                    pseudo_points=pseudo_points_list,  # list of (N, C) tensors
                     gt_points=None,  # No GT in test mode
                     return_loss=False,  # No loss computation in test
                 )
@@ -610,17 +690,17 @@ class ReconstructionBackbone(nn.Module):
 
 
 # add visualizatin function here for debugging purposes
-def display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=None):
+def display_point_cloud(points, colors=None, gt_bboxes_3d=None):
+    import open3d as o3d
     """Display point cloud using open3d.
     
     Args:
         points (np.ndarray): Point cloud as numpy array of shape (N, 3)
-        sample_token (str): Sample token for window title
         colors (np.ndarray, optional): Colors as numpy array of shape (N, 3) in [0, 1]
         gt_bboxes_3d (list, optional): List of ground truth 3D bounding boxes
     """
     if points is None or len(points) == 0:
-        print(f"  Warning: No point cloud to display for sample {sample_token}")
+        print(f"  Warning: No point cloud to display")
         return
     
     print(f"  Displaying point cloud with {len(points)} points...")
@@ -628,7 +708,7 @@ def display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=None):
     
     # Convert numpy to open3d PointCloud
     pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.points = o3d.utility.Vector3dVector(points[:, :3])
     
     # Set colors if provided
     if colors is not None:
@@ -642,7 +722,7 @@ def display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=None):
     
     # Create visualization window
     vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name=f"Point Cloud - Sample {sample_token[:8]}", width=1920, height=1080)
+    vis.create_window(window_name=f"Point Cloud", width=1920, height=1080)
     vis.add_geometry(pcd)
     
     # Calculate point cloud center and bounds for proper view setup
