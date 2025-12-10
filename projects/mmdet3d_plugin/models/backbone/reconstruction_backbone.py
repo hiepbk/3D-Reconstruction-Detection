@@ -189,24 +189,26 @@ class ReconstructionBackbone(nn.Module):
         multi_batch_cam2lidar_rts = torch.stack(cam2lidar_rts_list, dim=0).to(device=device, dtype=torch.float32)
         return multi_batch_cam2lidar_rts
 
+    def _extract_lidar2img_from_meta(self, meta: Dict, device: torch.device) -> torch.Tensor:
+        """Extract lidar2img matrices from metadata (must exist)."""
+        if meta is None:
+            raise ValueError("img_metas is required and must include lidar2img")
+        lidar2img_list = []
+        for meta_batch in meta:
+            if 'lidar2img' not in meta_batch or meta_batch['lidar2img'] is None:
+                raise ValueError("lidar2img missing in img_metas; required for GT colorization")
+            lidar2img_list.append(torch.tensor(meta_batch['lidar2img'], device=device))
+        return torch.stack(lidar2img_list, dim=0).to(device=device, dtype=torch.float32)
+
     def _get_gt_color_points(
-        self, 
-        gt_points_list: List[torch.Tensor], 
-        multi_batch_ori_imgs: Optional[torch.Tensor] = None, 
-        multi_batch_cam2lidar_rts: Optional[torch.Tensor] = None,
-        multi_batch_intrinsics: Optional[torch.Tensor] = None,
+        self,
+        gt_points_list: List[torch.Tensor],
+        multi_batch_ori_imgs: torch.Tensor,
+        multi_batch_lidar2img: torch.Tensor,
     ) -> List[torch.Tensor]:
         """
-        Colorize GT points (LiDAR frame) by projecting into multi-view images.
+        Colorize GT points (LiDAR frame) by projecting into multi-view images using lidar2img.
         """
-        if multi_batch_ori_imgs is None or multi_batch_cam2lidar_rts is None or multi_batch_intrinsics is None:
-            # Fallback: no image info, return zero colors
-            zeros_list = [
-                torch.zeros((pts.shape[0], 3), device=pts.device, dtype=pts.dtype)
-                for pts in gt_points_list
-            ]
-            return [torch.cat([pts, cols], dim=1) for pts, cols in zip(gt_points_list, zeros_list)]
-
         B = len(gt_points_list)
         _, N, _, H, W = multi_batch_ori_imgs.shape  # (B, N, 3, H, W)
 
@@ -216,26 +218,19 @@ class ReconstructionBackbone(nn.Module):
             colors = torch.zeros((pts_lidar.shape[0], 3), device=pts_lidar.device, dtype=pts_lidar.dtype)
             filled = torch.zeros((pts_lidar.shape[0],), device=pts_lidar.device, dtype=torch.bool)
 
-            for cam_idx in range(N):
-                cam2lidar = multi_batch_cam2lidar_rts[b_idx, cam_idx]  # (4,4)
-                R_cl = cam2lidar[:3, :3]  # cam -> lidar rotation
-                t_cl = cam2lidar[3, :3]   # cam -> lidar translation
-                # lidar -> cam
-                R_lc = R_cl.transpose(0, 1)
-                t_lc = -R_lc @ t_cl
+            lidar2img = multi_batch_lidar2img[b_idx]  # (N,4,4)
 
-                pts_cam = pts_lidar @ R_lc.T + t_lc  # (P,3)
-                z = pts_cam[:, 2]
-                valid = z > 0
+            for cam_idx in range(min(N, lidar2img.shape[0])):
+                pts_h = torch.cat(
+                    [pts_lidar, torch.ones((pts_lidar.shape[0], 1), device=pts_lidar.device, dtype=pts_lidar.dtype)],
+                    dim=1,
+                )
+                proj = pts_h @ lidar2img[cam_idx].T  # (P,4)
+                z = proj[:, 2]
+                u = proj[:, 0] / z
+                v = proj[:, 1] / z
+                valid = (z > 0) & (u >= 0) & (u <= (W - 1)) & (v >= 0) & (v <= (H - 1))
 
-                K = multi_batch_intrinsics[b_idx, cam_idx]  # (3,3)
-                fx, fy = K[0, 0], K[1, 1]
-                cx, cy = K[0, 2], K[1, 2]
-
-                u = fx * pts_cam[:, 0] / z + cx
-                v = fy * pts_cam[:, 1] / z + cy
-
-                valid = valid & (u >= 0) & (u <= (W - 1)) & (v >= 0) & (v <= (H - 1))
                 if not valid.any():
                     continue
 
@@ -545,13 +540,13 @@ class ReconstructionBackbone(nn.Module):
                     else:  # (N, 3) - single point cloud, expand to batch
                         gt_points_list = [points.unsqueeze(0).expand(B, -1, -1).float().to(device)]
 
-            # Colorize GT points if available
+            # Colorize GT points if available using lidar2img
             if gt_points_list is not None:
+                multi_batch_lidar2img = self._extract_lidar2img_from_meta(img_metas, device=device)
                 gt_points_list = self._get_gt_color_points(
                     gt_points_list=gt_points_list,
                     multi_batch_ori_imgs=multi_batch_ori_imgs,
-                    multi_batch_cam2lidar_rts=multi_batch_cam2lidar_rts,
-                    multi_batch_intrinsics=multi_batch_intrinsics,
+                    multi_batch_lidar2img=multi_batch_lidar2img,
                 )
                 
                 
