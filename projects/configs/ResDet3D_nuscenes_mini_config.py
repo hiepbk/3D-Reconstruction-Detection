@@ -54,8 +54,8 @@ train_pipeline = [
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
-        load_dim=5,
-        use_dim=[0, 1, 2, 3, 4],
+        load_dim=load_dim,
+        use_dim=use_dim,
     ),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -94,8 +94,8 @@ test_pipeline = [
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
-        load_dim=5,
-        use_dim=[0, 1, 2, 3, 4],
+        load_dim=load_dim,
+        use_dim=use_dim,
     ),
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
     dict(

@@ -21,9 +21,9 @@ from mmcv.parallel import MMDataParallel
 from mmcv.runner import load_checkpoint
 from mmcv.utils import import_modules_from_strings
 
-from mmdet3d.apis import single_gpu_test
 from mmdet3d.datasets import build_dataloader, build_dataset
 from mmdet3d.models import build_model
+import mmcv
 
 # Patch mmcv Scatter.forward to handle device indices correctly
 # This fixes a bug where target_gpus contains integers but _get_stream expects device objects
@@ -216,6 +216,92 @@ def display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=None):
     vis.destroy_window()
 
 
+def single_gpu_test(model,
+                    data_loader,
+                    show=False,
+                    out_dir=None,):
+    """Test model with single gpu.
+
+    This method tests model with single gpu and gives the 'show' option.
+    By setting ``show=True``, it saves the visualization results under
+    ``out_dir``.
+
+    Args:
+        model (nn.Module): Model to be tested.
+        data_loader (nn.Dataloader): Pytorch data loader.
+        show (bool): Whether to save viualization results.
+            Default: True.
+        out_dir (str): The path to save visualization results.
+            Default: None.
+
+    Returns:
+        list[dict]: The prediction results.
+    """
+    model.eval()
+    results = []
+    dataset = data_loader.dataset
+    prog_bar = mmcv.ProgressBar(len(dataset))
+
+    for i, data in enumerate(data_loader):
+        with torch.no_grad():
+            # sample_idx = 1447
+            # data = data_loader.dataset[sample_idx]
+            result = model(return_loss=False, rescale=True, **data)
+            
+            
+        batch_size = len(result)
+        for pred_idx, pred in enumerate(result):
+            gt
+            # This for debugging purposes
+            if isinstance(pred, dict) and 'pseudo_points' in pred:
+                pseudo_points = pred['pseudo_points']
+                
+                # Handle both single tensor and list of tensors
+                # (list case can happen if model returns list, but typically it's a single tensor per sample)
+                if isinstance(pseudo_points, list):
+                    # If it's a list, take the first element (shouldn't happen with proper batching)
+                    if len(pseudo_points) > 0:
+                        pseudo_points = pseudo_points[0]
+                    else:
+                        pseudo_points = None
+                
+                if pseudo_points is not None:
+                    # Convert to numpy if tensor
+                    if isinstance(pseudo_points, torch.Tensor):
+                        pseudo_points = pseudo_points.cpu().numpy()
+                    
+                    sample_token = f"batch_{i}_pred_{pred_idx}"
+                    
+                    # Split xyz / colors if available
+                    colors = None
+                    points = pseudo_points
+                    if pseudo_points.shape[1] >= 6:
+                        colors = pseudo_points[:, 3:]
+                        points = pseudo_points[:, :3]
+                    
+                    print(f"✓ Generated pseudo point cloud with {len(points)} points for {sample_token}")
+                    if colors is not None:
+                        print(f"  Found colors with shape {colors.shape}")
+                    
+                    # Optionally save point cloud as PCD file
+                    if out_dir:
+                        pcd_path = os.path.join(out_dir, f"{sample_token}_points.pcd")
+                        save_point_cloud_pcd(points, pcd_path, colors=colors)
+                        print(f"  Saved point cloud to {pcd_path}")
+                    
+                    # Display point cloud with colors
+                    if show and points is not None and len(points) > 0:
+                        display_point_cloud(points, sample_token, colors=colors, gt_bboxes_3d=None)
+        
+        results.extend(result)
+
+
+        for _ in range(batch_size):
+            prog_bar.update()
+    
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="mmdet3d-style inference for ResDet3D with DepthAnything3 reconstruction"
@@ -258,8 +344,7 @@ def main():
     )
     parser.add_argument(
         "--display",
-        type=bool,
-        default=True,
+        action='store_true',
         help="Display point cloud with colors",
     )
 
@@ -368,57 +453,9 @@ def main():
     outputs = single_gpu_test(
         model=model,
         data_loader=data_loader,
-        show=False,
-        out_dir=None,
-        UI_result=None
+        show=args.display,
+        out_dir=args.output_dir,
     )
-
-    # Process outputs to extract point clouds and visualize
-    # Note: outputs is a list where each element corresponds to one sample
-    # When batch_size > 1, single_gpu_test still returns one result per sample
-    print(f"\nProcessing {len(outputs)} results...")
-    
-    for sample_idx, result in enumerate(outputs):
-        # Extract pseudo points from result if available
-        if isinstance(result, dict) and 'pseudo_points' in result:
-            pseudo_points = result['pseudo_points']
-            
-            # Handle both single tensor and list of tensors
-            # (list case can happen if model returns list, but typically it's a single tensor per sample)
-            if isinstance(pseudo_points, list):
-                # If it's a list, take the first element (shouldn't happen with proper batching)
-                if len(pseudo_points) > 0:
-                    pseudo_points = pseudo_points[0]
-                else:
-                    pseudo_points = None
-            
-            if pseudo_points is not None:
-                # Convert to numpy if tensor
-                if isinstance(pseudo_points, torch.Tensor):
-                    pseudo_points = pseudo_points.cpu().numpy()
-                
-                sample_token = f"sample_{sample_idx}"
-                
-                # Split xyz / colors if available
-                colors = None
-                points = pseudo_points
-                if pseudo_points.shape[1] >= 6:
-                    colors = pseudo_points[:, 3:]
-                    points = pseudo_points[:, :3]
-                
-                print(f"✓ Generated pseudo point cloud with {len(points)} points for {sample_token}")
-                if colors is not None:
-                    print(f"  Found colors with shape {colors.shape}")
-                
-                # Optionally save point cloud as PCD file
-                if args.output_dir:
-                    pcd_path = os.path.join(args.output_dir, f"{sample_token}_points.pcd")
-                    save_point_cloud_pcd(points, pcd_path, colors=colors)
-                    print(f"  Saved point cloud to {pcd_path}")
-                
-                # Display point cloud with colors
-                if args.display and points is not None and len(points) > 0:
-                    display_point_cloud(points, sample_token, colors=colors, gt_bboxes_3d=None)
     
     print(f"\n{'='*60}")
     print("Processing Summary")
