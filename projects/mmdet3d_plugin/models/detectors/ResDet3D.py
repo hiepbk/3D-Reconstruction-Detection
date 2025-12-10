@@ -90,29 +90,93 @@ class ResDet3D(MVXTwoStageDetector):
             self.reconstruction_backbone = None
             print(f"[DEBUG] ResDet3D: No reconstruction backbone configured")
     
-    def extract_feat(self, points=None, img=None, img_metas=None):
+    def extract_feat(self, points=None, img=None, img_metas=None, return_loss=False):
         """Extract features using reconstruction backbone.
         
         This generates point clouds from multi-view images using DepthAnything3.
         The point cloud can then be used by the detection head.
         
         Args:
-            points: Point cloud (optional, not used when reconstruction_backbone exists)
+            points: Ground truth point cloud (optional, for training with refinement)
             img: Multi-view images (B, N, 3, H, W) or DataContainer
             img_metas: Image metadata list
+            return_loss: Whether to return losses (for training)
         
         Returns:
             tuple: (img_feats, pts_feats) where pts_feats is the generated point cloud
+            If return_loss=True and refinement enabled, also returns losses dict
         """
         if self.reconstruction_backbone is not None:
-
-            pseudo_points = self.reconstruction_backbone(img, img_metas)
+            # Forward through reconstruction backbone
+            result = self.reconstruction_backbone(img, img_metas, return_loss=return_loss, points=points)
+            
+            # Handle new return format: (batch_point_clouds, losses)
+            if isinstance(result, tuple) and len(result) == 2:
+                pseudo_points, losses = result
+                # Store losses for later use in loss computation
+                if losses is not None:
+                    self._reconstruction_losses = losses
+            else:
+                # Backward compatibility: just point clouds
+                pseudo_points = result
+                losses = None
+            
             # Return format matching parent class: (img_feats, pts_feats)
             # For now, img_feats is None since we're only using reconstruction
             return (None, pseudo_points)
         else:
             # No reconstruction backbone, fall back to parent behavior
             return super().extract_feat(points, img, img_metas)
+    
+    def forward_train(self,
+                      points=None,
+                      img_metas=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None,
+                      gt_labels=None,
+                      gt_bboxes=None,
+                      img=None,
+                      proposals=None,
+                      gt_bboxes_ignore=None):
+        """Forward function for training.
+        
+        Override to handle refinement losses from reconstruction backbone.
+        """
+        losses = dict()
+        
+        if self.reconstruction_backbone is not None:
+            # Extract features (generates point cloud with refinement)
+            img_feats, pseudo_points = self.extract_feat(
+                points=points,  # GT points for refinement loss
+                img=img,
+                img_metas=img_metas,
+                return_loss=True
+            )
+            
+            # Add refinement losses if available
+            if hasattr(self, '_reconstruction_losses') and self._reconstruction_losses is not None:
+                # Prefix losses with 'reconstruction_' to avoid conflicts
+                for key, value in self._reconstruction_losses.items():
+                    losses[f'reconstruction_{key}'] = value
+                # Clear stored losses
+                delattr(self, '_reconstruction_losses')
+        
+        # Call parent forward_train for detection losses (if head/neck exist)
+        if self.pts_bbox_head is not None or self.img_backbone is not None:
+            parent_losses = super().forward_train(
+                points=pseudo_points if self.reconstruction_backbone is not None else points,
+                img_metas=img_metas,
+                gt_bboxes_3d=gt_bboxes_3d,
+                gt_labels_3d=gt_labels_3d,
+                gt_labels=gt_labels,
+                gt_bboxes=gt_bboxes,
+                img=img,
+                proposals=proposals,
+                gt_bboxes_ignore=gt_bboxes_ignore
+            )
+            losses.update(parent_losses)
+        
+        return losses
     
     def simple_test(self, points, img_metas, img=None, rescale=False):
         """Test function without augmentation.
@@ -124,15 +188,25 @@ class ResDet3D(MVXTwoStageDetector):
             # Extract features (generates point cloud)
             img_feats, pseudo_points = self.extract_feat(points, img=img, img_metas=img_metas)
             
+            # Handle tuple return (backward compatibility)
+            if isinstance(pseudo_points, tuple):
+                pseudo_points, _ = pseudo_points
+            
             # For now, return empty results since we don't have head/neck
             # Later, when head/neck are added, this will call simple_test_pts
             bbox_list = [dict() for i in range(len(img_metas))]
             
             # Store pseudo points and colors in result for potential use
             if pseudo_points is not None:
-                for i, result_dict in enumerate(bbox_list):
-                    result_dict['pseudo_points'] = pseudo_points
-                    # Colors are handled by backbone; none stored here
+                # Handle list of point clouds (one per batch item)
+                if isinstance(pseudo_points, list):
+                    for i, result_dict in enumerate(bbox_list):
+                        if i < len(pseudo_points):
+                            result_dict['pseudo_points'] = pseudo_points[i]
+                else:
+                    # Single point cloud for all
+                    for i, result_dict in enumerate(bbox_list):
+                        result_dict['pseudo_points'] = pseudo_points
             
             return bbox_list
         else:

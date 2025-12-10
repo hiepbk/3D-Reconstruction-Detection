@@ -18,6 +18,7 @@ from mmdet.datasets.pipelines import Compose
 from projects.mmdet3d_plugin.models.depth_anything_3.api import DepthAnything3
 from projects.mmdet3d_plugin.models.depth_anything_3.specs import Prediction
 from projects.mmdet3d_plugin.datasets.pipelines.respoint_post_processing import ResPointCloudPipeline
+from projects.mmdet3d_plugin.models.backbone.point_cloud_refinement import PointCloudRefinement
 
 
 
@@ -55,6 +56,8 @@ class ReconstructionBackbone(nn.Module):
         filter_sky: bool = True,
         max_depth: Optional[float] = None,
         conf_thresh_percentile: Optional[float] = None,
+        freeze_da3: bool = True,  # Freeze DepthAnything3 model (recommended)
+        refinement: Optional[Dict] = None,  # Point cloud refinement config
     ):
         """Initialize ReconstructionBackbone.
         
@@ -79,9 +82,18 @@ class ReconstructionBackbone(nn.Module):
         self.da3_model.eval()
         print(f"[DEBUG] ReconstructionBackbone: DepthAnything3 model loaded successfully")
         
-        # Set to eval mode
-        self.eval()
-        print(f"[DEBUG] ReconstructionBackbone: Model set to eval mode")
+        # Freeze DA3 model if requested (recommended for training)
+        self.freeze_da3 = freeze_da3
+        if self.freeze_da3:
+            for param in self.da3_model.parameters():
+                param.requires_grad = False
+            print(f"[DEBUG] ReconstructionBackbone: DepthAnything3 model frozen (requires_grad=False)")
+        else:
+            print(f"[DEBUG] ReconstructionBackbone: DepthAnything3 model trainable (requires_grad=True)")
+        
+        # Set to eval mode (but can be switched to train mode for refinement)
+        # self.eval()  # Don't force eval mode, let training script control it
+        print(f"[DEBUG] ReconstructionBackbone: Model initialized")
         
         # Store ReconstructionBackbone-specific config
         self.respoint_post_processing_pipeline_cfg = respoint_post_processing_pipeline
@@ -98,6 +110,15 @@ class ReconstructionBackbone(nn.Module):
         self.filter_sky = filter_sky
         self.max_depth = max_depth or self.glb_config.get('max_depth', None)
         self.conf_thresh_percentile = conf_thresh_percentile or self.glb_config.get('conf_thresh_percentile', None)
+        
+        # Build point cloud refinement module
+        if refinement is not None:
+            print(f"[DEBUG] ReconstructionBackbone: Building point cloud refinement module...")
+            self.refinement = PointCloudRefinement(**refinement)
+            print(f"[DEBUG] ReconstructionBackbone: Refinement module built successfully")
+        else:
+            self.refinement = None
+            print(f"[DEBUG] ReconstructionBackbone: No refinement module configured")
     
     @property
     def input_processor(self):
@@ -312,22 +333,53 @@ class ReconstructionBackbone(nn.Module):
         img: torch.Tensor,
         img_metas: List[Dict],
         return_loss: bool = False,
-        # use_image_paths: bool = False,  # Debug mode: use image paths instead of preprocessed tensors
-    ) -> List[torch.Tensor]:
+        points: Optional[torch.Tensor] = None,  # GT point cloud for training
+        freeze_da3_override: Optional[bool] = None,  # Override freeze_da3 setting for this forward pass
+    ) -> Tuple[List[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
         """Forward pass: generate point cloud from images.
+        
+        Routes to forward_train or forward_test based on return_loss flag.
+        Both paths apply refinement network.
         
         Args:
             img: Multi-view images (B, N, 3, H, W) or DataContainer
             img_metas: Image metadata list (one dict per batch item)
-            return_loss: Whether to return loss (unused, for compatibility)
-            use_image_paths: If True, extract image paths and use inference() method directly
-                            (bypasses preprocessing, useful for debugging)
+            return_loss: Whether to return loss (True=train, False=test)
+            points: Ground truth point clouds (B, N, 3) or list of (N, 3) tensors for training
+            freeze_da3_override: Override freeze_da3 setting for this forward pass (train mode only)
         
         Returns:
-            List of point cloud tensors, one per batch item
-            Each tensor has shape (N_points, 3) in LiDAR coordinates
-            Same format as point cloud from bin file
+            batch_point_clouds: List of point cloud tensors, one per batch item
+                Each tensor has shape (N_points, 3) or (N_points, 6) if colors included
+            losses: Dict of loss values (if return_loss=True and refinement enabled)
         """
+        if return_loss:
+            return self.forward_train(img, img_metas, points, freeze_da3_override)
+        else:
+            return self.forward_test(img, img_metas)
+    
+    def forward_train(
+        self,
+        img: torch.Tensor,
+        img_metas: List[Dict],
+        points: Optional[torch.Tensor] = None,
+        freeze_da3_override: Optional[bool] = None,
+    ) -> Tuple[List[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
+        """Forward pass for training mode.
+        
+        Args:
+            img: Multi-view images (B, N, 3, H, W) or DataContainer
+            img_metas: Image metadata list (one dict per batch item)
+            points: Ground truth point clouds (B, N, 3) or list of (N, 3) tensors
+            freeze_da3_override: Override freeze_da3 setting (None = use self.freeze_da3)
+        
+        Returns:
+            batch_point_clouds: List of refined point cloud tensors
+            losses: Dict of loss values (if refinement enabled)
+        """
+        # Determine whether to freeze DA3 for this forward pass
+        freeze_da3 = self.freeze_da3 if freeze_da3_override is None else freeze_da3_override
+        
         device = next(self.parameters()).device
         
         # Handle DataContainer for img_metas
@@ -337,7 +389,6 @@ class ReconstructionBackbone(nn.Module):
         # Extract images from mmdet3d data format
         multi_batch_ori_imgs = self._extract_images_from_data(img)
         B, N, C, H, W = multi_batch_ori_imgs.shape
-        
         
         batch_point_clouds = []
 
@@ -350,7 +401,10 @@ class ReconstructionBackbone(nn.Module):
             process_res_method="upper_bound_resize",
         )
         imgs_for_da3 = imgs_processed.to(device, non_blocking=True).float()
-        with torch.no_grad():
+        
+        # Use no_grad context if DA3 is frozen
+        da3_context = torch.no_grad() if freeze_da3 else torch.enable_grad()
+        with da3_context:
             da3_output = self.da3_model.forward(
                 image=imgs_for_da3,
                 extrinsics=None,
@@ -361,18 +415,6 @@ class ReconstructionBackbone(nn.Module):
                 ref_view_strategy=self.ref_view_strategy,
             )
         prediction = self._convert_to_prediction(da3_output, return_torch=True)
-        
-        # prediction.depth.shape: (B, N, H, W)
-        # prediction.intrinsics.shape: (B, N, 3, 3)
-        # prediction.sky.shape: (B, N, H, W)
-        # prediction.conf.shape: (B, N, H, W)
-        # prediction.extrinsics.shape: (B, N, 4, 4)
-        # prediction.processed_images shape: (B, N, H, W, 3)
-        # prediction.gaussians.shape: (B, N, H, W, 3)
-        # prediction.aux.shape: (B, N, H, W, 3)
-        # prediction.scale_factor.shape: (B, N, H, W, 3)
-        
-        
         
         if prediction is not None:
             # Back-project depth maps to point clouds (batched)
@@ -389,7 +431,8 @@ class ReconstructionBackbone(nn.Module):
             )
             
             # Process each batch item separately through the post-processing pipeline
-            # This follows mmdet3d's pattern: transforms operate on single samples, not batches
+            post_processed_points_list = []
+            
             for b_idx in range(B):
                 points_b = all_points_batch[b_idx]  # (P, 3) tensor
                 colors_b = all_colors_batch[b_idx] if all_colors_batch[b_idx] is not None and all_colors_batch[b_idx].numel() > 0 else None
@@ -397,11 +440,11 @@ class ReconstructionBackbone(nn.Module):
                 if points_b.shape[0] == 0:
                     raise ValueError(f"No points were generated for batch {b_idx} (all views empty after filtering)")
                 
-                # Apply post-processing pipeline (operates on single sample, like mmdet3d transforms)
+                # Apply post-processing pipeline
                 if self.post_pipeline is not None:
                     pipeline_input = {
-                        'points': points_b,  # Single tensor, not a list
-                        'colors': colors_b,  # Single tensor or None, not a list
+                        'points': points_b,
+                        'colors': colors_b,
                         'polygon_mask': None,
                         'indices': None,
                     }
@@ -409,14 +452,161 @@ class ReconstructionBackbone(nn.Module):
                     points_b = pipeline_output['points']
                     colors_b = pipeline_output.get('colors', colors_b)
                 
-                # Merge points and colors to (N,6) xyzrgb format
+                # Merge points and colors to (N,6) xyzrgb format (or keep as (N,3))
                 if colors_b is not None and colors_b.shape[0] == points_b.shape[0]:
-                    merged = torch.cat([points_b, colors_b], dim=1)
+                    merged = torch.cat([points_b, colors_b], dim=1)  # (N, 6)
                 else:
-                    merged = points_b
+                    merged = points_b  # (N, 3)
                 
-                points_tensor = merged.float().to(device)
-                batch_point_clouds.append(points_tensor)
+                post_processed_points_list.append(merged.float().to(device))
+            
+            # Stack all post-processed point clouds into batch format (B, N, C)
+            # After FPSDownsample, all should have same N (e.g., 40K)
+            post_processed_batch = torch.stack(post_processed_points_list, dim=0)  # (B, N, C) where C is 3 or 6
+            
+            # Prepare GT points in batch format
+            gt_points_batch = None
+            if points is not None:
+                if isinstance(points, list):
+                    # Stack list of tensors
+                    gt_points_batch = torch.stack([p.float().to(device) for p in points if p is not None], dim=0)  # (B, M, 3)
+                elif isinstance(points, torch.Tensor):
+                    if points.dim() == 3:  # (B, N, 3)
+                        gt_points_batch = points.float().to(device)
+                    else:  # (N, 3) - single point cloud, expand to batch
+                        gt_points_batch = points.unsqueeze(0).expand(B, -1, -1).float().to(device)  # (B, N, 3)
+            
+            # Apply refinement in batch mode (if enabled)
+            if self.refinement is not None:
+                # Refine entire batch at once
+                refined_batch, refinement_losses = self.refinement(
+                    pseudo_points=post_processed_batch,  # (B, N, C) tensor
+                    gt_points=gt_points_batch,  # (B, M, 3) tensor or None
+                    return_loss=True,  # Always compute loss in training
+                )
+                
+                # refined_batch is (B, N, C) tensor, convert to list
+                batch_point_clouds = [refined_batch[i] for i in range(B)]
+                losses = refinement_losses
+            else:
+                # No refinement, convert batch tensor to list
+                batch_point_clouds = [post_processed_batch[i] for i in range(B)]
+                losses = None
         
-        return batch_point_clouds
+        return batch_point_clouds, losses
+    
+    def forward_test(
+        self,
+        img: torch.Tensor,
+        img_metas: List[Dict],
+    ) -> Tuple[List[torch.Tensor], None]:
+        """Forward pass for test/inference mode.
+        
+        Args:
+            img: Multi-view images (B, N, 3, H, W) or DataContainer
+            img_metas: Image metadata list (one dict per batch item)
+        
+        Returns:
+            batch_point_clouds: List of refined point cloud tensors
+            losses: Always None in test mode
+        """
+        device = next(self.parameters()).device
+        
+        # Handle DataContainer for img_metas
+        if isinstance(img_metas, DC):
+            img_metas = img_metas.data
+        
+        # Extract images from mmdet3d data format
+        multi_batch_ori_imgs = self._extract_images_from_data(img)
+        B, N, C, H, W = multi_batch_ori_imgs.shape
+        
+        batch_point_clouds = []
+
+        # Run DA3 forward once for the whole batch (always frozen in test mode)
+        imgs_processed, _, _ = self.input_processor(
+            image=multi_batch_ori_imgs,  # (B, N, 3, H, W)
+            extrinsics=None,
+            intrinsics=None,
+            process_res=504,
+            process_res_method="upper_bound_resize",
+        )
+        imgs_for_da3 = imgs_processed.to(device, non_blocking=True).float()
+        
+        # Always use no_grad in test mode
+        with torch.no_grad():
+            da3_output = self.da3_model.forward(
+                image=imgs_for_da3,
+                extrinsics=None,
+                intrinsics=None,
+                export_feat_layers=[],
+                infer_gs=False,
+                use_ray_pose=self.use_ray_pose,
+                ref_view_strategy=self.ref_view_strategy,
+            )
+        prediction = self._convert_to_prediction(da3_output, return_torch=True)
+        
+        if prediction is not None:
+            # Back-project depth maps to point clouds (batched)
+            multi_batch_depths = prediction.depth
+            multi_batch_intrinsics = prediction.intrinsics
+            multi_batch_cam2lidar_rts = self._extract_cam2lidar_rts_from_meta(img_metas, device=device)
+
+            # Back-project all batch items at once (returns lists of length B)
+            all_points_batch, all_colors_batch = self._backproject_depth_to_points(
+                multi_batch_depths,
+                multi_batch_intrinsics,
+                multi_batch_ori_imgs,
+                multi_batch_cam2lidar_rts,
+            )
+            
+            # Process each batch item separately through the post-processing pipeline
+            post_processed_points_list = []
+            
+            for b_idx in range(B):
+                points_b = all_points_batch[b_idx]  # (P, 3) tensor
+                colors_b = all_colors_batch[b_idx] if all_colors_batch[b_idx] is not None and all_colors_batch[b_idx].numel() > 0 else None
+                
+                if points_b.shape[0] == 0:
+                    raise ValueError(f"No points were generated for batch {b_idx} (all views empty after filtering)")
+                
+                # Apply post-processing pipeline
+                if self.post_pipeline is not None:
+                    pipeline_input = {
+                        'points': points_b,
+                        'colors': colors_b,
+                        'polygon_mask': None,
+                        'indices': None,
+                    }
+                    pipeline_output = self.post_pipeline(pipeline_input)
+                    points_b = pipeline_output['points']
+                    colors_b = pipeline_output.get('colors', colors_b)
+                
+                # Merge points and colors to (N,6) xyzrgb format (or keep as (N,3))
+                if colors_b is not None and colors_b.shape[0] == points_b.shape[0]:
+                    merged = torch.cat([points_b, colors_b], dim=1)  # (N, 6)
+                else:
+                    merged = points_b  # (N, 3)
+                
+                post_processed_points_list.append(merged.float().to(device))
+            
+            # Stack all post-processed point clouds into batch format (B, N, C)
+            # After FPSDownsample, all should have same N (e.g., 40K)
+            post_processed_batch = torch.stack(post_processed_points_list, dim=0)  # (B, N, C) where C is 3 or 6
+            
+            # Apply refinement in batch mode (if enabled)
+            if self.refinement is not None:
+                # Refine entire batch at once (no GT in test mode)
+                refined_batch, _ = self.refinement(
+                    pseudo_points=post_processed_batch,  # (B, N, C) tensor
+                    gt_points=None,  # No GT in test mode
+                    return_loss=False,  # No loss computation in test
+                )
+                
+                # refined_batch is (B, N, C) tensor, convert to list
+                batch_point_clouds = [refined_batch[i] for i in range(B)]
+            else:
+                # No refinement, convert batch tensor to list
+                batch_point_clouds = [post_processed_batch[i] for i in range(B)]
+        
+        return batch_point_clouds, None
         
