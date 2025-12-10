@@ -84,9 +84,9 @@ class OutputProcessor:
             model_output: Model output dictionary
 
         Returns:
-            Depth array/tensor with shape (N, H, W)
+            Depth array/tensor with shape (B, N, H, W)
         """
-        depth_t = model_output["depth"].squeeze(0).squeeze(-1)  # (N, H, W)
+        depth_t = model_output["depth"].squeeze(-1)  # (B, N, H, W)
         if return_torch:
             return depth_t.to(device)
         return depth_t.cpu().numpy()
@@ -99,11 +99,11 @@ class OutputProcessor:
             model_output: Model output dictionary
 
         Returns:
-            Confidence array/tensor with shape (N, H, W) or None
+            Confidence array/tensor with shape (B, N, H, W) or None
         """
         conf = model_output.get("depth_conf", None)
         if conf is not None:
-            conf = conf.squeeze(0)  # (N, H, W)
+            conf = conf.squeeze(-1)  # (B, N, H, W)
             if return_torch:
                 conf = conf.to(device)
             else:
@@ -118,11 +118,11 @@ class OutputProcessor:
             model_output: Model output dictionary
 
         Returns:
-            Extrinsics array/tensor with shape (N, 4, 4) or None
+            Extrinsics array/tensor with shape (B, N, 4, 4) or None
         """
         extrinsics = model_output.get("extrinsics", None)
         if extrinsics is not None:
-            extrinsics = extrinsics.squeeze(0)  # (N, 4, 4)
+            extrinsics = extrinsics  # keep (B, N, 4, 4)
             if return_torch:
                 extrinsics = extrinsics.to(device)
             else:
@@ -137,11 +137,11 @@ class OutputProcessor:
             model_output: Model output dictionary
 
         Returns:
-            Intrinsics array/tensor with shape (N, 3, 3) or None
+            Intrinsics array/tensor with shape (B, N, 3, 3) or None
         """
         intrinsics = model_output.get("intrinsics", None)
         if intrinsics is not None:
-            intrinsics = intrinsics.squeeze(0)  # (N, 3, 3)
+            intrinsics = intrinsics  # (B, N, 3, 3)
             if return_torch:
                 intrinsics = intrinsics.to(device)
             else:
@@ -156,11 +156,11 @@ class OutputProcessor:
             model_output: Model output dictionary
 
         Returns:
-            Sky mask array/tensor with shape (N, H, W) or None
+            Sky mask array/tensor with shape (B, N, H, W) or None
         """
         sky = model_output.get("sky", None)
         if sky is not None:
-            sky = sky.squeeze(0)  # (N, H, W)
+            sky = sky.squeeze(-1)  # (B, N, H, W) or (B,N,H,W,1)
             if return_torch:
                 sky = (sky >= 0.5).to(device)
             else:

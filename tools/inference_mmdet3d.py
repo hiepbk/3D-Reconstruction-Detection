@@ -389,7 +389,7 @@ def main():
     # Rebuild data loader with filtered dataset
     data_loader = build_dataloader(
         dataset,
-        samples_per_gpu=1,
+        samples_per_gpu=2,
         workers_per_gpu=cfg.data.get('workers_per_gpu', 4),
         dist=distributed,
         shuffle=False,
