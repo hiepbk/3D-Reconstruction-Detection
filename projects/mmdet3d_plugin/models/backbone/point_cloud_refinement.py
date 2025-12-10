@@ -116,6 +116,7 @@ class PointCloudRefinementNet(nn.Module):
         
         if self.output_mode == 'residual':
             # Add residual to input
+            # the final output will be refined by using the offsets from the output layer to adjust to match with real lidar point cloud
             refined = points + output
         else:
             refined = output

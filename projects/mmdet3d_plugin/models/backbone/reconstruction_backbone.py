@@ -445,7 +445,6 @@ class ReconstructionBackbone(nn.Module):
                     pipeline_input = {
                         'points': points_b,
                         'colors': colors_b,
-                        'polygon_mask': None,
                         'indices': None,
                     }
                     pipeline_output = self.post_pipeline(pipeline_input)
@@ -574,7 +573,6 @@ class ReconstructionBackbone(nn.Module):
                     pipeline_input = {
                         'points': points_b,
                         'colors': colors_b,
-                        'polygon_mask': None,
                         'indices': None,
                     }
                     pipeline_output = self.post_pipeline(pipeline_input)

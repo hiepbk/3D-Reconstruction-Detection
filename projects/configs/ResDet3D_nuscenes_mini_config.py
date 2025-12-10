@@ -46,7 +46,7 @@ extra_feat = True
 
 # ============================================================================
 # Post-processing pipeline (mimic mmdet3d style)
-# Each step receives/returns a dict with at least: points, colors, polygon_mask
+# Each step receives/returns a dict with at least: points, colors
 # ============================================================================
 
 
@@ -58,6 +58,7 @@ train_pipeline = [
         use_dim=use_dim,
     ),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
     # dict(
     #     type='GlobalRotScaleTrans',
@@ -79,7 +80,8 @@ train_pipeline = [
     dict(type='DefaultFormatBundle3D', class_names=class_names),
     dict(
         type='Collect3D',
-        keys=['points', 'gt_bboxes_3d', 'gt_labels_3d'],
+
+        keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'],
         meta_keys=(
             'filename', 'ori_shape', 'img_shape',
             'lidar2img', 'cam2lidar_rts',
@@ -88,7 +90,6 @@ train_pipeline = [
             'box_mode_3d', 'box_type_3d', 'img_norm_cfg',
         ),
     )
-    # dict(type='Collect3D', keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'])
 ]
 test_pipeline = [
     dict(
@@ -165,6 +166,13 @@ respoint_post_processing_pipeline = [
                 enabled=True,
                 num_points=40000,
             ),
+            dict(
+                type='PointPadding',
+                padding_size=40000,
+                
+            )
+            
+            
         ]
     ),
 ]
@@ -239,6 +247,7 @@ model = dict(
                 hidden_channels=64,
                 num_layers=4,
                 output_mode='residual',  # 'residual' outputs offsets, 'direct' outputs refined points
+                # output_mode='direct',  # 'residual' outputs offsets, 'direct' outputs refined points
             ),
             loss_weights=dict(
                 chamfer=1.0,  # Chamfer Distance weight
@@ -305,13 +314,39 @@ model = dict(
         ))
     
     )
-    
-    
+
+optimizer = dict(type='AdamW', lr=0.0001, weight_decay=0.01)
+optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
+lr_config = dict(
+    policy='cyclic',
+    target_ratio=(10, 0.0001),
+    cyclic_times=1,
+    step_ratio_up=0.4)
+momentum_config = dict(
+    policy='cyclic',
+    target_ratio=(0.8947368421052632, 1),
+    cyclic_times=1,
+    step_ratio_up=0.4)
+total_epochs = 8
+
+checkpoint_config = dict(interval=1)
+
+log_config = dict(
+    interval=50,
+    hooks=[dict(type='TextLoggerHook'),
+           dict(type='TensorboardLoggerHook'),
+        #    dict(type='WandbLoggerHook',
+        #         init_kwargs=dict(
+        #             project='ResDet3D',
+        #             name=f'ResDet3D_nuscenes_mini',
+        #         ))
+           ])
+
 
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = None
-
+load_from = None
 resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 4)

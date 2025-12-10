@@ -248,37 +248,6 @@ def load_polygon_from_txt(txt_path):
         return None
 
 
-def create_polygon_mask(polygon_normalized, height, width):
-    """
-    Create a binary mask from normalized polygon coordinates.
-    
-    Args:
-        polygon_normalized: Polygon as numpy array (N, 2) with normalized coordinates [0, 1]
-        height: Image height in pixels
-        width: Image width in pixels
-    
-    Returns:
-        Binary mask of shape (height, width), True inside polygon, False outside
-    """
-    if polygon_normalized is None:
-        return None
-    
-    # Convert normalized coordinates to pixel coordinates
-    polygon_pixels = polygon_normalized.copy()
-    polygon_pixels[:, 0] *= width   # x coordinates
-    polygon_pixels[:, 1] *= height  # y coordinates
-    polygon_pixels = polygon_pixels.astype(np.int32)
-    
-    # Create empty mask
-    mask = np.zeros((height, width), dtype=np.uint8)
-    
-    # Fill polygon using cv2.fillPoly
-    cv2.fillPoly(mask, [polygon_pixels], 255)
-    
-    # Convert to boolean
-    return mask > 0
-
-
 def draw_polygon_on_image(img, polygon_normalized, color=(0, 0, 255), thickness=2):
     """
     Draw polygon on image.
@@ -355,20 +324,18 @@ def load_point_cloud_from_prediction(
         max_depth: Maximum depth threshold to filter far objects/infinity (in meters, None = no limit)
         conf_thresh_percentile: Lower percentile for confidence threshold (None = no filtering)
         filter_sky: Whether to filter out sky regions (True = remove sky, False = keep sky)
-        polygon_by_camera: Dict mapping camera_name -> polygon (numpy array (N, 2) with normalized coordinates)
+        polygon_by_camera: Dict mapping camera_name -> polygon (numpy array (N, 2) with normalized coordinates) (unused)
     
     Returns: 
         Dictionary with:
         - 'points_by_camera': dict mapping camera_name -> points in camera coordinates
         - 'colors_by_camera': dict mapping camera_name -> colors
-        - 'polygon_mask_by_camera': dict mapping camera_name -> boolean mask (True = polygon point)
         - 'camera_order': list of camera names in order
     """
     
     result = {
         'points_by_camera': {},
         'colors_by_camera': {},
-        'polygon_mask_by_camera': {},
         'camera_order': []
     }
     
@@ -460,33 +427,11 @@ def load_point_cloud_from_prediction(
             # Store points for this camera (in camera coordinates)
             result['points_by_camera'][cam_name] = points_cam_valid
             
-            # Get colors from processed images
-            if hasattr(prediction, 'processed_images'):
-                img = prediction.processed_images[i]
-                colors = img.reshape(-1, 3)[valid] / 255.0
-                result['colors_by_camera'][cam_name] = colors
-            
-            # Check if points belong to polygon region
-            polygon_mask_flat = None
-            if polygon_by_camera and cam_name in polygon_by_camera:
-                polygon = polygon_by_camera[cam_name]
-                if polygon is not None:
-                    # Create polygon mask for this camera's image size
-                    polygon_mask = create_polygon_mask(polygon, H, W)
-                    if polygon_mask is not None:
-                        # Flatten polygon mask and apply same valid filter
-                        polygon_mask_flat = polygon_mask.flatten()[valid]
-                        result['polygon_mask_by_camera'][cam_name] = polygon_mask_flat
-                        print(f"    Polygon points: {polygon_mask_flat.sum()} / {len(polygon_mask_flat)}")
-                    else:
-                        # No valid polygon mask, create all-False mask
-                        result['polygon_mask_by_camera'][cam_name] = np.zeros(len(points_cam_valid), dtype=bool)
-                else:
-                    # No polygon for this camera, create all-False mask
-                    result['polygon_mask_by_camera'][cam_name] = np.zeros(len(points_cam_valid), dtype=bool)
-            else:
-                # No polygon information provided, create all-False mask
-                result['polygon_mask_by_camera'][cam_name] = np.zeros(len(points_cam_valid), dtype=bool)
+        # Get colors from processed images
+        if hasattr(prediction, 'processed_images'):
+            img = prediction.processed_images[i]
+            colors = img.reshape(-1, 3)[valid] / 255.0
+            result['colors_by_camera'][cam_name] = colors
     
     return result
 
@@ -787,8 +732,8 @@ def run_inference_for_frame(
             image_paths,
             max_depth=cfg.GLB_CONFIG["max_depth"],
             conf_thresh_percentile=cfg.GLB_CONFIG["conf_thresh_percentile"],
-            polygon_by_camera=nusc_info['polygon_by_camera'],
-        cfg=cfg,
+            polygon_by_camera=None,
+            cfg=cfg,
         )
         
         if pcd_data and pcd_data['points_by_camera']:
@@ -796,7 +741,6 @@ def run_inference_for_frame(
             # using ground truth extrinsics from nuScenes (not model's predicted extrinsics)
             all_points_lidar = []
             all_colors = []
-            all_polygon_mask = []
             
             print(f"  Transforming points from camera coordinates to LiDAR coordinates...")
             total_points_before_downsample = 0
@@ -819,11 +763,6 @@ def run_inference_for_frame(
                         if cam_name in pcd_data['colors_by_camera']:
                             cam_colors = pcd_data['colors_by_camera'][cam_name]
                         
-                        # Get polygon mask if available
-                        cam_polygon_mask = None
-                        if cam_name in pcd_data['polygon_mask_by_camera']:
-                            cam_polygon_mask = pcd_data['polygon_mask_by_camera'][cam_name]
-                        
                         # DOWNSAMPLE PER CAMERA BEFORE COMBINING (much more memory efficient!)
                         # This avoids building huge KDTree on 600k+ points
                         if nusc_info.get('downsample_voxel_size', None) is not None:
@@ -842,14 +781,12 @@ def run_inference_for_frame(
                             per_cam_input = {
                                 'points': points_lidar,
                                 'colors': cam_colors,
-                                'polygon_mask': cam_polygon_mask,
                                 'indices': None,
                             }
                             per_cam_output = run_post_processing_pipeline(per_cam_input, per_cam_pipeline)
 
                             points_lidar = per_cam_output.get('points', points_lidar)
                             cam_colors = per_cam_output.get('colors', cam_colors)
-                            cam_polygon_mask = per_cam_output.get('polygon_mask', cam_polygon_mask)
                                 
                             num_points_after = len(points_lidar)
                             reduction = num_points_before - num_points_after
@@ -864,8 +801,6 @@ def run_inference_for_frame(
                         if cam_colors is not None:
                             all_colors.append(cam_colors)
                         
-                        if cam_polygon_mask is not None:
-                            all_polygon_mask.append(cam_polygon_mask)
                     else:
                         print(f"    WARNING: No transformation found for {cam_name}, skipping...")
             
@@ -873,13 +808,9 @@ def run_inference_for_frame(
                 # Concatenate all points (already downsampled per camera)
                 combined_points = np.concatenate(all_points_lidar, axis=0)
                 combined_colors = None
-                combined_polygon_mask = None
                 
                 if all_colors:
                     combined_colors = np.concatenate(all_colors, axis=0)
-                
-                if all_polygon_mask:
-                    combined_polygon_mask = np.concatenate(all_polygon_mask, axis=0)
                 
                 num_points_after_camera_downsample = len(combined_points)
                 print(f"  Total points in LiDAR frame (after per-camera downsampling): {num_points_after_camera_downsample} (was {total_points_before_downsample} before)")
@@ -888,7 +819,6 @@ def run_inference_for_frame(
                 pipeline_input = {
                     'points': combined_points,
                     'colors': combined_colors,
-                    'polygon_mask': combined_polygon_mask,
                     'indices': None,
                 }
                 pipeline_output = run_post_processing_pipeline(
@@ -898,7 +828,6 @@ def run_inference_for_frame(
 
                 combined_points = pipeline_output.get('points', combined_points)
                 combined_colors = pipeline_output.get('colors', combined_colors)
-                combined_polygon_mask = pipeline_output.get('polygon_mask', combined_polygon_mask)
                 print(f"  Points after pipeline: {len(combined_points)}")
                 
                 # Create point cloud
@@ -906,12 +835,6 @@ def run_inference_for_frame(
                 pcd.points = o3d.utility.Vector3dVector(combined_points)
                 
                 if combined_colors is not None:
-                    # Override colors for polygon points (red)
-                    if combined_polygon_mask is not None:
-                        # Set polygon points to red [1, 0, 0]
-                        combined_colors[combined_polygon_mask] = [1.0, 0.0, 0.0]
-                        print(f"  Colored {combined_polygon_mask.sum()} polygon points in red")
-                    
                     pcd.colors = o3d.utility.Vector3dVector(combined_colors)
                 
                 print(f"  Total points in LiDAR frame (final): {len(combined_points)}")

@@ -191,6 +191,10 @@ def main():
         # apply the linear scaling rule (https://arxiv.org/abs/1706.02677)
         cfg.optimizer['lr'] = cfg.optimizer['lr'] * len(cfg.gpu_ids) / 8
 
+    # mmdet expects cfg.device to exist; default to cuda if available else cpu
+    if not cfg.get('device', None):
+        cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
         distributed = False
@@ -273,7 +277,7 @@ def main():
         val_dataset.test_mode = False
         datasets.append(build_dataset(val_dataset))
     
-    if cfg.checkpoint_config is not None:
+    if cfg.get('checkpoint_config', None) is not None:
         # save mmdet version, config file content and class names in
         # checkpoints as meta data
         cfg.checkpoint_config.meta = dict(

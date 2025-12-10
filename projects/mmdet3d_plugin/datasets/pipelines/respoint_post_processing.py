@@ -32,7 +32,6 @@ class VoxelDownsample:
         
         points = data['points']
         colors = data.get('colors')
-        polygon_mask = data.get('polygon_mask')
 
         device = points.device if torch.is_tensor(points) else (self.device or torch.device("cpu"))
         points_tensor = points if torch.is_tensor(points) else torch.as_tensor(points, device=device, dtype=torch.float32)
@@ -66,7 +65,6 @@ class VoxelDownsample:
             return {
                 'points': points_tensor,
                 'colors': colors,
-                'polygon_mask': polygon_mask,
                 'indices': torch.arange(points_tensor.shape[0], device=device),
             }
 
@@ -81,25 +79,21 @@ class VoxelDownsample:
             return {
                 'points': points_tensor,
                 'colors': colors,
-                'polygon_mask': polygon_mask,
                 'indices': torch.arange(points_tensor.shape[0], device=device),
             }
         voxel_centers = torch.stack(voxel_centers, dim=0)
 
         voxel_colors = None
-        voxel_polygon_mask = None
         closest_indices = torch.arange(voxel_centers.shape[0], device=device)
-        if colors is not None or polygon_mask is not None:
+        if colors is not None:
             # Use nearest neighbor via torch.cdist
             dists = torch.cdist(voxel_centers, points_tensor)
             closest_indices = torch.argmin(dists, dim=1)
             voxel_colors = colors[closest_indices] if colors is not None else None
-            voxel_polygon_mask = polygon_mask[closest_indices] if polygon_mask is not None else None
 
         return {
             'points': voxel_centers,
             'colors': voxel_colors,
-            'polygon_mask': voxel_polygon_mask,
             'indices': closest_indices,
         }
 
@@ -124,7 +118,6 @@ class BallQueryDownsample:
             return data
         points = data['points']
         colors = data.get('colors')
-        polygon_mask = data.get('polygon_mask')
 
         # Resolve device: prioritize points' device, fallback to self.device, else CPU/GPU default
         device = points.device if torch.is_tensor(points) else (self.device or torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -140,7 +133,6 @@ class BallQueryDownsample:
             return {
                 'points': points_tensor,
                 'colors': colors,
-                'polygon_mask': polygon_mask,
                 'indices': torch.arange(points_tensor.shape[0], device=device)
             }
 
@@ -167,12 +159,10 @@ class BallQueryDownsample:
 
         downsampled_points = points_tensor[final_indices]
         downsampled_colors = colors[final_indices] if colors is not None else None
-        downsampled_polygon_mask = polygon_mask[final_indices] if polygon_mask is not None else None
 
         return {
             'points': downsampled_points,
             'colors': downsampled_colors,
-            'polygon_mask': downsampled_polygon_mask,
             'indices': final_indices
         }
 
@@ -193,9 +183,8 @@ class FilterPointByRange:
 
         points = data['points']
         colors = data.get('colors')
-        polygon_mask = data.get('polygon_mask')
 
-        device = points.device if torch.is_tensor(points) else (self.device or torch.device("cpu"))
+        device = points.device if torch.is_tensor(points) else torch.device("cpu")
         pts = points if torch.is_tensor(points) else torch.as_tensor(points, device=device)
 
         x_min, y_min, z_min, x_max, y_max, z_max = self.point_cloud_range
@@ -207,13 +196,11 @@ class FilterPointByRange:
 
         filtered_points = pts[mask]
         filtered_colors = colors[mask] if colors is not None else None
-        filtered_polygon_mask = polygon_mask[mask] if polygon_mask is not None else None
         indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
 
         return {
             'points': filtered_points,
             'colors': filtered_colors,
-            'polygon_mask': filtered_polygon_mask,
             'indices': indices
         }
 
@@ -236,7 +223,6 @@ class FPSDownsample:
 
         points = data['points']
         colors = data.get('colors')
-        polygon_mask = data.get('polygon_mask')
 
         device = points.device if torch.is_tensor(points) else (self.device or torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         pts = points if torch.is_tensor(points) else torch.as_tensor(points, device=device, dtype=torch.float32)
@@ -247,7 +233,6 @@ class FPSDownsample:
             return {
                 'points': pts,
                 'colors': colors,
-                'polygon_mask': polygon_mask,
                 'indices': torch.arange(pts.shape[0], device=device)
             }
 
@@ -256,14 +241,51 @@ class FPSDownsample:
 
         downsampled_points = pts[fps_indices]
         downsampled_colors = colors[fps_indices] if colors is not None else None
-        downsampled_polygon_mask = polygon_mask[fps_indices] if polygon_mask is not None else None
 
         return {
             'points': downsampled_points,
             'colors': downsampled_colors,
-            'polygon_mask': downsampled_polygon_mask,
             'indices': fps_indices
         }
+
+# Padding points to a fixed size to ensure the number of points is the same as the padding size
+@PIPELINES.register_module()
+class PointPadding:
+    """Padding points to a fixed size.
+    
+    Pads points to a fixed size by adding new points at the end.
+    """
+    def __init__(self, padding_size=None, device: torch.device = None):
+        self.padding_size = padding_size
+        self.device = device
+        
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        if self.padding_size is None:
+            return data
+
+        points = data['points']
+        colors = data.get('colors')
+        
+        device = points.device if torch.is_tensor(points) else (self.device or torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        
+        if points.shape[0] >= self.padding_size:
+            # have to use the furthest point sample to downsample the points to the padding size
+            points_for_fps = points.unsqueeze(0)
+            fps_indices = furthest_point_sample(points_for_fps, self.padding_size).squeeze(0)
+            points = points[fps_indices]
+            colors = colors[fps_indices] if colors is not None else None
+        else:
+            # pad the points to the padding size
+            padding = torch.zeros(self.padding_size - points.shape[0], points.shape[1], device=device)
+            points = torch.cat([points, padding], dim=0)
+            colors = torch.cat([colors, padding], dim=0) if colors is not None else None
+
+        return {
+            'points': points,
+            'colors': colors,
+            'indices': torch.arange(points.shape[0], device=device)
+        }
+
 
 
 @PIPELINES.register_module()
@@ -305,11 +327,10 @@ class ResPointCloudPipeline:
         
         Args:
             data: Dict containing at least 'points' key (np.ndarray, N, 3).
-                May also contain 'colors' (N, 3) and 'polygon_mask' (N,).
+                May also contain 'colors' (N, 3).
         
         Returns:
-            Dict with same keys as input, but with processed 'points' and
-            optionally updated 'colors' and 'polygon_mask'.
+            Dict with processed 'points' and optionally updated 'colors'.
         """
         if data is None or 'points' not in data or data['points'] is None:
             return data

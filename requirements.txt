@@ -26,3 +26,5 @@ shapely
 scikit-image
 lyft-dataset-sdk==0.0.8
 setuptools==63.4.3
+wandb
+tensorboard

@@ -12,7 +12,7 @@ DEVICE = "cuda"  # Will auto-fallback to "cpu" if CUDA not available
 
 # ============================================================================
 # Post-processing pipeline (mimic mmdet3d style)
-# Each step receives/returns a dict with at least: points, colors, polygon_mask
+# Each step receives/returns a dict with at least: points, colors
 # ============================================================================
 test_pipeline = [
     
