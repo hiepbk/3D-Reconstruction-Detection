@@ -314,7 +314,7 @@ class DinoVisionTransformer(nn.Module):
             if self.alt_start != -1 and (i == self.alt_start - 1) and x.shape[1] >= THRESH_FOR_REF_SELECTION:
                 # Select reference view using configured strategy
                 strategy = kwargs.get("ref_view_strategy", "saddle_balanced")
-                logger.info(f"Selecting reference view using strategy: {strategy}")
+                # logger.info(f"Selecting reference view using strategy: {strategy}")
                 b_idx = select_reference_view(x, strategy=strategy)
                 # Reorder views to place reference view first
                 x = reorder_by_reference(x, b_idx)
