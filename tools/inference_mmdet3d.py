@@ -251,7 +251,6 @@ def single_gpu_test(model,
             
         batch_size = len(result)
         for pred_idx, pred in enumerate(result):
-            gt
             # This for debugging purposes
             if isinstance(pred, dict) and 'pseudo_points' in pred:
                 pseudo_points = pred['pseudo_points']
