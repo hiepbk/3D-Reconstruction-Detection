@@ -197,26 +197,44 @@ python -m tools.inference_nuscenes \
 
 ### Inference with mmdet3d (ResDet3D with DepthAnything3)
 
-Run inference using the integrated mmdet3d pipeline:
+Run inference using the integrated mmdet3d pipeline. The script processes all samples in the dataset by iterating through the data loader.
 
+**Basic usage:**
 ```bash
+# Process all samples with default batch size (1)
 python -m tools.inference_mmdet3d \
     --config projects/configs/ResDet3D_nuscenes_mini_config.py \
-    --output_dir output \
-    --sample_index 0
+    --output_dir output
 
-# Process multiple samples
+# Process with custom batch size (faster for multiple samples)
 python -m tools.inference_mmdet3d \
     --config projects/configs/ResDet3D_nuscenes_mini_config.py \
     --output_dir output \
-    --max_samples 20
+    --batch_size 4
+    --display True
 
 # With checkpoint (if training was done)
 python -m tools.inference_mmdet3d \
     --config projects/configs/ResDet3D_nuscenes_mini_config.py \
     --checkpoint path/to/checkpoint.pth \
     --output_dir output \
-    --sample_index 0
+    --batch_size 2
+
+# Disable visualization (faster processing)
+python -m tools.inference_mmdet3d \
+    --config projects/configs/ResDet3D_nuscenes_mini_config.py \
+    --output_dir output \
+    --batch_size 4 \
+    --display False
 ```
+
+**Arguments:**
+- `--config`: Path to config file (required)
+- `--checkpoint`: Path to checkpoint file (optional)
+- `--output_dir`: Output directory for results (default: "output")
+- `--batch_size`: Batch size for data loader (default: 1)
+- `--display`: Display point cloud visualization (default: True)
+- `--launcher`: Job launcher for distributed training (default: "none")
+- `--cfg-options`: Override config options in key=value format (optional)
 
 

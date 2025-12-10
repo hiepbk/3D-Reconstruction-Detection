@@ -12,13 +12,12 @@ Usage:
 
 import argparse
 import os
-import sys
 
 import numpy as np
 import open3d as o3d
 import torch
 from mmcv import Config, DictAction
-from mmcv.parallel import MMDataParallel, collate
+from mmcv.parallel import MMDataParallel
 from mmcv.runner import load_checkpoint
 from mmcv.utils import import_modules_from_strings
 
@@ -246,16 +245,10 @@ def main():
         help="Output directory for results",
     )
     parser.add_argument(
-        "--sample_index",
+        "--batch_size",
         type=int,
-        default=None,
-        help="Process only a specific sample by index (0-based, optional)",
-    )
-    parser.add_argument(
-        "--max_samples",
-        type=int,
-        default=None,
-        help="Maximum number of samples to process (optional)",
+        default=1,
+        help="Batch size (samples_per_gpu) for data loader (default: 1)",
     )
     parser.add_argument(
         "--launcher",
@@ -330,11 +323,11 @@ def main():
     dataset = build_dataset(cfg.data.test)
     print(f"Dataset loaded: {len(dataset)} samples")
 
-    # Build data loader
-    print("Building data loader...")
+    # Build data loader with specified batch size
+    print(f"Building data loader with batch_size={args.batch_size}...")
     data_loader = build_dataloader(
         dataset,
-        samples_per_gpu=1,
+        samples_per_gpu=args.batch_size,
         workers_per_gpu=cfg.data.get('workers_per_gpu', 4),
         dist=distributed,
         shuffle=False,
@@ -370,33 +363,8 @@ def main():
         print("Model wrapped with MMDistributedDataParallel (multi GPU)")
     print("Model built and ready")
 
-    # Filter dataset if needed
-    if args.sample_index is not None:
-        if args.sample_index < 0 or args.sample_index >= len(dataset):
-            print(f"Error: Sample index {args.sample_index} is out of range (0-{len(dataset)-1})")
-            sys.exit(1)
-        # Create a subset dataset with only the specified sample
-        from torch.utils.data import Subset
-        dataset = Subset(dataset, [args.sample_index])
-        print(f"Processing sample at index {args.sample_index}")
-
-    if args.max_samples:
-        from torch.utils.data import Subset
-        max_idx = min(args.max_samples, len(dataset))
-        dataset = Subset(dataset, list(range(max_idx)))
-        print(f"Processing first {max_idx} samples")
-
-    # Rebuild data loader with filtered dataset
-    data_loader = build_dataloader(
-        dataset,
-        samples_per_gpu=2,
-        workers_per_gpu=cfg.data.get('workers_per_gpu', 4),
-        dist=distributed,
-        shuffle=False,
-    )
-
     # Use single_gpu_test from mmdet3d (like test.py)
-    print(f"\nProcessing samples...")
+    print(f"\nProcessing samples with batch_size={args.batch_size}...")
     outputs = single_gpu_test(
         model=model,
         data_loader=data_loader,
@@ -406,25 +374,30 @@ def main():
     )
 
     # Process outputs to extract point clouds and visualize
+    # Note: outputs is a list where each element corresponds to one sample
+    # When batch_size > 1, single_gpu_test still returns one result per sample
     print(f"\nProcessing {len(outputs)} results...")
     
-    print('outputs: ', outputs)
-    
-    for i, result in enumerate(outputs):
+    for sample_idx, result in enumerate(outputs):
         # Extract pseudo points from result if available
         if isinstance(result, dict) and 'pseudo_points' in result:
             pseudo_points = result['pseudo_points']
-
-            # Unwrap list if single element
+            
+            # Handle both single tensor and list of tensors
+            # (list case can happen if model returns list, but typically it's a single tensor per sample)
             if isinstance(pseudo_points, list):
-                pseudo_points = pseudo_points[0] if len(pseudo_points) > 0 else None
+                # If it's a list, take the first element (shouldn't happen with proper batching)
+                if len(pseudo_points) > 0:
+                    pseudo_points = pseudo_points[0]
+                else:
+                    pseudo_points = None
             
             if pseudo_points is not None:
                 # Convert to numpy if tensor
                 if isinstance(pseudo_points, torch.Tensor):
                     pseudo_points = pseudo_points.cpu().numpy()
                 
-                sample_token = f"sample_{i}"
+                sample_token = f"sample_{sample_idx}"
                 
                 # Split xyz / colors if available
                 colors = None
@@ -451,6 +424,7 @@ def main():
     print("Processing Summary")
     print(f"{'='*60}")
     print(f"Total samples processed: {len(outputs)}")
+    print(f"Batch size used: {args.batch_size}")
     print(f"Output directory: {args.output_dir}")
     print(f"{'='*60}\n")
 
