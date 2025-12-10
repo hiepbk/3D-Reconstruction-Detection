@@ -63,3 +63,19 @@ data/
 # Large model files
 *.pkl
 *.pickle
+
+
+# .so files
+*.so
+*.dylib
+*.dll
+*.lib
+*.a
+*.o
+*.obj
+*.res
+*.exp
+*.def
+*.manifest
+*.manifest.in
+*.manifest.in.in
