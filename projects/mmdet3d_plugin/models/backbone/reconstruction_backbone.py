@@ -513,17 +513,12 @@ class ReconstructionBackbone(nn.Module):
         
         
         if prediction is not None:
-            # Back-project depth maps to point clouds
-            all_points_lidar = []
-            all_colors_lidar = []
-
-
+            # Back-project depth maps to point clouds (batched)
             multi_batch_depths = prediction.depth
             multi_batch_intrinsics = prediction.intrinsics
             multi_batch_cam2lidar_rts = self._extract_cam2lidar_rts_from_meta(img_metas, device=device)
 
-            
-            # modify this function to handle batch processing
+            # Back-project all batch items at once (returns lists of length B)
             all_points_batch, all_colors_batch = self._backproject_depth_to_points(
                 multi_batch_depths,
                 multi_batch_intrinsics,
@@ -531,142 +526,35 @@ class ReconstructionBackbone(nn.Module):
                 multi_batch_cam2lidar_rts,
             )
             
-            if self.post_pipeline is not None:
+            # Process each batch item separately through the post-processing pipeline
+            # This follows mmdet3d's pattern: transforms operate on single samples, not batches
+            for b_idx in range(B):
+                points_b = all_points_batch[b_idx]  # (P, 3) tensor
+                colors_b = all_colors_batch[b_idx] if all_colors_batch[b_idx] is not None and all_colors_batch[b_idx].numel() > 0 else None
                 
-                pipeline_input = {
-                    'points': all_points_batch,
-                    'colors': all_colors_batch,
-                    'polygon_mask': None,
-                    'indices': None,
-                }
-                pipeline_output = self.post_pipeline(pipeline_input)
-                all_points_batch = pipeline_output['points']
-                all_colors_batch = pipeline_output.get('colors', all_colors_batch)
-            
-        
-        
-        
-        
-        
-        
-        
-        # Process each batch item separately for point cloud generation
-        # for b_idx in range(B):
-        #     # Extract images for this batch item
-        #     imgs_batch = imgs_processed[b_idx]  # (N, 3, H_new, W_new)
-            
-        #     # Prepare model inputs exactly like inference() does:
-        #     # 1. Move to model device
-        #     # 2. Add batch dimension [None] to make (1, N, 3, H, W)
-        #     # 3. Convert to float
-        #     device = next(self.parameters()).device
-        #     imgs_for_da3 = imgs_batch.to(device, non_blocking=True)[None].float()
-            
-        #     # Run DepthAnything3 forward (wrapped model's forward method)
-        #     # This matches what _run_model_forward does in inference()
-        #     with torch.no_grad():
-        #         da3_output = self.da3_model.forward(
-        #             image=imgs_for_da3,
-        #             extrinsics=None,  # Let model estimate
-        #             intrinsics=None,  # Let model estimate
-        #             export_feat_layers=[],  # No feature export needed
-        #             infer_gs=False,  # No Gaussian Splatting
-        #             use_ray_pose=self.use_ray_pose,
-        #             ref_view_strategy=self.ref_view_strategy,
-        #         )
-            
-        #     # Convert output to Prediction object (matches inference())
-        #     prediction = self._convert_to_prediction(da3_output, return_torch=True)
-            
-        #     # Compute confidence threshold if needed (torch only)
-        #     conf_thresh = None
-        #     if self.conf_thresh_percentile is not None and hasattr(prediction, 'conf') and prediction.conf is not None:
-        #         sky = getattr(prediction, 'sky', None)
-        #         conf_map = prediction.conf
-        #         if sky is not None and sky.dtype != torch.bool:
-        #             sky = sky >= 0.5
-        #         if sky is not None and (~sky).sum() > 10:
-        #             conf_pixels = conf_map[~sky]
-        #         else:
-        #             conf_pixels = conf_map.reshape(-1)
-        #         if conf_pixels.numel() > 0:
-        #             conf_thresh = torch.quantile(conf_pixels, self.conf_thresh_percentile / 100.0)
+                if points_b.shape[0] == 0:
+                    raise ValueError(f"No points were generated for batch {b_idx} (all views empty after filtering)")
                 
-        #         # Back-project depth maps to point clouds
-        #         all_points_lidar = []
-        #         all_colors_lidar = []
-        #         cam2lidar_rts = img_metas[b_idx]['cam2lidar_rts']
-        #         for cam_idx in range(len(prediction.depth)):
-        #             depth = prediction.depth[cam_idx]
-        #             intrinsics = prediction.intrinsics[cam_idx] if hasattr(prediction, 'intrinsics') else None
-                    
-        #             if intrinsics is None:
-        #                 raise ValueError(f"Intrinsics not available for view {cam_idx} in batch {b_idx}")
-                    
-        #             # Get sky mask and confidence for this view
-        #             sky_mask = prediction.sky[cam_idx] if hasattr(prediction, 'sky') and prediction.sky is not None else None
-        #             conf = prediction.conf[cam_idx] if hasattr(prediction, 'conf') and prediction.conf is not None else None
-                    
-        #             # Back-project to camera coordinates (returns xyz + colors)
-        #             points_cam, colors_cam = self._backproject_depth_to_points(
-        #                 depth,
-        #                 intrinsics,
-        #                 image=img_tensor[b_idx, cam_idx],
-        #                 max_depth=self.max_depth,
-        #                 conf=conf,
-        #                 conf_thresh=conf_thresh,
-        #                 sky_mask=sky_mask,
-        #                 filter_sky=self.filter_sky,
-        #             )
-                    
-        #             if len(points_cam) == 0:
-        #                 print(f"[WARN] No points generated for view {cam_idx} in batch {b_idx}; skipping this view.")
-        #                 continue
-
-        #             # Transform to LiDAR coordinates
-        #             points_lidar, colors_lidar = self._transform_points_cam_to_lidar(
-        #                 points_cam,
-        #                 colors_cam,
-        #                 cam2lidar_rts[cam_idx],
-        #                 intrinsics,
-        #             )
-                    
-        #             all_points_lidar.append(points_lidar.clone())
-        #             all_colors_lidar.append(colors_lidar.clone() if colors_lidar is not None else None)
+                # Apply post-processing pipeline (operates on single sample, like mmdet3d transforms)
+                if self.post_pipeline is not None:
+                    pipeline_input = {
+                        'points': points_b,  # Single tensor, not a list
+                        'colors': colors_b,  # Single tensor or None, not a list
+                        'polygon_mask': None,
+                        'indices': None,
+                    }
+                    pipeline_output = self.post_pipeline(pipeline_input)
+                    points_b = pipeline_output['points']
+                    colors_b = pipeline_output.get('colors', colors_b)
                 
-        #         if not all_points_lidar:
-        #             raise ValueError(f"No points were generated for batch {b_idx} (all views empty after filtering)")
+                # Merge points and colors to (N,6) xyzrgb format
+                if colors_b is not None and colors_b.shape[0] == points_b.shape[0]:
+                    merged = torch.cat([points_b, colors_b], dim=1)
+                else:
+                    merged = points_b
                 
-        #         # Concatenate all points for this batch item
-        #         combined_points = torch.cat(all_points_lidar, dim=0)
-        #         combined_colors = None
-        #         if all_colors_lidar:
-        #             valid_color_lists = [c for c in all_colors_lidar if c is not None and c.numel() > 0]
-        #             if valid_color_lists:
-        #                 combined_colors = torch.cat(valid_color_lists, dim=0)
-                
-        #         # Apply post-processing pipeline
-        #         if self.post_pipeline is not None:
-        #             pipeline_input = {
-        #                 'points': combined_points,
-        #                 'colors': combined_colors,
-        #                 'polygon_mask': None,
-        #                 'indices': None,
-        #             }
-        #             pipeline_output = self.post_pipeline(pipeline_input)
-        #             combined_points = pipeline_output['points']
-        #             combined_colors = pipeline_output.get('colors', combined_colors)
-                    
-                    
-        #             # merged points and colors to (N,6) xyzrgb
-    
-        #         # merged points and colors to (N,6) xyzrgb
-        #         if combined_colors is not None and combined_colors.shape[0] == combined_points.shape[0]:
-        #             merged = torch.cat([combined_points, combined_colors], dim=1)
-        #         else:
-        #             merged = combined_points
-                
-        #         points_tensor = merged.float().to(device)
-        #         batch_point_clouds.append(points_tensor)
-
+                points_tensor = merged.float().to(device)
+                batch_point_clouds.append(points_tensor)
+        
         return batch_point_clouds
+        
