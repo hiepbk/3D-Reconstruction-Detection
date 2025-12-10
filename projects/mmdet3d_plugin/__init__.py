@@ -7,9 +7,9 @@ from .models.detectors import ResDet3D
 # Import backbones to register ReconstructionBackbone
 from .models.backbone import ReconstructionBackbone
 
-# Import pipelines to register ResPointCloudPipeline, VoxelDownsample, BallQueryDownsample, FPSDownsample
+# Import pipelines to register DepthAnything3Filter, VoxelDownsample, BallQueryDownsample, FPSDownsample
 from .datasets.pipelines import (
-    ResPointCloudPipeline,
+    DepthAnything3Filter,
     VoxelDownsample,
     BallQueryDownsample,
     FPSDownsample,
@@ -18,7 +18,7 @@ from .datasets.pipelines import (
 __all__ = [
     'ResDet3D',
     'ReconstructionBackbone',
-    'ResPointCloudPipeline',
+    'DepthAnything3Filter',
     'VoxelDownsample',
     'BallQueryDownsample',
     'FPSDownsample',

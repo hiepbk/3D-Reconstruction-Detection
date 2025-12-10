@@ -254,42 +254,40 @@ class PointPadding:
     """Padding points to a fixed size.
     
     Pads points to a fixed size by adding new points at the end.
+    process points with batch format (B, N, 3)
     """
-    def __init__(self, padding_size=None, device: torch.device = None):
-        self.padding_size = padding_size
+    def __init__(self, target_size=None, device: torch.device = None):
+        self.target_size = target_size
         self.device = device
         
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        if self.padding_size is None:
+        if self.target_size is None:
             return data
 
         points = data['points']
-        colors = data.get('colors')
         
         device = points.device if torch.is_tensor(points) else (self.device or torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        batch_size = points.shape[0]
         
-        if points.shape[0] >= self.padding_size:
+        if points.shape[1] >= self.target_size:
             # have to use the furthest point sample to downsample the points to the padding size
             points_for_fps = points.unsqueeze(0)
-            fps_indices = furthest_point_sample(points_for_fps, self.padding_size).squeeze(0)
+            fps_indices = furthest_point_sample(points_for_fps, self.target_size).squeeze(0)
             points = points[fps_indices]
-            colors = colors[fps_indices] if colors is not None else None
+            indices = fps_indices
         else:
             # pad the points to the padding size
-            padding = torch.zeros(self.padding_size - points.shape[0], points.shape[1], device=device)
+            padding = torch.zeros(self.target_size - points.shape[1], points.shape[1], device=device)
             points = torch.cat([points, padding], dim=0)
-            colors = torch.cat([colors, padding], dim=0) if colors is not None else None
-
+            indices = torch.arange(points.shape[0], device=device)
+        
         return {
             'points': points,
-            'colors': colors,
-            'indices': torch.arange(points.shape[0], device=device)
+            'indices': indices
         }
 
-
-
 @PIPELINES.register_module()
-class ResPointCloudPipeline:
+class DepthAnything3Filter:
     """Reconstruction Point Cloud Post-processing Pipeline.
     
     This pipeline wraps multiple post-processing transforms (VoxelDownsample,
@@ -304,7 +302,7 @@ class ResPointCloudPipeline:
             Each transform should be a dict with 'type' key and transform-specific args.
     
     Example:
-        >>> pipeline = ResPointCloudPipeline(
+        >>> pipeline = DepthAnything3Filter(
         ...     transforms=[
         ...         dict(type='VoxelDownsample', voxel_size=0.1),
         ...         dict(type='BallQueryDownsample', enabled=True, anchor_points=25000),
@@ -315,7 +313,7 @@ class ResPointCloudPipeline:
     """
     
     def __init__(self, transforms: List[Dict[str, Any]]):
-        """Initialize ResPointCloudPipeline.
+        """Initialize DepthAnything3Filter.
         
         Args:
             transforms: List of transform config dicts
@@ -360,4 +358,3 @@ class ResPointCloudPipeline:
                 result['indices'] = np.arange(len(pts))
         
         return result
-

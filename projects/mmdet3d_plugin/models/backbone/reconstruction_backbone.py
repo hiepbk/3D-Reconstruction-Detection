@@ -13,11 +13,11 @@ from copy import deepcopy
 from mmdet.models.builder import BACKBONES
 from mmcv.parallel import DataContainer as DC
 from mmdet.datasets.pipelines import Compose
-
+from mmdet.models.builder import build_backbone
 
 from projects.mmdet3d_plugin.models.backbone.depth_anything_3.api import DepthAnything3
 from projects.mmdet3d_plugin.models.backbone.depth_anything_3.specs import Prediction
-from projects.mmdet3d_plugin.datasets.pipelines.respoint_post_processing import ResPointCloudPipeline
+from projects.mmdet3d_plugin.datasets.pipelines.respoint_post_processing import DepthAnything3Filter
 from projects.mmdet3d_plugin.models.backbone.point_cloud_refinement import PointCloudRefinement
 
 
@@ -48,7 +48,7 @@ class ReconstructionBackbone(nn.Module):
         self,
         pretrained: str,
         cache_dir: Optional[str] = None,
-        respoint_post_processing_pipeline: Optional[List[Dict]] = None,
+        rescon_pipeline: Optional[List[Dict]] = None,
         glb_config: Optional[Dict] = None,
         ref_view_strategy: str = "saddle_balanced",
         use_ray_pose: bool = False,
@@ -64,7 +64,7 @@ class ReconstructionBackbone(nn.Module):
         Args:
             pretrained: Pretrained DepthAnything3 model name or path (HuggingFace Hub identifier)
             cache_dir: Cache directory for model
-            respoint_post_processing_pipeline: List of post-processing step configs
+            rescon_pipeline: List of post-processing step configs
             glb_config: GLB export config (for filtering)
             ref_view_strategy: Reference view selection strategy
             use_ray_pose: Use ray-based pose estimation
@@ -96,12 +96,15 @@ class ReconstructionBackbone(nn.Module):
         print(f"[DEBUG] ReconstructionBackbone: Model initialized")
         
         # Store ReconstructionBackbone-specific config
-        self.respoint_post_processing_pipeline_cfg = respoint_post_processing_pipeline
-        print(f"[DEBUG] ReconstructionBackbone: Building post-processing pipeline...")
-        print(f"[DEBUG] ReconstructionBackbone: Pipeline config length = {len(self.respoint_post_processing_pipeline_cfg) if self.respoint_post_processing_pipeline_cfg else 0}")
-        # Build post-processing pipeline using Compose
-        self.post_pipeline = Compose(self.respoint_post_processing_pipeline_cfg) if self.respoint_post_processing_pipeline_cfg else None
-        print(f"[DEBUG] ReconstructionBackbone: Post-processing pipeline built successfully")
+        self.rescon_pipeline_cfg = rescon_pipeline
+        
+        self.da3_pipeline_cfg = [cfg for cfg in rescon_pipeline if cfg['type'] != 'DepthAnything3Filter']
+        self.refinement_pipeline_cfg = [cfg for cfg in rescon_pipeline if cfg['type'] == 'RefinementProcessor']
+        
+        self.da3_pipeline = Compose(self.da3_pipeline_cfg) if self.da3_pipeline_cfg else None
+        self.refinement_pipeline = Compose(self.refinement_pipeline_cfg) if self.refinement_pipeline_cfg else None
+
+
         
         self.glb_config = glb_config or {}
         self.ref_view_strategy = ref_view_strategy
@@ -114,7 +117,7 @@ class ReconstructionBackbone(nn.Module):
         # Build point cloud refinement module
         if refinement is not None:
             print(f"[DEBUG] ReconstructionBackbone: Building point cloud refinement module...")
-            self.refinement = PointCloudRefinement(**refinement)
+            self.refinement = build_backbone(refinement)
             print(f"[DEBUG] ReconstructionBackbone: Refinement module built successfully")
         else:
             self.refinement = None
@@ -431,7 +434,7 @@ class ReconstructionBackbone(nn.Module):
             )
             
             # Process each batch item separately through the post-processing pipeline
-            post_processed_points_list = []
+            pseudo_points_list = []
             
             for b_idx in range(B):
                 points_b = all_points_batch[b_idx]  # (P, 3) tensor
@@ -441,13 +444,13 @@ class ReconstructionBackbone(nn.Module):
                     raise ValueError(f"No points were generated for batch {b_idx} (all views empty after filtering)")
                 
                 # Apply post-processing pipeline
-                if self.post_pipeline is not None:
+                if self.da3_pipeline is not None:
                     pipeline_input = {
                         'points': points_b,
                         'colors': colors_b,
                         'indices': None,
                     }
-                    pipeline_output = self.post_pipeline(pipeline_input)
+                    pipeline_output = self.da3_pipeline(pipeline_input)
                     points_b = pipeline_output['points']
                     colors_b = pipeline_output.get('colors', colors_b)
                 
@@ -457,30 +460,29 @@ class ReconstructionBackbone(nn.Module):
                 else:
                     merged = points_b  # (N, 3)
                 
-                post_processed_points_list.append(merged.float().to(device))
+                pseudo_points_list.append(merged.float().to(device))
             
-            # Stack all post-processed point clouds into batch format (B, N, C)
-            # After FPSDownsample, all should have same N (e.g., 40K)
-            post_processed_batch = torch.stack(post_processed_points_list, dim=0)  # (B, N, C) where C is 3 or 6
+
             
             # Prepare GT points in batch format
             gt_points_batch = None
             if points is not None:
                 if isinstance(points, list):
                     # Stack list of tensors
-                    gt_points_batch = torch.stack([p.float().to(device) for p in points if p is not None], dim=0)  # (B, M, 3)
+                    gt_points_list = [p.float().to(device) for p in points if p is not None]  # list of (N, 3) tensors with length B
                 elif isinstance(points, torch.Tensor):
                     if points.dim() == 3:  # (B, N, 3)
-                        gt_points_batch = points.float().to(device)
+                        gt_points_list = [points[i].float().to(device) for i in range(B)]
                     else:  # (N, 3) - single point cloud, expand to batch
-                        gt_points_batch = points.unsqueeze(0).expand(B, -1, -1).float().to(device)  # (B, N, 3)
+                        gt_points_list = [points.unsqueeze(0).expand(B, -1, -1).float().to(device)]
             
             # Apply refinement in batch mode (if enabled)
             if self.refinement is not None:
+                
                 # Refine entire batch at once
                 refined_batch, refinement_losses = self.refinement(
-                    pseudo_points=post_processed_batch,  # (B, N, C) tensor
-                    gt_points=gt_points_batch,  # (B, M, 3) tensor or None
+                    pseudo_points=pseudo_points_list,  # (B, N, C) tensor
+                    gt_points=gt_points_list,  # list of (N, 3) tensors with length B
                     return_loss=True,  # Always compute loss in training
                 )
                 
@@ -489,7 +491,7 @@ class ReconstructionBackbone(nn.Module):
                 losses = refinement_losses
             else:
                 # No refinement, convert batch tensor to list
-                batch_point_clouds = [post_processed_batch[i] for i in range(B)]
+                batch_point_clouds = [pseudo_points_batch[i] for i in range(B)]
                 losses = None
         
         return batch_point_clouds, losses
@@ -559,7 +561,7 @@ class ReconstructionBackbone(nn.Module):
             )
             
             # Process each batch item separately through the post-processing pipeline
-            post_processed_points_list = []
+            pseudo_points_list = []
             
             for b_idx in range(B):
                 points_b = all_points_batch[b_idx]  # (P, 3) tensor
@@ -569,13 +571,13 @@ class ReconstructionBackbone(nn.Module):
                     raise ValueError(f"No points were generated for batch {b_idx} (all views empty after filtering)")
                 
                 # Apply post-processing pipeline
-                if self.post_pipeline is not None:
+                if self.da3_pipeline is not None:
                     pipeline_input = {
                         'points': points_b,
                         'colors': colors_b,
                         'indices': None,
                     }
-                    pipeline_output = self.post_pipeline(pipeline_input)
+                    pipeline_output = self.da3_pipeline(pipeline_input)
                     points_b = pipeline_output['points']
                     colors_b = pipeline_output.get('colors', colors_b)
                 
@@ -585,17 +587,13 @@ class ReconstructionBackbone(nn.Module):
                 else:
                     merged = points_b  # (N, 3)
                 
-                post_processed_points_list.append(merged.float().to(device))
-            
-            # Stack all post-processed point clouds into batch format (B, N, C)
-            # After FPSDownsample, all should have same N (e.g., 40K)
-            post_processed_batch = torch.stack(post_processed_points_list, dim=0)  # (B, N, C) where C is 3 or 6
+                pseudo_points_list.append(merged.float().to(device))
             
             # Apply refinement in batch mode (if enabled)
             if self.refinement is not None:
                 # Refine entire batch at once (no GT in test mode)
                 refined_batch, _ = self.refinement(
-                    pseudo_points=post_processed_batch,  # (B, N, C) tensor
+                    pseudo_points=pseudo_points_list,  # list of (N, 3) tensors with length B
                     gt_points=None,  # No GT in test mode
                     return_loss=False,  # No loss computation in test
                 )
@@ -604,7 +602,7 @@ class ReconstructionBackbone(nn.Module):
                 batch_point_clouds = [refined_batch[i] for i in range(B)]
             else:
                 # No refinement, convert batch tensor to list
-                batch_point_clouds = [post_processed_batch[i] for i in range(B)]
+                batch_point_clouds = [pseudo_points_list[i] for i in range(B)]
         
         return batch_point_clouds, None
         

@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, List, Union
 from mmdet.models.builder import BACKBONES
 from mmdet3d.ops import furthest_point_sample
-
+from mmdet.models.builder import build_backbone
 
 
 class PointNet2Layer(nn.Module):
@@ -41,7 +41,8 @@ class PointNet2Layer(nn.Module):
         return self.mlp(x)
 
 
-class PointCloudRefinementNet(nn.Module):
+@BACKBONES.register_module()
+class PointNetRefinement(nn.Module):
     """Neural network for refining pseudo point clouds.
     
     Takes a pseudo point cloud and produces refined/corrected point cloud.
@@ -257,7 +258,7 @@ def smoothness_loss(
     else:
         return correction_var.sum()
 
-
+@BACKBONES.register_module()
 class PointCloudRefinement(nn.Module):
     """Complete point cloud refinement system.
     
@@ -269,52 +270,25 @@ class PointCloudRefinement(nn.Module):
     
     def __init__(
         self,
-        enabled: bool = True,
-        sample_pseudo_to: Optional[int] = None,  # Downsample pseudo to this size
-        sample_gt_to: Optional[int] = None,  # Downsample GT to this size
         refinement_net: Optional[Dict] = None,
         loss_weights: Optional[Dict] = None,
     ):
         """
         Args:
-            enabled: Whether refinement is enabled
-            sample_pseudo_to: Target size for pseudo point cloud after sampling
-            sample_gt_to: Target size for GT point cloud after sampling
             refinement_net: Config dict for refinement network
             loss_weights: Dict with keys 'chamfer', 'emd', 'feature', 'smoothness'
         """
         super().__init__()
-        self.enabled = enabled
-        self.sample_pseudo_to = sample_pseudo_to
-        self.sample_gt_to = sample_gt_to
         
-        # Default refinement network config
-        if refinement_net is None:
-            refinement_net = dict(
-                hidden_channels=64,
-                num_layers=4,
-                output_mode='residual',
-            )
+        # # Build refinement network
+        # self.refinement_net = PointNetRefinement(
+        #     in_channels=3,
+        #     hidden_channels=refinement_net.get('hidden_channels', 64),
+        #     num_layers=refinement_net.get('num_layers', 4),
+        #     output_mode=refinement_net.get('output_mode', 'residual'),
+        # )
         
-        # Build refinement network
-        if self.enabled:
-            self.refinement_net = PointCloudRefinementNet(
-                in_channels=3,
-                hidden_channels=refinement_net.get('hidden_channels', 64),
-                num_layers=refinement_net.get('num_layers', 4),
-                output_mode=refinement_net.get('output_mode', 'residual'),
-            )
-        else:
-            self.refinement_net = None
-        
-        # Loss weights
-        if loss_weights is None:
-            loss_weights = dict(
-                chamfer=1.0,
-                emd=0.1,
-                feature=0.0,  # Feature loss not implemented yet
-                smoothness=0.01,
-            )
+        self.refinement_net = build_backbone(refinement_net)
         self.loss_weights = loss_weights
     
     def sample_points_fps(
@@ -369,64 +343,62 @@ class PointCloudRefinement(nn.Module):
     def _pad_point_clouds(
         self,
         point_clouds: List[torch.Tensor],
+        target_num_points: int,
         pad_value: float = 0.0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Pad variable-length point clouds to same size.
         
         Args:
             point_clouds: List of (N_i, C) tensors (C can be 3 or 6)
+            target_num_points: Target number of points to pad to
             pad_value: Value to use for padding
         
         Returns:
-            padded: (B, max_N, C) padded tensor
-            valid_lengths: (B,) tensor with actual lengths
+            padded: (B, target_num_points, C) padded tensor
         """
         if len(point_clouds) == 0:
-            return torch.empty(0, 0, 3), torch.empty(0, dtype=torch.long)
+            return torch.empty(0, target_num_points, 3)
         
         device = point_clouds[0].device
         B = len(point_clouds)
         C = point_clouds[0].shape[1]  # 3 or 6
         
-        # Get max length
-        lengths = [pc.shape[0] for pc in point_clouds]
-        max_length = max(lengths)
-        valid_lengths = torch.tensor(lengths, device=device, dtype=torch.long)
-        
-        # Pad all to max_length
+        # Pad all to target_num_points
         padded_list = []
         for pc in point_clouds:
             N = pc.shape[0]
-            if N < max_length:
-                padding = torch.full((max_length - N, C), pad_value, device=device, dtype=pc.dtype)
+            if N < target_num_points:
+                padding = torch.full((target_num_points - N, C), pad_value, device=device, dtype=pc.dtype)
                 padded_pc = torch.cat([pc, padding], dim=0)
             else:
-                padded_pc = pc
+                #using the furthest point sample to downsample the points to the target number of points
+                fps_indices = furthest_point_sample(pc.unsqueeze(0), target_num_points).squeeze(0)
+                padded_pc = pc[fps_indices]
             padded_list.append(padded_pc)
         
-        padded = torch.stack(padded_list, dim=0)  # (B, max_N, C)
-        return padded, valid_lengths
+        padded = torch.stack(padded_list, dim=0)  # (B, target_num_points, C)
+        return padded
     
-    def _unpad_point_clouds(
-        self,
-        padded: torch.Tensor,
-        valid_lengths: torch.Tensor
-    ) -> List[torch.Tensor]:
-        """Unpad point clouds back to original lengths.
+    def _padding_samples(self, pseudo_points: List[torch.Tensor], 
+                         gt_points: List[torch.Tensor]) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         
-        Args:
-            padded: (B, max_N, C) padded tensor
-            valid_lengths: (B,) tensor with actual lengths
         
-        Returns:
-            List of (N_i, C) tensors
-        """
-        B = padded.shape[0]
-        unpadded = []
-        for b_idx in range(B):
-            N = valid_lengths[b_idx].item()
-            unpadded.append(padded[b_idx, :N])
-        return unpadded
+        assert len(pseudo_points) == len(gt_points), "Pseudo and GT points must have the same batch size"
+        batch_size = len(pseudo_points)
+        
+        # find the max number of points in pseudo and gt points
+        max_num_points = max(len(pseudo_points[i]) for i in range(batch_size))
+        max_num_points_gt = max(len(gt_points[i]) for i in range(batch_size))
+        target_num_points = max(max_num_points, max_num_points_gt)
+        
+        # pad pseudo and gt points to the target number of points
+        padded_pseudo_points = self._pad_point_clouds(pseudo_points, target_num_points)
+        padded_gt_points = self._pad_point_clouds(gt_points, target_num_points)
+        
+        
+        return padded_pseudo_points, padded_gt_points
+    
+    
     
     def forward(
         self,
@@ -446,34 +418,13 @@ class PointCloudRefinement(nn.Module):
             refined_points: (B, N, C) tensor (same format as input if tensor, else list)
             losses: Dict of loss values (if return_loss=True and gt_points provided)
         """
-        if not self.enabled:
-            # Return in same format as input
-            return pseudo_points, None
         
-        # Convert to batch tensor format if needed
-        if isinstance(pseudo_points, list):
-            # Stack list into batch tensor
-            pseudo_batch = torch.stack(pseudo_points, dim=0)  # (B, N, C)
-            return_as_list = True
-        else:
-            pseudo_batch = pseudo_points  # Already (B, N, C)
-            return_as_list = False
-        
-        device = pseudo_batch.device
-        B, N, C = pseudo_batch.shape
-        
-        # Extract XYZ coordinates (in case colors are included)
-        # pseudo_batch can be (B, N, 3) or (B, N, 6)
-        pseudo_xyz = pseudo_batch[:, :, :3]  # (B, N, 3)
-        
-        # Sample pseudo points if needed
-        if self.sample_pseudo_to is not None:
-            pseudo_sampled = self.sample_points_fps(pseudo_xyz, self.sample_pseudo_to, device)  # (B, sample_pseudo_to, 3)
-        else:
-            pseudo_sampled = pseudo_xyz  # (B, N, 3)
+        pseudo_sampled, gt_sampled = self._padding_samples(pseudo_points, gt_points)
+        B, N, C = pseudo_sampled.shape
+
         
         # Refine using network (batch operation)
-        refined_xyz = self.refinement_net(pseudo_sampled)  # (B, N, 3) or (B, sample_pseudo_to, 3)
+        refined_xyz = self.refinement_net(pseudo_sampled) # (B, N, 3)
         
         # If original had colors, preserve them
         if C == 6:
@@ -532,8 +483,5 @@ class PointCloudRefinement(nn.Module):
             losses = loss_dict
         
         # Return in same format as input
-        if return_as_list:
-            return [refined_batch[i] for i in range(B)], losses
-        else:
-            return refined_batch, losses
+        return refined_batch, losses
 

@@ -132,12 +132,10 @@ test_pipeline = [
         ])
 ]
 
-
-# Post-processing pipeline for reconstruction point clouds
-# This is a list with a single ResPointCloudPipeline dict that contains all transforms
-respoint_post_processing_pipeline = [
+rescon_pipeline = [
     dict(
-        type='ResPointCloudPipeline',
+        type='DepthAnything3Filter',
+        
         transforms=[
             # Voxel downsample (always runs if voxel_size is not None)
             # dict(
@@ -166,16 +164,12 @@ respoint_post_processing_pipeline = [
                 enabled=True,
                 num_points=40000,
             ),
-            dict(
-                type='PointPadding',
-                padding_size=40000,
-                
-            )
-            
             
         ]
-    ),
+    )
 ]
+
+
 
 
 
@@ -224,7 +218,7 @@ model = dict(
         type='ReconstructionBackbone',
         pretrained="depth-anything/DA3NESTED-GIANT-LARGE",
         cache_dir="ckpts",
-        respoint_post_processing_pipeline=respoint_post_processing_pipeline,
+        rescon_pipeline=rescon_pipeline,
         glb_config=dict(
             sky_depth_def=98.0,
             conf_thresh_percentile=30.0,
@@ -240,10 +234,9 @@ model = dict(
         conf_thresh_percentile=30.0,
         freeze_da3=True,  # Freeze DepthAnything3 model (recommended)
         refinement=dict(
-            enabled=True,  # Enable point cloud refinement
-            sample_pseudo_to=40000,  # Downsample pseudo point cloud to this size
-            sample_gt_to=None,  # Keep GT at original size (or set to downsample)
+            type='PointCloudRefinement',
             refinement_net=dict(
+                type='PointNetRefinement',
                 hidden_channels=64,
                 num_layers=4,
                 output_mode='residual',  # 'residual' outputs offsets, 'direct' outputs refined points
