@@ -15,8 +15,8 @@ from mmcv.parallel import DataContainer as DC
 from mmdet.datasets.pipelines import Compose
 
 
-from projects.mmdet3d_plugin.models.depth_anything_3.api import DepthAnything3
-from projects.mmdet3d_plugin.models.depth_anything_3.specs import Prediction
+from projects.mmdet3d_plugin.models.backbone.depth_anything_3.api import DepthAnything3
+from projects.mmdet3d_plugin.models.backbone.depth_anything_3.specs import Prediction
 from projects.mmdet3d_plugin.datasets.pipelines.respoint_post_processing import ResPointCloudPipeline
 from projects.mmdet3d_plugin.models.backbone.point_cloud_refinement import PointCloudRefinement
 

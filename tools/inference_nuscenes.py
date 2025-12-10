@@ -23,7 +23,7 @@ from mmcv import Config, DictAction
 from mmcv.utils import import_modules_from_strings
 
 # Project package imports (projects is a package with __init__.py)
-from projects.mmdet3d_plugin.models.depth_anything_3.api import DepthAnything3
+from projects.mmdet3d_plugin.models.backbone.depth_anything_3.api import DepthAnything3
 from projects.mmdet3d_plugin.core.post_processing.da3_post_processing import (
     build_post_processing_pipeline,
     run_post_processing_pipeline,
