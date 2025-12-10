@@ -410,7 +410,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         start_time = time.time()
         output = self.output_processor(raw_output, return_torch=return_torch)
         end_time = time.time()
-        logger.info(f"Conversion to Prediction Done. Time: {end_time - start_time} seconds")
+        # logger.info(f"Conversion to Prediction Done. Time: {end_time - start_time} seconds")
         return output
 
     def _add_processed_images(self, prediction: Prediction, imgs_cpu: torch.Tensor) -> Prediction:
