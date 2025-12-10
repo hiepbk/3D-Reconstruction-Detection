@@ -237,4 +237,66 @@ python -m tools.inference_mmdet3d \
 - `--launcher`: Job launcher for distributed training (default: "none")
 - `--cfg-options`: Override config options in key=value format (optional)
 
+### Training with mmdet3d (ResDet3D with Point Cloud Refinement)
+
+Train the ResDet3D model with point cloud refinement. The training process will:
+1. Generate pseudo point clouds from multi-view images using DepthAnything3
+2. Refine the pseudo point clouds to match ground-truth LiDAR point clouds
+3. Learn the refinement network using Chamfer Distance, EMD, and smoothness losses
+
+**Basic usage:**
+```bash
+# Single GPU training
+python -m tools.train_mmdet3d \
+    projects/configs/ResDet3D_nuscenes_mini_config.py \
+    --work-dir work_dirs/resdet3d_nuscenes_mini
+
+# Resume from checkpoint
+python -m tools.train_mmdet3d \
+    projects/configs/ResDet3D_nuscenes_mini_config.py \
+    --work-dir work_dirs/resdet3d_nuscenes_mini \
+    --resume-from work_dirs/resdet3d_nuscenes_mini/latest.pth
+
+# Multi-GPU training (distributed)
+python -m tools.train_mmdet3d \
+    projects/configs/ResDet3D_nuscenes_mini_config.py \
+    --work-dir work_dirs/resdet3d_nuscenes_mini \
+    --launcher pytorch \
+    --gpus 2
+
+# With custom GPU IDs
+python -m tools.train_mmdet3d \
+    projects/configs/ResDet3D_nuscenes_mini_config.py \
+    --work-dir work_dirs/resdet3d_nuscenes_mini \
+    --gpu-ids 0 1
+
+# Override config options
+python -m tools.train_mmdet3d \
+    projects/configs/ResDet3D_nuscenes_mini_config.py \
+    --work-dir work_dirs/resdet3d_nuscenes_mini \
+    --cfg-options optimizer.lr=0.001
+```
+
+**Training Arguments:**
+- `config`: Path to config file (required, positional argument)
+- `--work-dir`: Directory to save logs and checkpoints (default: `./work_dirs/{config_name}`)
+- `--resume-from`: Path to checkpoint file to resume training from
+- `--no-validate`: Skip validation during training
+- `--gpus`: Number of GPUs to use (single GPU training)
+- `--gpu-ids`: Specific GPU IDs to use (e.g., `--gpu-ids 0 1`)
+- `--launcher`: Job launcher for distributed training (`none`, `pytorch`, `slurm`, `mpi`)
+- `--seed`: Random seed (default: 0)
+- `--deterministic`: Use deterministic CUDNN backend
+- `--autoscale-lr`: Automatically scale learning rate with number of GPUs
+- `--cfg-options`: Override config options in key=value format
+
+**Note:** The training script uses the `train_model` API from mmdet3d, which handles:
+- Optimizer and learning rate scheduler setup
+- Training loop with loss computation
+- Checkpoint saving
+- Validation (if enabled)
+- Logging and tensorboard support
+
+The refinement losses (Chamfer Distance, EMD, Smoothness) will be logged and can be monitored during training.
+
 

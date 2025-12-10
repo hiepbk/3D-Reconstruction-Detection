@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
 """
-Inference script for nuScenes using mmdet3d infrastructure.
-Uses mmdet3d's data loading, model building, and inference pipeline.
+Training script for ResDet3D using mmdet3d infrastructure.
+Uses mmdet3d's data loading, model building, and training pipeline.
 
-The reconstruction backbone is integrated into ResDet3D and will be called
+The reconstruction backbone with refinement is integrated into ResDet3D and will be called
 automatically during model forward pass.
 
 Usage:
-    python tools/inference_mmdet3d.py --config projects/configs/ResDet3D_nuscenes_mini_config.py
+    python tools/train_mmdet3d.py projects/configs/ResDet3D_nuscenes_mini_config.py
 """
 
 import argparse
+import copy
+import mmcv
 import os
-
-import numpy as np
-import open3d as o3d
+import time
 import torch
+import warnings
 from mmcv import Config, DictAction
-from mmcv.parallel import MMDataParallel
-from mmcv.runner import load_checkpoint
+from mmcv.runner import get_dist_info, init_dist
+from os import path as osp
+
+from mmdet import __version__ as mmdet_version
+from mmdet3d import __version__ as mmdet3d_version
+from mmdet3d.apis import train_model
+from mmdet3d.datasets import build_dataset
+from mmdet3d.models import build_model
+from mmdet3d.utils import collect_env, get_root_logger
+from mmdet.apis import set_random_seed
+from mmseg import __version__ as mmseg_version
 from mmcv.utils import import_modules_from_strings
 
-from mmdet3d.datasets import build_dataloader, build_dataset
-from mmdet3d.models import build_model
-import mmcv
 
 # Patch mmcv Scatter.forward to handle device indices correctly
 # This fixes a bug where target_gpus contains integers but _get_stream expects device objects
@@ -58,309 +65,90 @@ def _patch_scatter_forward():
     print("[DEBUG] Patched mmcv Scatter.forward to handle device indices")
 
 
-def save_point_cloud_pcd(points, output_path, colors=None):
-    """Save point cloud as PCD file with colors.
-    
-    Args:
-        points (np.ndarray): Point cloud as numpy array of shape (N, 3)
-        output_path (str): Output path for PCD file
-        colors (np.ndarray, optional): Colors as numpy array of shape (N, 3) in [0, 1] or [0, 255]
-    """
-    if points is None or len(points) == 0:
-        print(f"  Warning: No point cloud to save to {output_path}")
-        return
-    
-    # Create open3d PointCloud
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    
-    # Set colors if provided
-    if colors is not None:
-        # Normalize colors to [0, 1] if needed
-        if colors.max() > 1.0:
-            colors = colors / 255.0
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-    else:
-        # Default gray color (white on white background is invisible)
-        pcd.paint_uniform_color([0.5, 0.5, 0.5])
-    
-    # Save as PCD file
-    o3d.io.write_point_cloud(output_path, pcd)
-    print(f"  Saved PCD file with {len(points)} points to {output_path}")
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train ResDet3D with DepthAnything3 reconstruction')
+    parser.add_argument('config', help='train config file path')
+    parser.add_argument('--work-dir', help='the dir to save logs and models')
+    parser.add_argument(
+        '--resume-from', help='the checkpoint file to resume from')
+    parser.add_argument(
+        '--no-validate',
+        action='store_true',
+        help='whether not to evaluate the checkpoint during training')
+    group_gpus = parser.add_mutually_exclusive_group()
+    group_gpus.add_argument(
+        '--gpus',
+        type=int,
+        help='number of gpus to use '
+        '(only applicable to non-distributed training)')
+    group_gpus.add_argument(
+        '--gpu-ids',
+        type=int,
+        nargs='+',
+        help='ids of gpus to use '
+        '(only applicable to non-distributed training)')
+    parser.add_argument('--seed', type=int, default=0, help='random seed')
+    parser.add_argument(
+        '--deterministic',
+        action='store_true',
+        help='whether to set deterministic options for CUDNN backend.')
+    parser.add_argument(
+        '--options',
+        nargs='+',
+        action=DictAction,
+        help='override some settings in the used config, the key-value pair '
+        'in xxx=yyy format will be merged into config file (deprecate), '
+        'change to --cfg-options instead.')
+    parser.add_argument(
+        '--cfg-options',
+        nargs='+',
+        action=DictAction,
+        help='override some settings in the used config, the key-value pair '
+        'in xxx=yyy format will be merged into config file. If the value to '
+        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
+        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
+        'Note that the quotation marks are necessary and that no white space '
+        'is allowed.')
+    parser.add_argument(
+        '--launcher',
+        choices=['none', 'pytorch', 'slurm', 'mpi'],
+        default='none',
+        help='job launcher')
+    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument(
+        '--autoscale-lr',
+        action='store_true',
+        help='automatically scale lr with the number of gpus')
+    args = parser.parse_args()
+    if 'LOCAL_RANK' not in os.environ:
+        os.environ['LOCAL_RANK'] = str(args.local_rank)
 
+    if args.options and args.cfg_options:
+        raise ValueError(
+            '--options and --cfg-options cannot be both specified, '
+            '--options is deprecated in favor of --cfg-options')
+    if args.options:
+        warnings.warn('--options is deprecated in favor of --cfg-options')
+        args.cfg_options = args.options
 
-def display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=None):
-    """Display point cloud using open3d.
-    
-    Args:
-        points (np.ndarray): Point cloud as numpy array of shape (N, 3)
-        sample_token (str): Sample token for window title
-        colors (np.ndarray, optional): Colors as numpy array of shape (N, 3) in [0, 1]
-        gt_bboxes_3d (list, optional): List of ground truth 3D bounding boxes
-    """
-    if points is None or len(points) == 0:
-        print(f"  Warning: No point cloud to display for sample {sample_token}")
-        return
-    
-    print(f"  Displaying point cloud with {len(points)} points...")
-    print(f"  Press 'Q' or close the window to continue")
-    
-    # Convert numpy to open3d PointCloud
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    
-    # Set colors if provided
-    if colors is not None:
-        if colors.max() > 1.0:
-            # Assume colors are in [0, 255], normalize to [0, 1]
-            colors = colors / 255.0
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-    else:
-        # Default gray color (white on white background is invisible)
-        pcd.paint_uniform_color([0.5, 0.5, 0.5])
-    
-    # Create visualization window
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name=f"Point Cloud - Sample {sample_token[:8]}", width=1920, height=1080)
-    vis.add_geometry(pcd)
-    
-    # Calculate point cloud center and bounds for proper view setup
-    points_array = np.asarray(pcd.points)
-    if len(points_array) > 0:
-        center = points_array.mean(axis=0)
-        bounds = points_array.max(axis=0) - points_array.min(axis=0)
-        max_bound = bounds.max()
-    else:
-        center = np.array([0, 0, 0])
-        max_bound = 1.0
-    
-    # Set up view to look at the point cloud center
-    view_ctl = vis.get_view_control()
-    view_ctl.set_front([0, 0, -1])
-    view_ctl.set_lookat(center)
-    view_ctl.set_up([0, -1, 0])
-    # Set zoom based on point cloud size
-    if max_bound > 0:
-        # Zoom to fit the point cloud (smaller zoom = wider view)
-        zoom = 0.3 if max_bound > 50 else 0.7
-    else:
-        zoom = 0.7
-    view_ctl.set_zoom(zoom)
-    
-    # Update renderer to apply view changes
-    vis.poll_events()
-    vis.update_renderer()
-    
-    # Draw the axis of the point cloud
-    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
-    vis.add_geometry(axis)
-    
-    # Draw the gt_bboxes_3d on the point cloud
-    if gt_bboxes_3d is not None and len(gt_bboxes_3d) > 0:
-        print(f"  Adding {len(gt_bboxes_3d)} bounding boxes to visualization")
-        for gt_bbox_3d in gt_bboxes_3d:
-            # Extract bbox information
-            # gt_bboxes_3d from mmdet3d are typically in LiDARBox3D format
-            if hasattr(gt_bbox_3d, 'tensor'):
-                # mmdet3d LiDARBox3D format: [x, y, z, w, l, h, yaw]
-                bbox_tensor = gt_bbox_3d.tensor.cpu().numpy()
-                if len(bbox_tensor.shape) == 2:
-                    bbox_tensor = bbox_tensor[0]  # Take first box if batched
-                
-                center = bbox_tensor[:3]  # x, y, z
-                size = bbox_tensor[3:6]  # w, l, h
-                yaw = bbox_tensor[6]  # yaw angle
-                
-                # Create rotation matrix from yaw
-                cos_yaw = np.cos(yaw)
-                sin_yaw = np.sin(yaw)
-                rotation_matrix = np.array([
-                    [cos_yaw, -sin_yaw, 0],
-                    [sin_yaw, cos_yaw, 0],
-                    [0, 0, 1]
-                ])
-            else:
-                # Fallback: assume dict or other format
-                center = np.array(gt_bbox_3d.get('center', [0, 0, 0]), dtype=np.float64)
-                size = np.array(gt_bbox_3d.get('size', [1, 1, 1]), dtype=np.float64)
-                rotation_matrix = gt_bbox_3d.get('rotation_matrix', np.eye(3))
-            
-            # Create OrientedBoundingBox
-            obb = o3d.geometry.OrientedBoundingBox(center, rotation_matrix, size)
-            obb.color = [1, 0, 0]  # Red color for boxes
-            vis.add_geometry(obb)
-            
-            # Change the color of points which are in this box
-            indices = obb.get_point_indices_within_bounding_box(pcd.points)
-            if len(indices) > 0:
-                # Convert colors to numpy array, modify, then assign back
-                colors_array = np.asarray(pcd.colors)
-                colors_array[indices] = [1, 0, 0]  # Red color for points in box
-                pcd.colors = o3d.utility.Vector3dVector(colors_array)
-                vis.update_geometry(pcd)
-            
-            # Find the center of front face (heading direction)
-            heading_dir = rotation_matrix[:2, 0]  # x, y components of heading
-            yaw = np.arctan2(heading_dir[1], heading_dir[0])
-            
-            # Connect the bbox center with the front center -> heading direction
-            front_center = center + size[0] * np.array([np.cos(yaw), np.sin(yaw), 0])
-            # Append geometry line set from center to front center
-            line_set = o3d.geometry.LineSet()
-            line_set.points = o3d.utility.Vector3dVector([center, front_center])
-            line_set.lines = o3d.utility.Vector2iVector([[0, 1]])
-            line_set.colors = o3d.utility.Vector3dVector([[1, 0, 0], [1, 0, 0]])  # Red color for heading line
-            vis.add_geometry(line_set)
-    
-    vis.run()
-    vis.destroy_window()
-
-
-def single_gpu_test(model,
-                    data_loader,
-                    show=False,
-                    out_dir=None,):
-    """Test model with single gpu.
-
-    This method tests model with single gpu and gives the 'show' option.
-    By setting ``show=True``, it saves the visualization results under
-    ``out_dir``.
-
-    Args:
-        model (nn.Module): Model to be tested.
-        data_loader (nn.Dataloader): Pytorch data loader.
-        show (bool): Whether to save viualization results.
-            Default: True.
-        out_dir (str): The path to save visualization results.
-            Default: None.
-
-    Returns:
-        list[dict]: The prediction results.
-    """
-    model.eval()
-    results = []
-    dataset = data_loader.dataset
-    prog_bar = mmcv.ProgressBar(len(dataset))
-
-    for i, data in enumerate(data_loader):
-        with torch.no_grad():
-            # sample_idx = 1447
-            # data = data_loader.dataset[sample_idx]
-            result = model(return_loss=False, rescale=True, **data)
-            
-            
-        batch_size = len(result)
-        for pred_idx, pred in enumerate(result):
-            # This for debugging purposes
-            if isinstance(pred, dict) and 'pseudo_points' in pred:
-                pseudo_points = pred['pseudo_points']
-                
-                # Handle both single tensor and list of tensors
-                # (list case can happen if model returns list, but typically it's a single tensor per sample)
-                if isinstance(pseudo_points, list):
-                    # If it's a list, take the first element (shouldn't happen with proper batching)
-                    if len(pseudo_points) > 0:
-                        pseudo_points = pseudo_points[0]
-                    else:
-                        pseudo_points = None
-                
-                if pseudo_points is not None:
-                    # Convert to numpy if tensor
-                    if isinstance(pseudo_points, torch.Tensor):
-                        pseudo_points = pseudo_points.cpu().numpy()
-                    
-                    sample_token = f"batch_{i}_pred_{pred_idx}"
-                    
-                    # Split xyz / colors if available
-                    colors = None
-                    points = pseudo_points
-                    if pseudo_points.shape[1] >= 6:
-                        colors = pseudo_points[:, 3:]
-                        points = pseudo_points[:, :3]
-                    
-                    print(f"✓ Generated pseudo point cloud with {len(points)} points for {sample_token}")
-                    if colors is not None:
-                        print(f"  Found colors with shape {colors.shape}")
-                    
-                    # Optionally save point cloud as PCD file
-                    if out_dir:
-                        pcd_path = os.path.join(out_dir, f"{sample_token}_points.pcd")
-                        save_point_cloud_pcd(points, pcd_path, colors=colors)
-                        print(f"  Saved point cloud to {pcd_path}")
-                    
-                    # Display point cloud with colors
-                    if show and points is not None and len(points) > 0:
-                        display_point_cloud(points, sample_token, colors=colors, gt_bboxes_3d=None)
-        
-        results.extend(result)
-
-
-        for _ in range(batch_size):
-            prog_bar.update()
-    
-    return results
+    return args
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="mmdet3d-style inference for ResDet3D with DepthAnything3 reconstruction"
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        required=True,
-        help="Path to config file (mmdet3d-style)",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Path to checkpoint file (optional, for loading trained weights)",
-    )
-    parser.add_argument(
-        "--cfg-options",
-        nargs="+",
-        action=DictAction,
-        help="Override config options, key=value format",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="output",
-        help="Output directory for results",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=1,
-        help="Batch size (samples_per_gpu) for data loader (default: 1)",
-    )
-    parser.add_argument(
-        "--launcher",
-        choices=['none', 'pytorch', 'slurm', 'mpi'],
-        default='none',
-        help="Job launcher for distributed training (default: none = single GPU)",
-    )
-    parser.add_argument(
-        "--display",
-        action='store_true',
-        help="Display point cloud with colors",
-    )
-
-    args = parser.parse_args()
-
-    # Load config (mimic mmdet3d behavior)
-    cfg = Config.fromfile(args.config)
-    if args.cfg_options is not None:
-        cfg.merge_from_dict(args.cfg_options)
+    args = parse_args()
 
     # Patch mmcv Scatter.forward before building model/data
     _patch_scatter_forward()
 
-    # Handle custom imports/plugins (mimic mmdet3d)
+    cfg = Config.fromfile(args.config)
+    if args.cfg_options is not None:
+        cfg.merge_from_dict(args.cfg_options)
+    
+    # import modules from string list.
     if cfg.get('custom_imports', None):
         import_modules_from_strings(**cfg['custom_imports'])
 
+    # Handle plugin imports (mimic mmdet3d behavior)
     if hasattr(cfg, 'plugin') and cfg.plugin:
         import importlib
         if hasattr(cfg, 'plugin_dir'):
@@ -380,90 +168,144 @@ def main():
             print(f"Importing plugin from: {_module_path}")
             importlib.import_module(_module_path)
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # set cudnn_benchmark
+    if cfg.get('cudnn_benchmark', False):
+        torch.backends.cudnn.benchmark = True
 
-    # Auto-detect device (use CUDA if available, else CPU)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # work_dir is determined in this priority: CLI > segment in file > filename
+    if args.work_dir is not None:
+        # update configs according to CLI args if args.work_dir is not None
+        cfg.work_dir = args.work_dir
+    elif cfg.get('work_dir', None) is None:
+        # use config filename as default work_dir if cfg.work_dir is None
+        cfg.work_dir = osp.join('./work_dirs',
+                                osp.splitext(osp.basename(args.config))[0])
+    if args.resume_from is not None:
+        cfg.resume_from = args.resume_from
+    if args.gpu_ids is not None:
+        cfg.gpu_ids = args.gpu_ids
+    else:
+        cfg.gpu_ids = range(1) if args.gpus is None else range(args.gpus)
 
-    print(f"\n{'='*60}")
-    print("ResDet3D - mmdet3d Inference")
-    print(f"{'='*60}")
-    print(f"Config: {args.config}")
-    print(f"Output directory: {args.output_dir}")
-    print(f"Device: {device}")
-    print(f"{'='*60}\n")
+    if args.autoscale_lr:
+        # apply the linear scaling rule (https://arxiv.org/abs/1706.02677)
+        cfg.optimizer['lr'] = cfg.optimizer['lr'] * len(cfg.gpu_ids) / 8
 
-    # Detect if distributed (like test.py)
+    # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
         distributed = False
     else:
         distributed = True
-        from mmcv.runner import init_dist
-        init_dist(args.launcher, **cfg.get('dist_params', {}))
+        init_dist(args.launcher, **cfg.dist_params)
+        # re-set gpu_ids with distributed training mode
+        _, world_size = get_dist_info()
+        cfg.gpu_ids = range(world_size)
 
-    # Build dataset using mmdet3d infrastructure
-    print("Building training dataset...")
-    dataset = build_dataset(cfg.data.train)
-    print(f"Dataset loaded: {len(dataset)} samples")
+    # create work_dir
+    mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
+    # dump config
+    cfg.dump(osp.join(cfg.work_dir, osp.basename(args.config)))
+    # init the logger before other steps
+    timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+    log_file = osp.join(cfg.work_dir, f'{timestamp}.log')
+    # specify logger name, if we still use 'mmdet', the output info will be
+    # filtered and won't be saved in the log_file
+    # TODO: ugly workaround to judge whether we are training det or seg model
+    if cfg.model.type in ['EncoderDecoder3D']:
+        logger_name = 'mmseg'
+    else:
+        logger_name = 'mmdet'
+    logger = get_root_logger(
+        log_file=log_file, log_level=cfg.log_level, name=logger_name)
 
-    # Build data loader with specified batch size
-    print(f"Building data loader with batch_size={args.batch_size}...")
-    data_loader = build_dataloader(
-        dataset,
-        samples_per_gpu=args.batch_size,
-        workers_per_gpu=cfg.data.get('workers_per_gpu', 4),
-        dist=distributed,
-        shuffle=False,
-    )
-    print("Data loader built")
+    # init the meta dict to record some important information such as
+    # environment info and seed, which will be logged
+    meta = dict()
+    # log env info
+    env_info_dict = collect_env()
+    env_info = '\n'.join([(f'{k}: {v}') for k, v in env_info_dict.items()])
+    dash_line = '-' * 60 + '\n'
+    logger.info('Environment info:\n' + dash_line + env_info + '\n' +
+                dash_line)
+    meta['env_info'] = env_info
+    meta['config'] = cfg.pretty_text
 
-    # Build model using mmdet3d infrastructure (exactly like test.py)
+    # log some basic info
+    logger.info(f'Distributed training: {distributed}')
+    logger.info(f'Config:\n{cfg.pretty_text}')
+
+    # set random seeds
+    if args.seed is not None:
+        logger.info(f'Set random seed to {args.seed}, '
+                    f'deterministic: {args.deterministic}')
+        set_random_seed(args.seed, deterministic=args.deterministic)
+    cfg.seed = args.seed
+    meta['seed'] = args.seed
+    meta['exp_name'] = osp.basename(args.config)
+
+    # Build model
     print("Building model...")
     print(f"[DEBUG] Model config keys: {list(cfg.model.keys())}")
     if 'reconstruction_backbone' in cfg.model:
         print(f"[DEBUG] Reconstruction backbone config present: {cfg.model['reconstruction_backbone']}")
-    cfg.model.train_cfg = None  # Set train_cfg to None like test.py
-    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
     
-    # Load checkpoint if provided (load to CPU, like test.py)
-    if args.checkpoint is not None:
-        print(f"Loading checkpoint: {args.checkpoint}")
-        load_checkpoint(model, args.checkpoint, map_location='cpu')
+    model = build_model(
+        cfg.model,
+        train_cfg=cfg.get('train_cfg'),
+        test_cfg=cfg.get('test_cfg'))
+    model.init_weights()
 
-    # Wrap model based on distributed mode (exactly like test.py)
-    if not distributed:
-        # Single GPU: wrap directly with MMDataParallel (no manual device movement)
-        # MMDataParallel will automatically handle device placement
-        model = MMDataParallel(model, device_ids=[0])
-        print("Model wrapped with MMDataParallel (single GPU)")
-    else:
-        # Multi GPU: use MMDistributedDataParallel (for future implementation)
-        from mmcv.parallel import MMDistributedDataParallel
-        model = MMDistributedDataParallel(
-            model.cuda(),
-            device_ids=[torch.cuda.current_device()],
-            broadcast_buffers=False)
-        print("Model wrapped with MMDistributedDataParallel (multi GPU)")
-    print("Model built and ready")
-
-    # Use single_gpu_test from mmdet3d (like test.py)
-    print(f"\nProcessing samples with batch_size={args.batch_size}...")
-    outputs = single_gpu_test(
-        model=model,
-        data_loader=data_loader,
-        show=args.display,
-        out_dir=args.output_dir,
-    )
+    logger.info(f'Model:\n{model}')
     
+    # Build datasets
+    print("Building training dataset...")
+    datasets = [build_dataset(cfg.data.train)]
+    if len(cfg.workflow) == 2:
+        val_dataset = copy.deepcopy(cfg.data.val)
+        # in case we use a dataset wrapper
+        if 'dataset' in cfg.data.train:
+            val_dataset.pipeline = cfg.data.train.dataset.pipeline
+        else:
+            val_dataset.pipeline = cfg.data.train.pipeline
+        # set test_mode=False here in deep copied config
+        # which do not affect AP/AR calculation later
+        # refer to https://mmdetection3d.readthedocs.io/en/latest/tutorials/customize_runtime.html#customize-workflow  # noqa
+        val_dataset.test_mode = False
+        datasets.append(build_dataset(val_dataset))
+    
+    if cfg.checkpoint_config is not None:
+        # save mmdet version, config file content and class names in
+        # checkpoints as meta data
+        cfg.checkpoint_config.meta = dict(
+            mmdet_version=mmdet_version,
+            mmseg_version=mmseg_version,
+            mmdet3d_version=mmdet3d_version,
+            config=cfg.pretty_text,
+            CLASSES=datasets[0].CLASSES,
+            PALETTE=datasets[0].PALETTE  # for segmentors
+            if hasattr(datasets[0], 'PALETTE') else None)
+    # add an attribute for visualization convenience
+    model.CLASSES = datasets[0].CLASSES
+    
+    # Start training
     print(f"\n{'='*60}")
-    print("Processing Summary")
+    print("ResDet3D - Training")
     print(f"{'='*60}")
-    print(f"Total samples processed: {len(outputs)}")
-    print(f"Batch size used: {args.batch_size}")
-    print(f"Output directory: {args.output_dir}")
+    print(f"Config: {args.config}")
+    print(f"Work directory: {cfg.work_dir}")
+    print(f"Distributed: {distributed}")
+    print(f"GPU IDs: {cfg.gpu_ids}")
     print(f"{'='*60}\n")
+    
+    train_model(
+        model,
+        datasets,
+        cfg,
+        distributed=distributed,
+        validate=(not args.no_validate),
+        timestamp=timestamp,
+        meta=meta)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

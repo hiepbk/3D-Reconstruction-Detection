@@ -231,23 +231,23 @@ model = dict(
         max_depth=100.0,
         conf_thresh_percentile=30.0,
         freeze_da3=True,  # Freeze DepthAnything3 model (recommended)
-        # refinement=dict(
-        #     enabled=True,  # Enable point cloud refinement
-        #     sample_pseudo_to=40000,  # Downsample pseudo point cloud to this size
-        #     sample_gt_to=None,  # Keep GT at original size (or set to downsample)
-        #     refinement_net=dict(
-        #         hidden_channels=64,
-        #         num_layers=4,
-        #         output_mode='residual',  # 'residual' outputs offsets, 'direct' outputs refined points
-        #     ),
-        #     loss_weights=dict(
-        #         chamfer=1.0,  # Chamfer Distance weight
-        #         emd=0.1,  # Earth Mover's Distance weight
-        #         feature=0.0,  # Feature-space consistency loss (not implemented yet)
-        #         smoothness=0.01,  # Smoothness regularization weight
-        #     ),
-        # ),
-        refinement=None
+        refinement=dict(
+            enabled=True,  # Enable point cloud refinement
+            sample_pseudo_to=40000,  # Downsample pseudo point cloud to this size
+            sample_gt_to=None,  # Keep GT at original size (or set to downsample)
+            refinement_net=dict(
+                hidden_channels=64,
+                num_layers=4,
+                output_mode='residual',  # 'residual' outputs offsets, 'direct' outputs refined points
+            ),
+            loss_weights=dict(
+                chamfer=1.0,  # Chamfer Distance weight
+                emd=0.1,  # Earth Mover's Distance weight
+                feature=0.0,  # Feature-space consistency loss (not implemented yet)
+                smoothness=0.01,  # Smoothness regularization weight
+            ),
+        ),
+        # refinement=None
     ),
     
     freeze_img=True,

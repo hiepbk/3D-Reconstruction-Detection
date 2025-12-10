@@ -610,3 +610,132 @@ class ReconstructionBackbone(nn.Module):
         
         return batch_point_clouds, None
         
+
+
+
+# add visualizatin function here for debugging purposes
+def display_point_cloud(points, sample_token, colors=None, gt_bboxes_3d=None):
+    """Display point cloud using open3d.
+    
+    Args:
+        points (np.ndarray): Point cloud as numpy array of shape (N, 3)
+        sample_token (str): Sample token for window title
+        colors (np.ndarray, optional): Colors as numpy array of shape (N, 3) in [0, 1]
+        gt_bboxes_3d (list, optional): List of ground truth 3D bounding boxes
+    """
+    if points is None or len(points) == 0:
+        print(f"  Warning: No point cloud to display for sample {sample_token}")
+        return
+    
+    print(f"  Displaying point cloud with {len(points)} points...")
+    print(f"  Press 'Q' or close the window to continue")
+    
+    # Convert numpy to open3d PointCloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    
+    # Set colors if provided
+    if colors is not None:
+        if colors.max() > 1.0:
+            # Assume colors are in [0, 255], normalize to [0, 1]
+            colors = colors / 255.0
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+    else:
+        # Default gray color (white on white background is invisible)
+        pcd.paint_uniform_color([0.5, 0.5, 0.5])
+    
+    # Create visualization window
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name=f"Point Cloud - Sample {sample_token[:8]}", width=1920, height=1080)
+    vis.add_geometry(pcd)
+    
+    # Calculate point cloud center and bounds for proper view setup
+    points_array = np.asarray(pcd.points)
+    if len(points_array) > 0:
+        center = points_array.mean(axis=0)
+        bounds = points_array.max(axis=0) - points_array.min(axis=0)
+        max_bound = bounds.max()
+    else:
+        center = np.array([0, 0, 0])
+        max_bound = 1.0
+    
+    # Set up view to look at the point cloud center
+    view_ctl = vis.get_view_control()
+    view_ctl.set_front([0, 0, -1])
+    view_ctl.set_lookat(center)
+    view_ctl.set_up([0, -1, 0])
+    # Set zoom based on point cloud size
+    if max_bound > 0:
+        # Zoom to fit the point cloud (smaller zoom = wider view)
+        zoom = 0.3 if max_bound > 50 else 0.7
+    else:
+        zoom = 0.7
+    view_ctl.set_zoom(zoom)
+    
+    # Update renderer to apply view changes
+    vis.poll_events()
+    vis.update_renderer()
+    
+    # Draw the axis of the point cloud
+    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
+    vis.add_geometry(axis)
+    
+    # Draw the gt_bboxes_3d on the point cloud
+    if gt_bboxes_3d is not None and len(gt_bboxes_3d) > 0:
+        print(f"  Adding {len(gt_bboxes_3d)} bounding boxes to visualization")
+        for gt_bbox_3d in gt_bboxes_3d:
+            # Extract bbox information
+            # gt_bboxes_3d from mmdet3d are typically in LiDARBox3D format
+            if hasattr(gt_bbox_3d, 'tensor'):
+                # mmdet3d LiDARBox3D format: [x, y, z, w, l, h, yaw]
+                bbox_tensor = gt_bbox_3d.tensor.cpu().numpy()
+                if len(bbox_tensor.shape) == 2:
+                    bbox_tensor = bbox_tensor[0]  # Take first box if batched
+                
+                center = bbox_tensor[:3]  # x, y, z
+                size = bbox_tensor[3:6]  # w, l, h
+                yaw = bbox_tensor[6]  # yaw angle
+                
+                # Create rotation matrix from yaw
+                cos_yaw = np.cos(yaw)
+                sin_yaw = np.sin(yaw)
+                rotation_matrix = np.array([
+                    [cos_yaw, -sin_yaw, 0],
+                    [sin_yaw, cos_yaw, 0],
+                    [0, 0, 1]
+                ])
+            else:
+                # Fallback: assume dict or other format
+                center = np.array(gt_bbox_3d.get('center', [0, 0, 0]), dtype=np.float64)
+                size = np.array(gt_bbox_3d.get('size', [1, 1, 1]), dtype=np.float64)
+                rotation_matrix = gt_bbox_3d.get('rotation_matrix', np.eye(3))
+            
+            # Create OrientedBoundingBox
+            obb = o3d.geometry.OrientedBoundingBox(center, rotation_matrix, size)
+            obb.color = [1, 0, 0]  # Red color for boxes
+            vis.add_geometry(obb)
+            
+            # Change the color of points which are in this box
+            indices = obb.get_point_indices_within_bounding_box(pcd.points)
+            if len(indices) > 0:
+                # Convert colors to numpy array, modify, then assign back
+                colors_array = np.asarray(pcd.colors)
+                colors_array[indices] = [1, 0, 0]  # Red color for points in box
+                pcd.colors = o3d.utility.Vector3dVector(colors_array)
+                vis.update_geometry(pcd)
+            
+            # Find the center of front face (heading direction)
+            heading_dir = rotation_matrix[:2, 0]  # x, y components of heading
+            yaw = np.arctan2(heading_dir[1], heading_dir[0])
+            
+            # Connect the bbox center with the front center -> heading direction
+            front_center = center + size[0] * np.array([np.cos(yaw), np.sin(yaw), 0])
+            # Append geometry line set from center to front center
+            line_set = o3d.geometry.LineSet()
+            line_set.points = o3d.utility.Vector3dVector([center, front_center])
+            line_set.lines = o3d.utility.Vector2iVector([[0, 1]])
+            line_set.colors = o3d.utility.Vector3dVector([[1, 0, 0], [1, 0, 0]])  # Red color for heading line
+            vis.add_geometry(line_set)
+    
+    vis.run()
+    vis.destroy_window()
