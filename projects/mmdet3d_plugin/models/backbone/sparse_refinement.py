@@ -65,40 +65,44 @@ class SparseRefinement(nn.Module):
         else:
             self.loss_feature = None
     
-    def _voxelize_and_encode(self, points: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Voxelize and encode point clouds.
+    def _voxelize_and_encode(self, points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Voxelize and encode batched point clouds.
         
         Args:
-            points: List of (N, C) tensors where C is 3 (XYZ) or 6 (XYZRGB)
+            points: (B, N, C) tensor
         
         Returns:
             voxel_features: Voxel features
             num_points: Number of points per voxel
             coors: Voxel coordinates (with batch index)
         """
-        # Voxelize each point cloud individually (Voxelization expects single tensor)
+        if points.dim() == 2:
+            points = points.unsqueeze(0)
+        batch_size = points.shape[0]
+
         voxels_list, coors_list, num_points_list = [], [], []
-        for res in points:
+        for b in range(batch_size):
+            res = points[b]
+            if not res.is_contiguous():
+                res = res.contiguous()
+            if not torch.is_floating_point(res):
+                res = res.float()
             res_voxels, res_coors, res_num_points = self.voxel_layer(res)
             voxels_list.append(res_voxels)
             coors_list.append(res_coors)
             num_points_list.append(res_num_points)
-        
-        # Concatenate voxels and num_points
+
         voxels = torch.cat(voxels_list, dim=0)
         num_points = torch.cat(num_points_list, dim=0)
-        
-        # Add batch index to coordinates and concatenate
+
         coors_batch = []
         for i, coor in enumerate(coors_list):
-            # Pad coordinates with batch index: (N, 3) -> (N, 4) where first dim is batch_idx
             coor_pad = F.pad(coor, (1, 0), mode='constant', value=i)
             coors_batch.append(coor_pad)
         coors = torch.cat(coors_batch, dim=0)
-        
-        # Encode voxels
+
         voxel_features = self.voxel_encoder(voxels, num_points, coors)
-        
+
         return voxel_features, num_points, coors
     
     def _process_sparse_features(
@@ -126,30 +130,25 @@ class SparseRefinement(nn.Module):
     
     def forward(
         self,
-        pseudo_points: Union[torch.Tensor, List[torch.Tensor]],
-        gt_points: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        pseudo_points: torch.Tensor,
+        gt_points: Optional[torch.Tensor] = None,
         return_loss: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         """
         Args:
-            pseudo_points: (B, N, C) tensor or list of (N, C) tensors
-            gt_points: (B, N, C) tensor or list of (N, C) tensors (optional)
+            pseudo_points: (B, N, C) tensor
+            gt_points: (B, N, C) tensor (optional)
             return_loss: Whether to compute losses
         
         Returns:
             refined_points: (B, N, C) refined point clouds (currently returns input)
             losses: Dict of loss values (if return_loss=True)
         """
-        # Ensure tensor input (B, N, C)
-        if isinstance(pseudo_points, list):
-            pseudo_points = torch.stack(pseudo_points, dim=0)
         if pseudo_points.dim() == 2:
             pseudo_points = pseudo_points.unsqueeze(0)
         batch_size = pseudo_points.shape[0]
 
-        # Convert to list for voxelization layer
-        pseudo_list = [pseudo_points[b] for b in range(batch_size)]
-        pseudo_points_xyz = pseudo_list if self.use_color else [pts[:, :3] for pts in pseudo_list]
+        pseudo_points_xyz = pseudo_points if self.use_color else pseudo_points[:, :, :3]
         
         # Voxelize and encode pseudo points
         pseudo_voxel_features, pseudo_num_points, pseudo_coors = self._voxelize_and_encode(pseudo_points_xyz)
@@ -164,13 +163,10 @@ class SparseRefinement(nn.Module):
         if return_loss and gt_points is not None:
             loss_dict = {}
             
-            if isinstance(gt_points, list):
-                gt_points = torch.stack(gt_points, dim=0)
             if gt_points.dim() == 2:
                 gt_points = gt_points.unsqueeze(0)
 
-            gt_list = [gt_points[b] for b in range(batch_size)]
-            gt_points_xyz = gt_list if self.use_color else [pts[:, :3] for pts in gt_list]
+            gt_points_xyz = gt_points if self.use_color else gt_points[:, :, :3]
             
             # Voxelize and encode GT points
             gt_voxel_features, gt_num_points, gt_coors = self._voxelize_and_encode(gt_points_xyz)
