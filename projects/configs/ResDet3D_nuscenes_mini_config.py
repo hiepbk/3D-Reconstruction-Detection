@@ -347,6 +347,12 @@ log_config = dict(
         #         ))
            ])
 
+custom_hooks = [
+    dict(type='VisualDebugSparseHook', interval=1, max_voxels=20000),
+]
+
+
+
 
 dist_params = dict(backend='nccl')
 log_level = 'INFO'

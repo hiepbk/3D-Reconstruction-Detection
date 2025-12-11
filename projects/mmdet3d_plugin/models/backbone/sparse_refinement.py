@@ -52,6 +52,9 @@ class SparseRefinement(nn.Module):
         
         # Build voxelization layer
         self.voxel_layer = Voxelization(**pts_voxel_layer)
+        # Cache voxel meta for visualization
+        self.voxel_size = torch.tensor(pts_voxel_layer['voxel_size'], dtype=torch.float32)
+        self.point_cloud_range = torch.tensor(pts_voxel_layer['point_cloud_range'], dtype=torch.float32)
         
         # Build voxel encoder
         self.voxel_encoder = builder.build_voxel_encoder(pts_voxel_encoder)
@@ -64,6 +67,9 @@ class SparseRefinement(nn.Module):
             self.loss_feature = build_loss(loss_feature)
         else:
             self.loss_feature = None
+
+        # Visualization caching flag
+        self.enable_visual_debug = False
     
     def _voxelize_and_encode(self, points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Voxelize and encode batched point clouds.
@@ -158,6 +164,10 @@ class SparseRefinement(nn.Module):
             pseudo_voxel_features, pseudo_num_points, pseudo_coors, batch_size
         )
         
+        # Cache pseudo coors for visualization (only if enabled)
+        if self.enable_visual_debug:
+            self.last_coors = pseudo_coors.detach().cpu()
+
         # Compute losses if needed
         losses = None
         if return_loss and gt_points is not None:
@@ -175,6 +185,10 @@ class SparseRefinement(nn.Module):
             gt_sparse_features = self._process_sparse_features(
                 gt_voxel_features, gt_num_points, gt_coors, batch_size
             )
+
+            # Cache GT coors for visualization (only if enabled)
+            if self.enable_visual_debug:
+                self.last_coors_gt = gt_coors.detach().cpu()
             
             # Compute feature loss
             if self.loss_feature is not None:
