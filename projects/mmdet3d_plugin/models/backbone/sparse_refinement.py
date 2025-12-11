@@ -13,6 +13,7 @@ from typing import Optional, Tuple, Dict, List, Union
 from mmdet.models.builder import BACKBONES, LOSSES, build_loss
 from mmdet3d.ops import Voxelization
 from mmdet3d.models import builder
+from projects.mmdet3d_plugin.utils.live_visualizer import enqueue_live_frame
 
 
 @BACKBONES.register_module()
@@ -49,6 +50,7 @@ class SparseRefinement(nn.Module):
         
         self.use_color = use_color
         self.loss_weight = loss_weight
+        self.vis_grid_size = None  # optionally set by visualization hook
         
         # Build voxelization layer
         self.voxel_layer = Voxelization(**pts_voxel_layer)
@@ -69,7 +71,36 @@ class SparseRefinement(nn.Module):
             self.loss_feature = None
 
         # Visualization caching flag
-        self.enable_visual_debug = False
+        self.enable_visual_debug = True
+        self.last_vis_coors = None
+        self.last_vis_coors_gt = None
+
+    def _prepare_vis_coors(self, coors: torch.Tensor) -> torch.Tensor:
+        """Detach, crop (if configured), and move coors to CPU for visualization."""
+        if coors is None:
+            return None
+        coors_cpu = coors.detach().cpu()
+        if self.vis_grid_size is None:
+            return coors_cpu
+        # coors format: [batch, z, y, x]
+        voxel_size = self.voxel_size.cpu().numpy()
+        pcr = self.point_cloud_range.cpu().numpy()
+        gx = (pcr[3] - pcr[0]) / voxel_size[0]
+        gy = (pcr[4] - pcr[1]) / voxel_size[1]
+        gz = (pcr[5] - pcr[2]) / voxel_size[2]
+        cx = gx * 0.5
+        cy = gy * 0.5
+        cz = gz * 0.5
+        vx_half = self.vis_grid_size[0] * 0.5
+        vy_half = self.vis_grid_size[1] * 0.5
+        vz_half = self.vis_grid_size[2] * 0.5
+        coors_np = coors_cpu.numpy()
+        mask = (
+            (coors_np[:, 3] >= cx - vx_half) & (coors_np[:, 3] <= cx + vx_half) &
+            (coors_np[:, 2] >= cy - vy_half) & (coors_np[:, 2] <= cy + vy_half) &
+            (coors_np[:, 1] >= cz - vz_half) & (coors_np[:, 1] <= cz + vz_half)
+        )
+        return torch.as_tensor(coors_np[mask], dtype=torch.int32)
     
     def _voxelize_and_encode(self, points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Voxelize and encode batched point clouds.
@@ -167,6 +198,7 @@ class SparseRefinement(nn.Module):
         # Cache pseudo coors for visualization (only if enabled)
         if self.enable_visual_debug:
             self.last_coors = pseudo_coors.detach().cpu()
+            self.last_vis_coors = self._prepare_vis_coors(pseudo_coors)
 
         # Compute losses if needed
         losses = None
@@ -189,6 +221,15 @@ class SparseRefinement(nn.Module):
             # Cache GT coors for visualization (only if enabled)
             if self.enable_visual_debug:
                 self.last_coors_gt = gt_coors.detach().cpu()
+                self.last_vis_coors_gt = self._prepare_vis_coors(gt_coors)
+                enqueue_live_frame(
+                    dict(
+                        pseudo_coors=self.last_vis_coors,
+                        gt_coors=self.last_vis_coors_gt,
+                        voxel_size=self.voxel_size.detach().cpu().numpy(),
+                        pcr=self.point_cloud_range.detach().cpu().numpy(),
+                    )
+                )
             
             # Compute feature loss
             if self.loss_feature is not None:

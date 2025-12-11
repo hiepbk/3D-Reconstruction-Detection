@@ -182,7 +182,8 @@ data = dict(
             classes=class_names,
             modality=input_modality,
             test_mode=False,
-            box_type_3d='LiDAR')),
+            box_type_3d='LiDAR')
+        ),
     val=dict(
         type=dataset_type,
         data_root=data_root,
@@ -348,7 +349,6 @@ log_config = dict(
            ])
 
 custom_hooks = [
-    dict(type='VisualDebugSparseHook', interval=1, max_voxels=20000),
 ]
 
 

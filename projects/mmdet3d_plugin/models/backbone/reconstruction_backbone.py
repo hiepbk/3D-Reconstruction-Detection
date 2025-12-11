@@ -18,7 +18,6 @@ from mmdet.models.builder import build_backbone
 from projects.mmdet3d_plugin.models.backbone.depth_anything_3.api import DepthAnything3
 from projects.mmdet3d_plugin.models.backbone.depth_anything_3.specs import Prediction
 from projects.mmdet3d_plugin.datasets.pipelines.respoint_post_processing import DepthAnything3Filter
-from projects.mmdet3d_plugin.models.backbone.point_cloud_refinement import PointCloudRefinement
 
 
 

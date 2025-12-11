@@ -354,6 +354,10 @@ class Custom3DDataset(Dataset):
         if self.test_mode:
             return self.prepare_test_data(idx)
         while True:
+            # Hiep add for first sample dataset
+            
+            # idx = 0
+            
             data = self.prepare_train_data(idx)
             if data is None:
                 idx = self._rand_another(idx)
