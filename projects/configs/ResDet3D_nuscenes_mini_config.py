@@ -231,6 +231,8 @@ model = dict(
         refinement=dict(
             type='SparseRefinement',
             use_color=False,  # Set to False to disable color processing (only use XYZ)
+            debug_viz=True,
+            debug_viz_dir='work_dirs/resdet3d_nuscenes_mini/debug_viz',
             # Voxelization layer: converts point clouds to voxels
             pts_voxel_layer=dict(
                 max_num_points=10,  # Maximum points per voxel
