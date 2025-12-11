@@ -6,11 +6,6 @@ Modify these settings to control model behavior and post-processing.
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
 
-
-
-
-
-
 point_cloud_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
 class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
@@ -161,7 +156,7 @@ rescon_pipeline = [
             dict(
                 type='FPSDownsample',
                 enabled=True,
-                num_points=40000,
+                num_points=40000,  # 40k points for convergence to real LiDAR point clouds
             ),
             
         ]
@@ -174,8 +169,8 @@ rescon_pipeline = [
 
 
 data = dict(
-    samples_per_gpu=3,
-    workers_per_gpu=6,
+    samples_per_gpu=1,
+    workers_per_gpu=2,
     train=dict(
         type='CBGSDataset',
         dataset=dict(
@@ -233,39 +228,38 @@ model = dict(
         conf_thresh_percentile=30.0,
         freeze_da3=True,  # Freeze DepthAnything3 model (recommended)
         refinement=dict(
-            type='PointCloudRefinement',
-            refinement_net=dict(
-                type='PointNetRefinement',
-                in_channels=6,  # 3 for XYZ only, 6 for XYZRGB (auto-detects from input)
-                hidden_channels=64,
-                num_layers=4,
-                output_mode='residual',  # 'residual' outputs offsets, 'direct' outputs refined points
-                color_weight=0.1,  # Weight for color refinement (lower = less influence on colors)
+            type='SparseRefinement',
+            use_color=False,  # Set to False to disable color processing (only use XYZ)
+            # Voxelization layer: converts point clouds to voxels
+            pts_voxel_layer=dict(
+                max_num_points=10,  # Maximum points per voxel
+                voxel_size=voxel_size,  # [0.075, 0.075, 0.2]
+                max_voxels=(120000, 160000),  # (training, testing) max voxels
+                point_cloud_range=point_cloud_range,  # [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
             ),
-            loss_chamfer=dict(
-                type='ChamferDistance',
-                mode='l2',
+            # Voxel encoder: encodes voxel features
+            pts_voxel_encoder=dict(
+                type='HardSimpleVFE',
+                num_features=3,  # XYZ only (since use_color=False)
+            ),
+            # Sparse middle encoder: 3D sparse convolutions
+            pts_middle_encoder=dict(
+                type='SparseEncoder',
+                in_channels=3,  # Should match num_features in voxel_encoder
+                sparse_shape=[41, 1440, 1440],  # [Z, Y, X] calculated from point_cloud_range and voxel_size
+                output_channels=128,
+                order=('conv', 'norm', 'act'),
+                encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
+                encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
+                block_type='basicblock',
+            ),
+            # Feature loss: compares sparse features between pseudo and GT
+            loss_feature=dict(
+                type='SimpleL2Loss',
                 reduction='mean',
-                loss_src_weight=1.0,
-                loss_dst_weight=1.0,
+                loss_weight=1.0,
             ),
-            loss_emd=dict(
-                type='EMDLoss',
-                temperature=0.1,
-                reduction='mean',
-                loss_weight=0.1,  # Earth Mover's Distance weight (XYZ position)
-            ),
-            loss_smoothness=dict(
-                type='SmoothnessLoss',
-                reduction='mean',
-                loss_weight=0.01,  # Smoothness regularization weight (XYZ position)
-            ),
-            loss_color=dict(
-                type='ColorLoss',
-                mode='l1',
-                reduction='mean',
-                loss_weight=0.1,  # Color loss weight (lower than position losses)
-            ),
+            loss_weight=1.0,  # Weight for feature loss
         ),
         # refinement=None
     ),
@@ -343,8 +337,8 @@ total_epochs = 8
 checkpoint_config = dict(interval=1)
 
 log_config = dict(
-    interval=50,
-    hooks=[dict(type='TextLoggerHook'),
+    interval=1,
+    hooks=[dict(type='ComponentMemoryLoggerHook'),  # Custom hook with component memory breakdown (extends TextLoggerHook)
            dict(type='TensorboardLoggerHook'),
         #    dict(type='WandbLoggerHook',
         #         init_kwargs=dict(

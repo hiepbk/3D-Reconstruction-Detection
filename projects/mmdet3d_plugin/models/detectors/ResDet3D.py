@@ -162,7 +162,10 @@ class ResDet3D(MVXTwoStageDetector):
                 delattr(self, '_reconstruction_losses')
         
         # Call parent forward_train for detection losses (if head/neck exist)
-        if self.pts_bbox_head is not None or self.img_backbone is not None:
+        has_pts_bbox_head = hasattr(self, 'pts_bbox_head') and self.pts_bbox_head is not None
+        has_img_backbone = hasattr(self, 'img_backbone') and self.img_backbone is not None
+        
+        if has_pts_bbox_head or has_img_backbone:
             parent_losses = super().forward_train(
                 points=pseudo_points if self.reconstruction_backbone is not None else points,
                 img_metas=img_metas,

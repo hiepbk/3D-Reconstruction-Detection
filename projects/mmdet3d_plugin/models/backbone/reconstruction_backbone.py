@@ -75,12 +75,26 @@ class ReconstructionBackbone(nn.Module):
         """
         super(ReconstructionBackbone, self).__init__()
         
+        # Measure baseline memory before loading DA3
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            baseline_memory = torch.cuda.memory_allocated() / 1024**2
+        
         # Create wrapped DepthAnything3 model
         print(f"[DEBUG] ReconstructionBackbone: Loading DepthAnything3 model from {pretrained}")
         print(f"[DEBUG] ReconstructionBackbone: cache_dir = {cache_dir}")
         self.da3_model = DepthAnything3.from_pretrained(pretrained, cache_dir=cache_dir)
         self.da3_model.eval()
-        print(f"[DEBUG] ReconstructionBackbone: DepthAnything3 model loaded successfully")
+        
+        # Measure DA3 memory usage
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            da3_memory = torch.cuda.memory_allocated() / 1024**2
+            da3_net_memory = da3_memory - baseline_memory
+            da3_params = sum(p.numel() for p in self.da3_model.parameters())
+            print(f"[DEBUG] ReconstructionBackbone: DA3 model loaded successfully")
+            print(f"[DEBUG] ReconstructionBackbone: DA3 VRAM usage: {da3_net_memory:.2f} MB (params: {da3_params/1e6:.2f}M)")
         
         # Freeze DA3 model if requested (recommended for training)
         self.freeze_da3 = freeze_da3
@@ -116,9 +130,22 @@ class ReconstructionBackbone(nn.Module):
         
         # Build point cloud refinement module
         if refinement is not None:
+            # Measure memory before refinement
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                before_refinement_memory = torch.cuda.memory_allocated() / 1024**2
+            
             print(f"[DEBUG] ReconstructionBackbone: Building point cloud refinement module...")
             self.refinement = build_backbone(refinement)
-            print(f"[DEBUG] ReconstructionBackbone: Refinement module built successfully")
+            
+            # Measure refinement memory usage
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                after_refinement_memory = torch.cuda.memory_allocated() / 1024**2
+                refinement_net_memory = after_refinement_memory - before_refinement_memory
+                refinement_params = sum(p.numel() for p in self.refinement.parameters())
+                print(f"[DEBUG] ReconstructionBackbone: Refinement module built successfully")
+                print(f"[DEBUG] ReconstructionBackbone: Refinement VRAM usage: {refinement_net_memory:.2f} MB (params: {refinement_params/1e6:.2f}M)")
         else:
             self.refinement = None
             print(f"[DEBUG] ReconstructionBackbone: No refinement module configured")
@@ -291,8 +318,11 @@ class ReconstructionBackbone(nn.Module):
         all_colors_batch = []
 
         for batch_idx in range(B):
-            points_batch = torch.zeros((0, 3), device=device, dtype=multi_batch_depths.dtype)
-            colors_batch = torch.zeros((0, 3), device=device, dtype=multi_batch_depths.dtype)
+            # Collect points and colors in lists first to avoid quadratic memory growth
+            # from repeated torch.cat operations
+            points_list = []
+            colors_list = []
+            
             for cam_idx in range(N):
                 depth = multi_batch_depths[batch_idx, cam_idx]  # (H,W)
                 intr = multi_batch_intrinsics[batch_idx, cam_idx]  # (3,3)
@@ -336,18 +366,81 @@ class ReconstructionBackbone(nn.Module):
                         cols = cols / 255.0
 
                 
-                # pts_list.append(pts)
-                # col_list.append(cols)
-                # convert pts in camera coordinates to lidar coordinates
-                pts = pts @ multi_batch_cam2lidar_rts[batch_idx, cam_idx][:3, :3].T + multi_batch_cam2lidar_rts[batch_idx, cam_idx][3, :3]
-                
-                points_batch = torch.cat([points_batch, pts], dim=0) if pts is not None else points_batch
-                colors_batch = torch.cat([colors_batch, cols], dim=0) if cols is not None else colors_batch
+                # Convert pts in camera coordinates to lidar coordinates
+                if pts.numel() > 0:
+                    pts = pts @ multi_batch_cam2lidar_rts[batch_idx, cam_idx][:3, :3].T + multi_batch_cam2lidar_rts[batch_idx, cam_idx][3, :3]
+                    points_list.append(pts)
+                    if cols is not None and cols.numel() > 0:
+                        colors_list.append(cols)
+            
+            # Concatenate all points/colors once at the end (much more memory efficient)
+            if points_list:
+                points_batch = torch.cat(points_list, dim=0)
+                colors_batch = torch.cat(colors_list, dim=0) if colors_list else None
+            else:
+                points_batch = torch.zeros((0, 3), device=device, dtype=multi_batch_depths.dtype)
+                colors_batch = None
             
             all_points_batch.append(points_batch)
             all_colors_batch.append(colors_batch)
 
         return all_points_batch, all_colors_batch
+
+    def _padding_samples(
+        self,
+        pseudo_points: List[torch.Tensor],
+        gt_points: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pad pseudo and GT point clouds in the batch to the same number of points.
+        
+        Returns batched tensors with unified point count: (B, N, C).
+        """
+        assert len(pseudo_points) == len(gt_points), "Pseudo and GT points must have the same batch size"
+        batch_size = len(pseudo_points)
+
+        # Determine target number of points across pseudo and gt
+        max_num_points = max(len(pseudo_points[i]) for i in range(batch_size))
+        max_num_points_gt = max(len(gt_points[i]) for i in range(batch_size))
+        target_num_points = max(max_num_points, max_num_points_gt)
+
+        # Pad to target size
+        padded_pseudo_points = self._pad_point_clouds(pseudo_points, target_num_points)
+        padded_gt_points = self._pad_point_clouds(gt_points, target_num_points)
+
+        # Stack to tensors (B, N, C)
+        padded_pseudo_points = torch.stack(padded_pseudo_points, dim=0)
+        padded_gt_points = torch.stack(padded_gt_points, dim=0)
+
+        return padded_pseudo_points, padded_gt_points
+
+    def _pad_point_clouds(
+        self,
+        points_list: List[torch.Tensor],
+        target_num_points: int,
+    ) -> List[torch.Tensor]:
+        """Pad a list of point clouds to the target number of points.
+        
+        Pads by repeating the last point if needed.
+        """
+        padded = []
+        for pts in points_list:
+            n, c = pts.shape
+            if n == target_num_points:
+                padded.append(pts)
+                continue
+            if n == 0:
+                # create zeros if empty
+                pad_pts = torch.zeros((target_num_points, c), device=pts.device, dtype=pts.dtype)
+                padded.append(pad_pts)
+                continue
+            if n < target_num_points:
+                pad_count = target_num_points - n
+                pad = pts[-1:].repeat(pad_count, 1)
+                pad_pts = torch.cat([pts, pad], dim=0)
+            else:
+                pad_pts = pts[:target_num_points]
+            padded.append(pad_pts)
+        return padded
     
     def _transform_points_cam_to_lidar(
         self,
@@ -402,7 +495,6 @@ class ReconstructionBackbone(nn.Module):
         img_metas: List[Dict],
         return_loss: bool = False,
         points: Optional[torch.Tensor] = None,  # GT point cloud for training
-        freeze_da3_override: Optional[bool] = None,  # Override freeze_da3 setting for this forward pass
     ) -> Tuple[List[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
         """Forward pass: generate point cloud from images.
         
@@ -414,7 +506,6 @@ class ReconstructionBackbone(nn.Module):
             img_metas: Image metadata list (one dict per batch item)
             return_loss: Whether to return loss (True=train, False=test)
             points: Ground truth point clouds (B, N, 3) or list of (N, 3) tensors for training
-            freeze_da3_override: Override freeze_da3 setting for this forward pass (train mode only)
         
         Returns:
             batch_point_clouds: List of point cloud tensors, one per batch item
@@ -422,7 +513,7 @@ class ReconstructionBackbone(nn.Module):
             losses: Dict of loss values (if return_loss=True and refinement enabled)
         """
         if return_loss:
-            return self.forward_train(img, img_metas, points, freeze_da3_override)
+            return self.forward_train(img, img_metas, points)
         else:
             return self.forward_test(img, img_metas)
     
@@ -431,7 +522,6 @@ class ReconstructionBackbone(nn.Module):
         img: torch.Tensor,
         img_metas: List[Dict],
         points: Optional[torch.Tensor] = None,
-        freeze_da3_override: Optional[bool] = None,
     ) -> Tuple[List[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
         """Forward pass for training mode.
         
@@ -439,14 +529,11 @@ class ReconstructionBackbone(nn.Module):
             img: Multi-view images (B, N, 3, H, W) or DataContainer
             img_metas: Image metadata list (one dict per batch item)
             points: Ground truth point clouds (B, N, 3) or list of (N, 3) tensors
-            freeze_da3_override: Override freeze_da3 setting (None = use self.freeze_da3)
         
         Returns:
             batch_point_clouds: List of refined point cloud tensors
             losses: Dict of loss values (if refinement enabled)
         """
-        # Determine whether to freeze DA3 for this forward pass
-        freeze_da3 = self.freeze_da3 if freeze_da3_override is None else freeze_da3_override
         
         device = next(self.parameters()).device
         
@@ -470,9 +557,24 @@ class ReconstructionBackbone(nn.Module):
         )
         imgs_for_da3 = imgs_processed.to(device, non_blocking=True).float()
         
-        # Use no_grad context if DA3 is frozen
-        da3_context = torch.no_grad() if freeze_da3 else torch.enable_grad()
-        with da3_context:
+        # Use inference_mode (more memory efficient than no_grad) if DA3 is frozen
+        if self.freeze_da3:
+            # Set to eval mode and use inference_mode for maximum memory savings
+            self.da3_model.eval()
+            with torch.inference_mode():
+                da3_output = self.da3_model.forward(
+                    image=imgs_for_da3,
+                    extrinsics=None,
+                    intrinsics=None,
+                    export_feat_layers=[],
+                    infer_gs=False,
+                    use_ray_pose=self.use_ray_pose,
+                    ref_view_strategy=self.ref_view_strategy,
+                )
+            # Clear cache after DA3 forward to free up memory
+            torch.cuda.empty_cache()
+        else:
+            self.da3_model.train()
             da3_output = self.da3_model.forward(
                 image=imgs_for_da3,
                 extrinsics=None,
@@ -540,14 +642,18 @@ class ReconstructionBackbone(nn.Module):
                     else:  # (N, 3) - single point cloud, expand to batch
                         gt_points_list = [points.unsqueeze(0).expand(B, -1, -1).float().to(device)]
 
-            # Colorize GT points if available using lidar2img
+            # Colorize GT points if available using lidar2img (only if refinement uses colors)
             if gt_points_list is not None:
-                multi_batch_lidar2img = self._extract_lidar2img_from_meta(img_metas, device=device)
-                gt_points_list = self._get_gt_color_points(
-                    gt_points_list=gt_points_list,
-                    multi_batch_ori_imgs=multi_batch_ori_imgs,
-                    multi_batch_lidar2img=multi_batch_lidar2img,
-                )
+                # Check if refinement module uses colors
+                use_color = getattr(self.refinement, 'use_color', False) if self.refinement is not None else False
+                if use_color:
+                    multi_batch_lidar2img = self._extract_lidar2img_from_meta(img_metas, device=device)
+                    gt_points_list = self._get_gt_color_points(
+                        gt_points_list=gt_points_list,
+                        multi_batch_ori_imgs=multi_batch_ori_imgs,
+                        multi_batch_lidar2img=multi_batch_lidar2img,
+                    )
+                # If not using colors, gt_points_list remains as XYZ only (B, N, 3)
             # comment or uncomment for visual debugging purposes
             # for b_idx in range(B):
             #     print(img_metas[b_idx]['filename'])
@@ -557,14 +663,20 @@ class ReconstructionBackbone(nn.Module):
             # Apply refinement in batch mode (if enabled)
             if self.refinement is not None:
                 # Refine entire batch at once
+                if gt_points_list is None:
+                    raise ValueError("GT points are required for refinement")
+
+                # Pad pseudo and GT to the same number of points per batch
+                padded_pseudo, padded_gt = self._padding_samples(pseudo_points_list, gt_points_list)
+
                 refined_batch, refinement_losses = self.refinement(
-                    pseudo_points=pseudo_points_list,  # list of (N, C) tensors
-                    gt_points=gt_points_list,  # list of (N, 3 or 6) tensors
-                    return_loss=True,  # Always compute loss in training
+                    pseudo_points=padded_pseudo,  # (B, N, C) tensor
+                    gt_points=padded_gt,         # (B, N, C) tensor
+                    return_loss=True,            # Always compute loss in training
                 )
                 
                 # refined_batch is (B, N, C) tensor, convert to list
-                batch_point_clouds = [refined_batch[i] for i in range(B)]
+                batch_point_clouds = [refined_batch[i] for i in range(refined_batch.shape[0])]
                 losses = refinement_losses
             else:
                 # No refinement, convert batch tensor to list

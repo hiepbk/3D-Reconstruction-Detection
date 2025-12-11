@@ -212,6 +212,8 @@ class PointCloudRefinement(nn.Module):
         loss_emd: Optional[Dict] = None,
         loss_smoothness: Optional[Dict] = None,
         loss_color: Optional[Dict] = None,
+        loss_sample_points: Optional[int] = None,
+        use_color: bool = False,
     ):
         """
         Args:
@@ -220,10 +222,21 @@ class PointCloudRefinement(nn.Module):
             loss_emd: Config dict for EMD loss
             loss_smoothness: Config dict for Smoothness loss
             loss_color: Config dict for Color loss
+            loss_sample_points: Number of points to sample for loss computation (None = use all points)
+                This helps reduce memory usage for Chamfer/EMD losses which create O(N*M) tensors.
+            use_color: If False, only use XYZ (first 3 channels), skip color processing and color loss.
         """
         super().__init__()
         
+        self.use_color = use_color
+        
+        # If not using colors, force refinement_net to use 3 channels
+        if not self.use_color and refinement_net is not None:
+            refinement_net = refinement_net.copy()
+            refinement_net['in_channels'] = 3
+        
         self.refinement_net = build_backbone(refinement_net)
+        self.loss_sample_points = loss_sample_points
         
         # Build loss modules using registered losses
         # Chamfer Distance (use mmdet3d's built-in)
@@ -244,11 +257,18 @@ class PointCloudRefinement(nn.Module):
         else:
             self.loss_smoothness = None
         
-        # Color Loss
-        if loss_color is not None:
+        # Color Loss (only if use_color is True)
+        if self.use_color and loss_color is not None:
             self.loss_color = build_loss(loss_color)
         else:
             self.loss_color = None
+        
+        # Measure VRAM usage after initialization (for reference, actual measurement done in parent)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            refinement_params = sum(p.numel() for p in self.refinement_net.parameters())
+            refinement_memory_estimate = (refinement_params * 4) / 1024**2  # 4 bytes per float32
+            print(f"[DEBUG] PointCloudRefinement: Refinement network params: {refinement_params/1e6:.2f}M (estimated VRAM: {refinement_memory_estimate:.2f} MB)")
     
     def sample_points_fps(
         self,
@@ -403,39 +423,128 @@ class PointCloudRefinement(nn.Module):
         B, N, C = pseudo_sampled.shape
         device = pseudo_sampled.device
         
+        # If not using colors, only use XYZ (first 3 channels)
+        if not self.use_color:
+            pseudo_sampled = pseudo_sampled[:, :, :3]  # (B, N, 3)
+            C = 3
+        
         # Refine using network (batch operation)
         # Network now handles both XYZ and XYZRGB internally
         refined_batch = self.refinement_net(pseudo_sampled)  # (B, N, C) where C matches input
         
         # Extract XYZ and colors for loss computation
         refined_xyz = refined_batch[:, :, :3]  # (B, N, 3)
-        refined_colors = refined_batch[:, :, 3:6] if C == 6 else None  # (B, N, 3) or None
+        refined_colors = refined_batch[:, :, 3:6] if (self.use_color and C >= 6) else None  # (B, N, 3) or None
         
         # Compute losses if needed
         losses = None
         if return_loss and gt_sampled is not None:
-            # Extract GT XYZ and colors
+            # Extract GT XYZ and colors (only if use_color is True)
             gt_xyz = gt_sampled[:, :, :3]  # (B, M, 3)
-            gt_colors = gt_sampled[:, :, 3:6] if gt_sampled.shape[2] >= 6 else None  # (B, M, 3) or None
+            gt_colors = gt_sampled[:, :, 3:6] if (self.use_color and gt_sampled.shape[2] >= 6) else None  # (B, M, 3) or None
             
             # Compute losses on batched data
             loss_dict = {}
             
-            # Chamfer Distance (XYZ only - most important)
+            # Optionally downsample points for loss computation to save memory
+            # Chamfer/EMD losses create O(N*M) intermediate tensors, so reducing N helps a lot
+            if self.loss_sample_points is not None and refined_xyz.shape[1] > self.loss_sample_points:
+                # Sample points using FPS for loss computation
+                refined_xyz_loss = self.sample_points_fps(refined_xyz, self.loss_sample_points, device=refined_xyz.device)
+                gt_xyz_loss = self.sample_points_fps(gt_xyz, self.loss_sample_points, device=gt_xyz.device)
+                pseudo_xyz_loss = self.sample_points_fps(pseudo_sampled[:, :, :3], self.loss_sample_points, device=pseudo_sampled.device)
+            else:
+                refined_xyz_loss = refined_xyz
+                gt_xyz_loss = gt_xyz
+                pseudo_xyz_loss = pseudo_sampled[:, :, :3]
+            
+            # Chamfer Distance or Simple L2 Loss (XYZ only - most important)
             if self.loss_chamfer is not None:
-                loss_src, loss_dst = self.loss_chamfer(refined_xyz, gt_xyz)
-                cd_loss = loss_src + loss_dst
-                loss_dict['loss_chamfer'] = cd_loss
+                # Check if it's SimpleL2Loss (O(N) complexity, no distance matrices)
+                if hasattr(self.loss_chamfer, '__class__') and 'SimpleL2Loss' in str(type(self.loss_chamfer)):
+                    # Simple L2 loss - direct call, no special handling needed
+                    cd_loss = self.loss_chamfer(refined_xyz_loss, gt_xyz_loss)
+                    loss_dict['loss_chamfer'] = cd_loss
+                else:
+                    # Chamfer Distance - use memory-efficient chunked computation
+                    B, N, _ = refined_xyz_loss.shape
+                    M = gt_xyz_loss.shape[1]
+                    
+                    # Use highly memory-efficient chunked computation with double chunking
+                    # Process both source and target in small chunks to avoid (B, chunk_size, M) tensors
+                    chunk_size_src = 256  # Very small chunks for 40k points
+                    chunk_size_tgt = 256  # Also chunk target dimension
+                    loss_src_chunks = []
+                    
+                    # Process source points in chunks, and also chunk target to avoid large matrices
+                    for i in range(0, N, chunk_size_src):
+                        end_i = min(i + chunk_size_src, N)
+                        src_chunk = refined_xyz_loss[:, i:end_i, :]  # (B, chunk_size_src, 3)
+                        
+                        # Process target in chunks too
+                        min_dists_for_src_chunk = []
+                        for j in range(0, M, chunk_size_tgt):
+                            end_j = min(j + chunk_size_tgt, M)
+                            tgt_chunk = gt_xyz_loss[:, j:end_j, :]  # (B, chunk_size_tgt, 3)
+                            
+                            # Compute distance matrix for this small chunk: (B, chunk_size_src, chunk_size_tgt)
+                            dists = torch.cdist(src_chunk, tgt_chunk, p=2)  # (B, chunk_size_src, chunk_size_tgt)
+                            min_dists = dists.min(dim=2).values  # (B, chunk_size_src)
+                            min_dists_for_src_chunk.append(min_dists)
+                            
+                            # Free memory immediately
+                            del dists, min_dists, tgt_chunk
+                        
+                        # Take minimum across all target chunks (each source point finds closest across all target chunks)
+                        min_dists_src_chunk = torch.stack(min_dists_for_src_chunk, dim=0).min(dim=0).values  # (B, chunk_size_src)
+                        loss_src_chunks.append(min_dists_src_chunk.mean())
+                        
+                        # Free memory
+                        del min_dists_for_src_chunk, min_dists_src_chunk, src_chunk
+                        torch.cuda.empty_cache()  # Aggressive memory clearing
+                    
+                    # Process target->source similarly with double chunking
+                    loss_dst_chunks = []
+                    for j in range(0, M, chunk_size_tgt):
+                        end_j = min(j + chunk_size_tgt, M)
+                        tgt_chunk = gt_xyz_loss[:, j:end_j, :]  # (B, chunk_size_tgt, 3)
+                        
+                        # Process source in chunks
+                        min_dists_for_tgt_chunk = []
+                        for i in range(0, N, chunk_size_src):
+                            end_i = min(i + chunk_size_src, N)
+                            src_chunk = refined_xyz_loss[:, i:end_i, :]  # (B, chunk_size_src, 3)
+                            
+                            dists = torch.cdist(src_chunk, tgt_chunk, p=2)  # (B, chunk_size_src, chunk_size_tgt)
+                            min_dists = dists.min(dim=1).values  # (B, chunk_size_src)
+                            min_dists_for_tgt_chunk.append(min_dists)
+                            
+                            del dists, min_dists, src_chunk
+                        
+                        # Take minimum across all source chunks
+                        min_dists_tgt_chunk = torch.stack(min_dists_for_tgt_chunk, dim=0).min(dim=0).values  # (B, chunk_size_tgt)
+                        loss_dst_chunks.append(min_dists_tgt_chunk.mean())
+                        
+                        del min_dists_for_tgt_chunk, min_dists_tgt_chunk, tgt_chunk
+                        torch.cuda.empty_cache()  # Aggressive memory clearing
+                    
+                    # Average chunked losses
+                    loss_src = torch.stack(loss_src_chunks).mean()
+                    loss_dst = torch.stack(loss_dst_chunks).mean()
+                    cd_loss = loss_src + loss_dst
+                    loss_dict['loss_chamfer'] = cd_loss
+                    
+                    # Clear cache after Chamfer Distance
+                    torch.cuda.empty_cache()
             
             # EMD (XYZ only)
             if self.loss_emd is not None:
-                emd_loss_val = self.loss_emd(refined_xyz, gt_xyz)
+                emd_loss_val = self.loss_emd(refined_xyz_loss, gt_xyz_loss)
                 loss_dict['loss_emd'] = emd_loss_val
             
             # Smoothness (XYZ only)
             if self.loss_smoothness is not None:
-                pseudo_xyz = pseudo_sampled[:, :, :3]  # (B, N, 3)
-                smooth_loss_val = self.loss_smoothness(refined_xyz, pseudo_xyz)
+                smooth_loss_val = self.loss_smoothness(refined_xyz_loss, pseudo_xyz_loss)
                 loss_dict['loss_smoothness'] = smooth_loss_val
             
             # Color loss (if both have colors)
