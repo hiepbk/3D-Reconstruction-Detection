@@ -80,7 +80,7 @@ def save_point_cloud_pcd(points, output_path, colors=None):
         if colors.max() > 1.0:
             colors = colors / 255.0
         pcd.colors = o3d.utility.Vector3dVector(colors)
-    else:
+            else:
         # Default gray color (white on white background is invisible)
         pcd.paint_uniform_color([0.5, 0.5, 0.5])
     
@@ -225,7 +225,7 @@ def single_gpu_test(model,
     This method tests model with single gpu and gives the 'show' option.
     By setting ``show=True``, it saves the visualization results under
     ``out_dir``.
-
+    
     Args:
         model (nn.Module): Model to be tested.
         data_loader (nn.Dataloader): Pytorch data loader.
@@ -437,7 +437,7 @@ def main():
         # MMDataParallel will automatically handle device placement
         model = MMDataParallel(model, device_ids=[0])
         print("Model wrapped with MMDataParallel (single GPU)")
-    else:
+        else:
         # Multi GPU: use MMDistributedDataParallel (for future implementation)
         from mmcv.parallel import MMDistributedDataParallel
         model = MMDistributedDataParallel(
@@ -450,7 +450,7 @@ def main():
     # Use single_gpu_test from mmdet3d (like test.py)
     print(f"\nProcessing samples with batch_size={args.batch_size}...")
     outputs = single_gpu_test(
-        model=model,
+            model=model,
         data_loader=data_loader,
         show=args.display,
         out_dir=args.output_dir,

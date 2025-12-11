@@ -12,9 +12,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, List, Union
-from mmdet.models.builder import BACKBONES
+from mmdet.models.builder import BACKBONES, LOSSES, build_loss
 from mmdet3d.ops import furthest_point_sample
 from mmdet.models.builder import build_backbone
+from mmdet3d.models.losses import ChamferDistance, chamfer_distance
 
 
 class PointNet2Layer(nn.Module):
@@ -47,216 +48,152 @@ class PointNetRefinement(nn.Module):
     
     Takes a pseudo point cloud and produces refined/corrected point cloud.
     Architecture: PointNet++ style with residual connections.
+    Handles both XYZ-only (3 channels) and XYZRGB (6 channels) inputs.
+    Prioritizes XYZ refinement over color refinement.
     """
     
     def __init__(
         self,
-        in_channels: int = 3,
+        in_channels: int = 3,  # Will auto-detect from input (3 or 6)
         hidden_channels: int = 64,
         num_layers: int = 4,
         output_mode: str = 'residual',  # 'residual' or 'direct'
+        color_weight: float = 0.1,  # Weight for color features (lower = less influence)
     ):
         """
         Args:
-            in_channels: Input point dimension (3 for XYZ)
+            in_channels: Input point dimension (3 for XYZ, 6 for XYZRGB) - can be auto-detected
             hidden_channels: Hidden feature dimension
             num_layers: Number of PointNet layers
             output_mode: 'residual' outputs offsets, 'direct' outputs refined points
+            color_weight: Weight for color features (0.0-1.0, lower means less influence)
         """
         super().__init__()
         self.output_mode = output_mode
+        self.color_weight = color_weight
+        self.in_channels = in_channels
+        self._initialized = False
         
-        # Feature extraction layers
-        layers = []
-        prev_channels = in_channels
+        # Main XYZ feature extraction layers (always processes 3 channels)
+        xyz_layers = []
+        prev_channels = 3  # Always 3 for XYZ
         for i in range(num_layers):
-            layers.append(PointNet2Layer(prev_channels, hidden_channels))
+            xyz_layers.append(PointNet2Layer(prev_channels, hidden_channels))
             prev_channels = hidden_channels
         
-        self.feature_layers = nn.ModuleList(layers)
+        self.xyz_feature_layers = nn.ModuleList(xyz_layers)
         
-        # Output layer: predict per-point residual offsets or refined points
+        # Lightweight color feature extraction (initialize if in_channels indicates colors)
+        self.has_color_branch = (in_channels == 6)
+        self.color_feature_layers = None
+        if self.has_color_branch:
+            # Lightweight color processing (fewer layers, smaller channels)
+            color_layers = []
+            prev_channels = 3  # RGB channels
+            for i in range(max(1, num_layers // 2)):  # Half the layers for color
+                color_layers.append(PointNet2Layer(prev_channels, hidden_channels // 2))
+                prev_channels = hidden_channels // 2
+            self.color_feature_layers = nn.ModuleList(color_layers)
+        
+        # Output layer for XYZ: predict per-point residual offsets or refined points
         if output_mode == 'residual':
-            self.output_layer = nn.Sequential(
+            self.xyz_output_layer = nn.Sequential(
                 nn.Conv1d(hidden_channels, hidden_channels // 2, 1),
                 nn.BatchNorm1d(hidden_channels // 2),
                 nn.ReLU(inplace=True),
                 nn.Conv1d(hidden_channels // 2, 3, 1),  # XYZ offsets
             )
         else:  # direct
-            self.output_layer = nn.Sequential(
+            self.xyz_output_layer = nn.Sequential(
                 nn.Conv1d(hidden_channels, hidden_channels // 2, 1),
                 nn.BatchNorm1d(hidden_channels // 2),
                 nn.ReLU(inplace=True),
                 nn.Conv1d(hidden_channels // 2, 3, 1),  # Refined XYZ
             )
+        
+        # Output layer for color (if color branch exists)
+        if self.has_color_branch:
+            self.color_output_layer = nn.Sequential(
+                nn.Conv1d(hidden_channels // 2, hidden_channels // 4, 1),
+                nn.BatchNorm1d(hidden_channels // 4),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(hidden_channels // 4, 3, 1),  # RGB offsets or refined RGB
+            )
+        else:
+            self.color_output_layer = None
     
     def forward(self, points: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            points: (B, N, 3) or (N, 3) point cloud
+            points: (B, N, C) where C is 3 (XYZ) or 6 (XYZRGB)
         Returns:
-            If output_mode='residual': (B, N, 3) or (N, 3) offsets
-            If output_mode='direct': (B, N, 3) or (N, 3) refined points
+            If output_mode='residual': (B, N, C) offsets (C matches input)
+            If output_mode='direct': (B, N, C) refined points (C matches input)
         """
         # Handle both batched and unbatched inputs
         is_batched = points.dim() == 3
         if not is_batched:
-            points = points.unsqueeze(0)  # (1, N, 3)
+            points = points.unsqueeze(0)  # (1, N, C)
         
         B, N, C = points.shape
-        x = points.transpose(1, 2)  # (B, 3, N)
         
-        # Extract features through layers
-        for layer in self.feature_layers:
-            x = layer(x)
+        # Split XYZ and color if present
+        xyz = points[:, :, :3]  # (B, N, 3)
+        xyz_t = xyz.transpose(1, 2)  # (B, 3, N)
         
-        # Generate output
-        output = self.output_layer(x)  # (B, 3, N)
-        output = output.transpose(1, 2)  # (B, N, 3)
+        # Process XYZ through main network (heavily weighted)
+        xyz_features = xyz_t
+        for layer in self.xyz_feature_layers:
+            xyz_features = layer(xyz_features)
+        
+        # Generate XYZ output
+        xyz_output = self.xyz_output_layer(xyz_features)  # (B, 3, N)
+        xyz_output = xyz_output.transpose(1, 2)  # (B, N, 3)
         
         if self.output_mode == 'residual':
-            # Add residual to input
-            # the final output will be refined by using the offsets from the output layer to adjust to match with real lidar point cloud
-            refined = points + output
+            refined_xyz = xyz + xyz_output
         else:
-            refined = output
+            refined_xyz = xyz_output
+        
+        # Process color if present
+        if C == 6:
+            colors = points[:, :, 3:6]  # (B, N, 3)
+            if self.has_color_branch and self.color_feature_layers is not None and self.color_output_layer is not None:
+                # Refine colors through lightweight network
+                colors_t = colors.transpose(1, 2)  # (B, 3, N)
+                
+                # Process color through lightweight network
+                color_features = colors_t
+                for layer in self.color_feature_layers:
+                    color_features = layer(color_features)
+                
+                # Generate color output
+                color_output = self.color_output_layer(color_features)  # (B, 3, N)
+                color_output = color_output.transpose(1, 2)  # (B, N, 3)
+                
+                if self.output_mode == 'residual':
+                    # Apply color weight to color refinement (lighter influence)
+                    refined_colors = colors + self.color_weight * color_output
+                else:
+                    # Blend original and refined colors
+                    refined_colors = (1 - self.color_weight) * colors + self.color_weight * color_output
+            else:
+                # No color branch, preserve original colors
+                refined_colors = colors
+            
+            # Concatenate refined XYZ and colors
+            refined = torch.cat([refined_xyz, refined_colors], dim=2)  # (B, N, 6)
+        else:
+            refined = refined_xyz  # (B, N, 3)
         
         if not is_batched:
-            refined = refined.squeeze(0)  # (N, 3)
+            refined = refined.squeeze(0)  # (N, C)
         
         return refined
 
 
-def chamfer_distance_loss(
-    pred_points: torch.Tensor,
-    gt_points: torch.Tensor,
-    reduction: str = 'mean'
-) -> torch.Tensor:
-    """
-    Compute Chamfer Distance between two point clouds.
-    
-    Args:
-        pred_points: (B, M, 3) or (M, 3) predicted point cloud
-        gt_points: (B, N, 3) or (N, 3) ground truth point cloud
-        reduction: 'mean' or 'sum'
-    
-    Returns:
-        Scalar loss value
-    """
-    # Handle batched and unbatched
-    is_batched = pred_points.dim() == 3
-    if not is_batched:
-        pred_points = pred_points.unsqueeze(0)
-        gt_points = gt_points.unsqueeze(0)
-    
-    B, M, _ = pred_points.shape
-    _, N, _ = gt_points.shape
-    
-    # Compute pairwise distances: (B, M, N)
-    dists = torch.cdist(pred_points, gt_points)  # (B, M, N)
-    
-    # For each point in pred, find closest in gt
-    dist_pred_to_gt = dists.min(dim=2).values  # (B, M)
-    
-    # For each point in gt, find closest in pred
-    dist_gt_to_pred = dists.min(dim=1).values  # (B, N)
-    
-    # Chamfer distance
-    cd_loss = dist_pred_to_gt.mean(dim=1) + dist_gt_to_pred.mean(dim=1)  # (B,)
-    
-    if reduction == 'mean':
-        return cd_loss.mean()
-    else:
-        return cd_loss.sum()
-
-
-def emd_loss_approximate(
-    pred_points: torch.Tensor,
-    gt_points: torch.Tensor,
-    reduction: str = 'mean'
-) -> torch.Tensor:
-    """
-    Approximate Earth Mover's Distance using optimal transport.
-    Uses a simplified version: Hungarian matching for small sets, or Sinkhorn for larger.
-    
-    Args:
-        pred_points: (B, M, 3) or (M, 3) predicted point cloud
-        gt_points: (B, N, 3) or (N, 3) ground truth point cloud
-        reduction: 'mean' or 'sum'
-    
-    Returns:
-        Scalar loss value
-    """
-    # Handle batched and unbatched
-    is_batched = pred_points.dim() == 3
-    if not is_batched:
-        pred_points = pred_points.unsqueeze(0)
-        gt_points = gt_points.unsqueeze(0)
-    
-    B, M, _ = pred_points.shape
-    _, N, _ = gt_points.shape
-    
-    # For simplicity, use a differentiable approximation:
-    # Compute pairwise distances and use soft assignment
-    dists = torch.cdist(pred_points, gt_points)  # (B, M, N)
-    
-    # Soft assignment using softmin (temperature-scaled softmax of negative distances)
-    temperature = 0.1
-    soft_assign = F.softmin(dists / temperature, dim=2)  # (B, M, N)
-    
-    # Weighted distance
-    weighted_dists = (soft_assign * dists).sum(dim=2)  # (B, M)
-    
-    # Average over points
-    emd_loss = weighted_dists.mean(dim=1)  # (B,)
-    
-    if reduction == 'mean':
-        return emd_loss.mean()
-    else:
-        return emd_loss.sum()
-
-
-def smoothness_loss(
-    refined_points: torch.Tensor,
-    pseudo_points: torch.Tensor,
-    k_neighbors: int = 10,
-    reduction: str = 'mean'
-) -> torch.Tensor:
-    """
-    Smoothness regularization: penalize large local variations in corrections.
-    
-    Args:
-        refined_points: (B, M, 3) or (M, 3) refined points
-        pseudo_points: (B, M, 3) or (M, 3) original pseudo points
-        k_neighbors: Number of neighbors for local smoothness
-        reduction: 'mean' or 'sum'
-    
-    Returns:
-        Scalar loss value
-    """
-    # Handle batched and unbatched
-    is_batched = refined_points.dim() == 3
-    if not is_batched:
-        refined_points = refined_points.unsqueeze(0)
-        pseudo_points = pseudo_points.unsqueeze(0)
-    
-    B, M, _ = refined_points.shape
-    
-    # Compute corrections (residuals)
-    corrections = refined_points - pseudo_points  # (B, M, 3)
-    
-    # For each point, find k nearest neighbors in pseudo_points
-    # Use simplified version: compute variance of corrections
-    # More sophisticated: use k-NN graph
-    
-    # Simple smoothness: penalize large variance in corrections
-    correction_var = corrections.var(dim=1).mean(dim=1)  # (B,)
-    
-    if reduction == 'mean':
-        return correction_var.mean()
-    else:
-        return correction_var.sum()
+# Import registered losses (must be imported to register them)
+from projects.mmdet3d_plugin.models.losses import EMDLoss, SmoothnessLoss, ColorLoss
 
 @BACKBONES.register_module()
 class PointCloudRefinement(nn.Module):
@@ -271,25 +208,47 @@ class PointCloudRefinement(nn.Module):
     def __init__(
         self,
         refinement_net: Optional[Dict] = None,
-        loss_weights: Optional[Dict] = None,
+        loss_chamfer: Optional[Dict] = None,
+        loss_emd: Optional[Dict] = None,
+        loss_smoothness: Optional[Dict] = None,
+        loss_color: Optional[Dict] = None,
     ):
         """
         Args:
             refinement_net: Config dict for refinement network
-            loss_weights: Dict with keys 'chamfer', 'emd', 'feature', 'smoothness'
+            loss_chamfer: Config dict for Chamfer Distance loss
+            loss_emd: Config dict for EMD loss
+            loss_smoothness: Config dict for Smoothness loss
+            loss_color: Config dict for Color loss
         """
         super().__init__()
         
-        # # Build refinement network
-        # self.refinement_net = PointNetRefinement(
-        #     in_channels=3,
-        #     hidden_channels=refinement_net.get('hidden_channels', 64),
-        #     num_layers=refinement_net.get('num_layers', 4),
-        #     output_mode=refinement_net.get('output_mode', 'residual'),
-        # )
-        
         self.refinement_net = build_backbone(refinement_net)
-        self.loss_weights = loss_weights
+        
+        # Build loss modules using registered losses
+        # Chamfer Distance (use mmdet3d's built-in)
+        if loss_chamfer is not None:
+            self.loss_chamfer = build_loss(loss_chamfer)
+        else:
+            self.loss_chamfer = None
+        
+        # EMD Loss
+        if loss_emd is not None:
+            self.loss_emd = build_loss(loss_emd)
+        else:
+            self.loss_emd = None
+        
+        # Smoothness Loss
+        if loss_smoothness is not None:
+            self.loss_smoothness = build_loss(loss_smoothness)
+        else:
+            self.loss_smoothness = None
+        
+        # Color Loss
+        if loss_color is not None:
+            self.loss_color = build_loss(loss_color)
+        else:
+            self.loss_color = None
     
     def sample_points_fps(
         self,
@@ -418,66 +377,71 @@ class PointCloudRefinement(nn.Module):
             losses: Dict of loss values (if return_loss=True and gt_points provided)
         """
         
-        pseudo_sampled, gt_sampled = self._padding_samples(pseudo_points, gt_points)
+        # Convert to lists if needed for padding
+        if isinstance(pseudo_points, torch.Tensor):
+            pseudo_list = [pseudo_points[i] for i in range(pseudo_points.shape[0])]
+        else:
+            pseudo_list = pseudo_points
+        
+        if isinstance(gt_points, torch.Tensor):
+            gt_list = [gt_points[i] for i in range(gt_points.shape[0])]
+        else:
+            gt_list = gt_points if gt_points is not None else None
+        
+        # Pad to same size
+        if gt_list is not None:
+            pseudo_sampled, gt_sampled = self._padding_samples(pseudo_list, gt_list)
+        else:
+            # No GT, just pad pseudo points
+            if len(pseudo_list) > 0:
+                max_n = max(pc.shape[0] for pc in pseudo_list)
+                pseudo_sampled = self._pad_point_clouds(pseudo_list, max_n)
+            else:
+                pseudo_sampled = torch.empty(0, 0, 3)
+            gt_sampled = None
+        
         B, N, C = pseudo_sampled.shape
-
+        device = pseudo_sampled.device
         
         # Refine using network (batch operation)
-        refined_xyz = self.refinement_net(pseudo_sampled) # (B, N, 3)
+        # Network now handles both XYZ and XYZRGB internally
+        refined_batch = self.refinement_net(pseudo_sampled)  # (B, N, C) where C matches input
         
-        # If original had colors, preserve them
-        if C == 6:
-            # Preserve colors from original
-            if refined_xyz.shape[1] == N:
-                # Same size, just concatenate colors
-                refined_batch = torch.cat([refined_xyz, pseudo_batch[:, :, 3:]], dim=2)  # (B, N, 6)
-            else:
-                # Different size after sampling, need to handle colors differently
-                # For now, just return XYZ (could interpolate colors in future)
-                refined_batch = refined_xyz  # (B, sample_pseudo_to, 3)
-        else:
-            refined_batch = refined_xyz  # (B, N, 3) or (B, sample_pseudo_to, 3)
+        # Extract XYZ and colors for loss computation
+        refined_xyz = refined_batch[:, :, :3]  # (B, N, 3)
+        refined_colors = refined_batch[:, :, 3:6] if C == 6 else None  # (B, N, 3) or None
         
         # Compute losses if needed
         losses = None
-        if return_loss and gt_points is not None:
-            # Convert GT to batch tensor if needed
-            if isinstance(gt_points, list):
-                gt_batch = torch.stack([p.float().to(device) for p in gt_points if p is not None], dim=0)  # (B, M, 3)
-            else:
-                gt_batch = gt_points  # Already (B, M, 3)
-            
-            # Sample GT if needed
-            if self.sample_gt_to is not None:
-                gt_sampled = self.sample_points_fps(gt_batch, self.sample_gt_to, device)  # (B, sample_gt_to, 3)
-            else:
-                gt_sampled = gt_batch  # (B, M, 3)
+        if return_loss and gt_sampled is not None:
+            # Extract GT XYZ and colors
+            gt_xyz = gt_sampled[:, :, :3]  # (B, M, 3)
+            gt_colors = gt_sampled[:, :, 3:6] if gt_sampled.shape[2] >= 6 else None  # (B, M, 3) or None
             
             # Compute losses on batched data
             loss_dict = {}
             
-            # Chamfer Distance
-            if self.loss_weights.get('chamfer', 0) > 0:
-                cd_loss = chamfer_distance_loss(refined_xyz, gt_sampled)
-                loss_dict['chamfer'] = cd_loss * self.loss_weights['chamfer']
+            # Chamfer Distance (XYZ only - most important)
+            if self.loss_chamfer is not None:
+                loss_src, loss_dst = self.loss_chamfer(refined_xyz, gt_xyz)
+                cd_loss = loss_src + loss_dst
+                loss_dict['loss_chamfer'] = cd_loss
             
-            # EMD
-            if self.loss_weights.get('emd', 0) > 0:
-                emd_loss = emd_loss_approximate(refined_xyz, gt_sampled)
-                loss_dict['emd'] = emd_loss * self.loss_weights['emd']
+            # EMD (XYZ only)
+            if self.loss_emd is not None:
+                emd_loss_val = self.loss_emd(refined_xyz, gt_xyz)
+                loss_dict['loss_emd'] = emd_loss_val
             
-            # Smoothness
-            if self.loss_weights.get('smoothness', 0) > 0:
-                smooth_loss = smoothness_loss(refined_xyz, pseudo_sampled)
-                loss_dict['smoothness'] = smooth_loss * self.loss_weights['smoothness']
+            # Smoothness (XYZ only)
+            if self.loss_smoothness is not None:
+                pseudo_xyz = pseudo_sampled[:, :, :3]  # (B, N, 3)
+                smooth_loss_val = self.loss_smoothness(refined_xyz, pseudo_xyz)
+                loss_dict['loss_smoothness'] = smooth_loss_val
             
-            # Feature loss (placeholder)
-            if self.loss_weights.get('feature', 0) > 0:
-                loss_dict['feature'] = torch.tensor(0.0, device=device)
-            
-            # Total loss
-            total_loss = sum(loss_dict.values())
-            loss_dict['total'] = total_loss
+            # Color loss (if both have colors)
+            if self.loss_color is not None and refined_colors is not None and gt_colors is not None:
+                color_loss_val = self.loss_color(refined_colors, gt_colors)
+                loss_dict['loss_color'] = color_loss_val
             
             losses = loss_dict
         

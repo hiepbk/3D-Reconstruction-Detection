@@ -548,10 +548,12 @@ class ReconstructionBackbone(nn.Module):
                     multi_batch_ori_imgs=multi_batch_ori_imgs,
                     multi_batch_lidar2img=multi_batch_lidar2img,
                 )
+            # comment or uncomment for visual debugging purposes
+            # for b_idx in range(B):
+            #     print(img_metas[b_idx]['filename'])
+            #     display_point_cloud(gt_points_list[b_idx].cpu().numpy(), colors=gt_points_list[b_idx].cpu().numpy()[:, 3:], gt_bboxes_3d=None)
+            #     display_point_cloud(pseudo_points_list[b_idx].cpu().numpy(), colors=pseudo_points_list[b_idx].cpu().numpy()[:, 3:], gt_bboxes_3d=None)
                 
-                
-            display_point_cloud(pseudo_points_list[0].cpu().numpy(), colors=gt_points_list[0].cpu().numpy()[:, 3:], gt_bboxes_3d=None)
-            
             # Apply refinement in batch mode (if enabled)
             if self.refinement is not None:
                 # Refine entire batch at once
@@ -566,7 +568,7 @@ class ReconstructionBackbone(nn.Module):
                 losses = refinement_losses
             else:
                 # No refinement, convert batch tensor to list
-                batch_point_clouds = [pseudo_points_batch[i] for i in range(B)]
+                batch_point_clouds = [pseudo_points_list[i] for i in range(B)]
                 losses = None
         
         return batch_point_clouds, losses

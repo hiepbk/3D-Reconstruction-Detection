@@ -174,7 +174,7 @@ rescon_pipeline = [
 
 
 data = dict(
-    samples_per_gpu=2,
+    samples_per_gpu=3,
     workers_per_gpu=6,
     train=dict(
         type='CBGSDataset',
@@ -236,16 +236,35 @@ model = dict(
             type='PointCloudRefinement',
             refinement_net=dict(
                 type='PointNetRefinement',
+                in_channels=6,  # 3 for XYZ only, 6 for XYZRGB (auto-detects from input)
                 hidden_channels=64,
                 num_layers=4,
                 output_mode='residual',  # 'residual' outputs offsets, 'direct' outputs refined points
-                # output_mode='direct',  # 'residual' outputs offsets, 'direct' outputs refined points
+                color_weight=0.1,  # Weight for color refinement (lower = less influence on colors)
             ),
-            loss_weights=dict(
-                chamfer=1.0,  # Chamfer Distance weight
-                emd=0.1,  # Earth Mover's Distance weight
-                feature=0.0,  # Feature-space consistency loss (not implemented yet)
-                smoothness=0.01,  # Smoothness regularization weight
+            loss_chamfer=dict(
+                type='ChamferDistance',
+                mode='l2',
+                reduction='mean',
+                loss_src_weight=1.0,
+                loss_dst_weight=1.0,
+            ),
+            loss_emd=dict(
+                type='EMDLoss',
+                temperature=0.1,
+                reduction='mean',
+                loss_weight=0.1,  # Earth Mover's Distance weight (XYZ position)
+            ),
+            loss_smoothness=dict(
+                type='SmoothnessLoss',
+                reduction='mean',
+                loss_weight=0.01,  # Smoothness regularization weight (XYZ position)
+            ),
+            loss_color=dict(
+                type='ColorLoss',
+                mode='l1',
+                reduction='mean',
+                loss_weight=0.1,  # Color loss weight (lower than position losses)
             ),
         ),
         # refinement=None

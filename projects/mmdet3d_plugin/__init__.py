@@ -15,6 +15,9 @@ from .datasets.pipelines import (
     FPSDownsample,
 )
 
+# Import losses to register EMDLoss, SmoothnessLoss, ColorLoss
+from .models.losses import EMDLoss, SmoothnessLoss, ColorLoss
+
 __all__ = [
     'ResDet3D',
     'ReconstructionBackbone',
@@ -22,5 +25,8 @@ __all__ = [
     'VoxelDownsample',
     'BallQueryDownsample',
     'FPSDownsample',
+    'EMDLoss',
+    'SmoothnessLoss',
+    'ColorLoss',
 ]
 
