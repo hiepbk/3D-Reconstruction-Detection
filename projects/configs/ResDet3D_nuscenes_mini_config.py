@@ -256,13 +256,21 @@ model = dict(
                 encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
                 block_type='basicblock',
             ),
-            # Feature loss: compares sparse features between pseudo and GT
-            loss_feature=dict(
-                type='SimpleL2Loss',
+            bev_height_occupancy=dict(
+                type='BEVHeightOccupancy',
+                in_channels=256,  # out channels have to equal to input channels
+                Unet_channels=[128, 256, 512],
+                sparse_shape=[255, 180, 180], # [Z, Y, X] the feature map shape of the occupancy map
+                voxel_encoder=dict(
+                    type='HardVoxelOccupancyVFE',
+                ),
+            ),
+            loss_occupancy=dict(
+                type='OccupancyLoss',
                 reduction='mean',
                 loss_weight=1.0,
             ),
-            loss_weight=1.0,  # Weight for feature loss
+            loss_weight=1.0,  # Weight for occupancy loss
         ),
         # refinement=None
     ),

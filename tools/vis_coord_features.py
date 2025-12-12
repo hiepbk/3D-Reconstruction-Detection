@@ -5,8 +5,11 @@ import pickle
 import numpy as np
 import open3d as o3d
 
+import matplotlib.pyplot as plt
 
-CROP_SIZE = [500, 500, 20]  # [X,Y,Z] voxels (centered crop); set None to disable
+
+# CROP_SIZE = [500, 500, 20]  # [X,Y,Z] voxels (centered crop); set None to disable
+CROP_SIZE = None
 
 
 def _make_voxel_lines(voxel_indices: np.ndarray, voxel_size: np.ndarray, pcr: np.ndarray, color: tuple):
@@ -73,8 +76,10 @@ def visualize_file(path: str):
 
     pseudo_coors = data.get("pseudo_coors")
     gt_coors = data.get("gt_coors")
-    pseudo_feats = data.get("pseudo_features")
-    gt_feats = data.get("gt_features")
+    pseudo_voxel_feats = data.get("pseudo_voxel_features")  # Per-voxel features from VFE (N, C)
+    gt_voxel_feats = data.get("gt_voxel_features")  # Per-voxel features from VFE (N, C)
+    pseudo_occupancy_map = data.get("pseudo_occupancy_map")  # (B, C, H, W) occupancy probability maps
+    gt_occupancy_map = data.get("gt_occupancy_map")  # (B, C, H, W) occupancy probability maps
     voxel_size = np.asarray(data.get("voxel_size"), dtype=np.float32)
     pcr = np.asarray(data.get("point_cloud_range"), dtype=np.float32)
 
@@ -89,12 +94,15 @@ def visualize_file(path: str):
 
     pseudo_coors = to_np(pseudo_coors)
     gt_coors = to_np(gt_coors)
-    pseudo_feats = to_np(pseudo_feats)
-    gt_feats = to_np(gt_feats)
+    pseudo_voxel_feats = to_np(pseudo_voxel_feats)
+    gt_voxel_feats = to_np(gt_voxel_feats)
+    pseudo_occupancy_map = to_np(pseudo_occupancy_map)
+    gt_occupancy_map = to_np(gt_occupancy_map)
 
-    def crop_coors(coors: np.ndarray):
+    def crop_coors_and_feats(coors: np.ndarray, feats: np.ndarray):
+        """Crop coors and corresponding voxel_features using the same mask."""
         if coors is None or CROP_SIZE is None:
-            return coors
+            return coors, feats
         gx = (pcr[3] - pcr[0]) / voxel_size[0]
         gy = (pcr[4] - pcr[1]) / voxel_size[1]
         gz = (pcr[5] - pcr[2]) / voxel_size[2]
@@ -109,108 +117,201 @@ def visualize_file(path: str):
             (coors[:, 2] >= cy - vy_half) & (coors[:, 2] <= cy + vy_half) &
             (coors[:, 1] >= cz - vz_half) & (coors[:, 1] <= cz + vz_half)
         )
-        return coors[mask]
+        coors_cropped = coors[mask]
+        # Only crop feats if they exist and match the coors length
+        if feats is not None and len(feats.shape) >= 1 and feats.shape[0] == coors.shape[0]:
+            feats_cropped = feats[mask]
+        else:
+            feats_cropped = feats
+        return coors_cropped, feats_cropped
 
     if pseudo_coors is not None:
-        pseudo_coors = crop_coors(pseudo_coors)
+        pseudo_coors, pseudo_voxel_feats = crop_coors_and_feats(pseudo_coors, pseudo_voxel_feats)
     if gt_coors is not None:
-        gt_coors = crop_coors(gt_coors)
-
-    def gather_feats(coors: np.ndarray, feats):
-        if coors is None or feats is None:
-            return None
-        feats_np = np.asarray(feats)
-        ndim = feats_np.ndim
-        # derive downsample ratios so we can map voxel indices to feature map
-        if coors is not None and coors.size > 0:
-            max_x = coors[:, 3].max()
-            max_y = coors[:, 2].max()
-            max_z = coors[:, 1].max()
-        else:
-            max_x = max_y = max_z = 0
-        out = []
-        for idx in coors:
-            b, z, y, x = idx.astype(int)
-            if b >= feats_np.shape[0]:
-                continue
-            if ndim == 5:
-                # Expect (B, C, Z, Y, X), map voxel indices to feature grid
-                ratio_x = max(1, int(np.ceil((max_x + 1) / feats_np.shape[4])))
-                ratio_y = max(1, int(np.ceil((max_y + 1) / feats_np.shape[3])))
-                ratio_z = max(1, int(np.ceil((max_z + 1) / feats_np.shape[2])))
-                fx = min(feats_np.shape[4] - 1, x // ratio_x)
-                fy = min(feats_np.shape[3] - 1, y // ratio_y)
-                fz = min(feats_np.shape[2] - 1, z // ratio_z)
-                out.append(feats_np[b, :, fz, fy, fx])
-            elif ndim == 4:
-                # Expect (B, C, H, W) BEV; ignore z, use y,x with downsample ratio
-                ratio_x = max(1, int(np.ceil((max_x + 1) / feats_np.shape[3])))
-                ratio_y = max(1, int(np.ceil((max_y + 1) / feats_np.shape[2])))
-                fx = min(feats_np.shape[3] - 1, x // ratio_x)
-                fy = min(feats_np.shape[2] - 1, y // ratio_y)
-                out.append(feats_np[b, :, fy, fx])
-            else:
-                # Unsupported shape
-                continue
-        if not out:
-            return None
-        return np.stack(out, axis=0)
-
-    pseudo_feat_vecs = gather_feats(pseudo_coors, pseudo_feats)
-    gt_feat_vecs = gather_feats(gt_coors, gt_feats)
+        gt_coors, gt_voxel_feats = crop_coors_and_feats(gt_coors, gt_voxel_feats)
 
     print(f"[INFO] {path}")
     print(f"  pseudo_coors: {None if pseudo_coors is None else pseudo_coors.shape}")
-    print(f"  pseudo_feats: {None if pseudo_feats is None else pseudo_feats.shape}")
-    print(f"  gathered pseudo_feat_vecs: {None if pseudo_feat_vecs is None else pseudo_feat_vecs.shape}")
+    print(f"  pseudo_voxel_feats: {None if pseudo_voxel_feats is None else pseudo_voxel_feats.shape}")
+    print(f"  pseudo_occupancy_map: {None if pseudo_occupancy_map is None else pseudo_occupancy_map.shape}")
     print(f"  gt_coors: {None if gt_coors is None else gt_coors.shape}")
-    print(f"  gt_feats: {None if gt_feats is None else gt_feats.shape}")
-    print(f"  gathered gt_feat_vecs: {None if gt_feat_vecs is None else gt_feat_vecs.shape}")
-
-    # Print a few coordinate/feature pairs for inspection
-    def print_samples(name, coors, feats):
-        if coors is None or feats is None:
-            return
-        n = min(5, coors.shape[0], feats.shape[0])
-        print(f"{name}: coors {coors.shape}, feats {feats.shape}")
-        print(f"{name} sample pairs (coord -> first 5 dims of feature):")
-        for i in range(n):
-            print(f"  {coors[i].tolist()} -> {feats[i][:5].tolist()}")
-        norms = np.linalg.norm(feats, axis=1)
-        print(f"{name} feat norm stats: min={norms.min():.4f}, max={norms.max():.4f}, mean={norms.mean():.4f}")
-        import sys
-        sys.stdout.flush()
-
-    print_samples("Pseudo", pseudo_coors, pseudo_feat_vecs)
-    print_samples("GT", gt_coors, gt_feat_vecs)
+    print(f"  gt_voxel_feats: {None if gt_voxel_feats is None else gt_voxel_feats.shape}")
+    print(f"  gt_occupancy_map: {None if gt_occupancy_map is None else gt_occupancy_map.shape}")
     import sys
     sys.stdout.flush()
+    
+    # Visualize occupancy maps and their difference
+    # The shape of occupancy maps is (B, C, H, W) where C is the number of channels (e.g., 256)
+    def display_occupancy_difference(pseudo_occ, gt_occ):
+        if pseudo_occ is None or gt_occ is None:
+            print("  Occupancy maps not available for visualization")
+            return
+        
+        for b in range(pseudo_occ.shape[0]):
+            differences = np.abs(pseudo_occ[b] - gt_occ[b])
+            num_channels = pseudo_occ.shape[1]
+            
+            # Display a few representative channels (e.g., first, middle, last)
+            channels_to_show = [0, num_channels // 4, num_channels // 2, 3 * num_channels // 4, num_channels - 1]
+            channels_to_show = [c for c in channels_to_show if c < num_channels]
+            
+            for i in channels_to_show:
+                plt.figure(figsize=(15, 5))
+                plt.subplot(1, 3, 1)
+                plt.imshow(pseudo_occ[b, i], cmap='hot', vmin=0, vmax=1)
+                plt.colorbar()
+                plt.title(f"Pseudo Occupancy Channel {i}")
+                plt.subplot(1, 3, 2)
+                plt.imshow(gt_occ[b, i], cmap='hot', vmin=0, vmax=1)
+                plt.colorbar()
+                plt.title(f"GT Occupancy Channel {i}")
+                plt.subplot(1, 3, 3)
+                plt.imshow(differences[i], cmap='hot')
+                plt.colorbar()
+                plt.title(f"Difference Channel {i}")
+                plt.tight_layout()
+                plt.show()
+            
+            # Also show mean across all channels
+            pseudo_mean = pseudo_occ[b].mean(axis=0)
+            gt_mean = gt_occ[b].mean(axis=0)
+            diff_mean = np.abs(pseudo_mean - gt_mean)
+            
+            plt.figure(figsize=(15, 5))
+            plt.subplot(1, 3, 1)
+            plt.imshow(pseudo_mean, cmap='hot', vmin=0, vmax=1)
+            plt.colorbar()
+            plt.title("Pseudo Occupancy (Mean across channels)")
+            plt.subplot(1, 3, 2)
+            plt.imshow(gt_mean, cmap='hot', vmin=0, vmax=1)
+            plt.colorbar()
+            plt.title("GT Occupancy (Mean across channels)")
+            plt.subplot(1, 3, 3)
+            plt.imshow(diff_mean, cmap='hot')
+            plt.colorbar()
+            plt.title("Difference (Mean across channels)")
+            plt.tight_layout()
+            plt.show()
 
+    # Display occupancy maps and their difference
+    # display_occupancy_difference(pseudo_occupancy_map, gt_occupancy_map)
+    
+    def occupancy_map_to_voxels(occupancy_map, pcr, voxel_size, occupancy_threshold=0.5):
+        """Convert occupancy map (B, C, H, W) to voxel coordinates in original grid.
+        
+        Args:
+            occupancy_map: (B, C, H, W) occupancy probability maps, where H=W=180
+            pcr: Point cloud range [x_min, y_min, z_min, x_max, y_max, z_max]
+            voxel_size: [vx, vy, vz] voxel sizes
+            occupancy_threshold: Threshold for considering a voxel as occupied
+            num_z_levels: Number of Z levels in original grid (41)
+        
+        Returns:
+            voxel_coors: (N, 4) voxel coordinates [batch, z, y, x] in original grid
+        """
+        if occupancy_map is None:
+            return None
+        
+        occ_np = np.asarray(occupancy_map)
+        if occ_np.ndim != 4:
+            return None
+        
+        B, C, H, W = occ_np.shape  # H=W=180, C=256 (channels)
+        
+        # Calculate original grid size from point cloud range and voxel size
+        grid_size_x = int((pcr[3] - pcr[0]) / voxel_size[0])  # e.g., 1440
+        grid_size_y = int((pcr[4] - pcr[1]) / voxel_size[1])  # e.g., 1440
+        grid_size_z = int((pcr[5] - pcr[2]) / voxel_size[2])
+        
+        # Calculate mapping from BEV map (H, W) to original grid (grid_size_y, grid_size_x)
+        # Each cell in BEV map corresponds to multiple cells in original grid
+        scale_x = grid_size_x / W  # e.g., 1440 / 180 = 8
+        scale_y = grid_size_y / H  # e.g., 1440 / 180 = 8
+        scale_z = grid_size_z / C
+        
+        voxel_coors = []
+        
+        for b in range(B):
+            for bev_y in range(H):
+                for bev_x in range(W):
+                    # Get occupancy for all channels at this (bev_y, bev_x) location
+                    z_occ_at_loc = occ_np[b, :, bev_y, bev_x]  # (C,)
+                    
+                    # Find channels with occupancy above threshold
+                    z_occupied_channels = np.where(z_occ_at_loc > occupancy_threshold)[0]
+                    
+                    # This layer of height does not have any occupied voxels
+                    if len(z_occupied_channels) == 0:
+                        continue
+                    
+                    # For each occupied channel, map to Z level and create ONE voxel at the center of the 8x8 region
+                    for ch in z_occupied_channels:
+                        z_level = ch / C * grid_size_z
+                        
+                        # Map BEV position to original grid
+                        # Each 180x180 cell corresponds to 8x8 region in 1440x1440
+                        # Center of 8x8 region is at offset (4, 4) within that block
+                        x_start = int(bev_x * scale_x)  # Start of 8x8 block
+                        y_start = int(bev_y * scale_y)  # Start of 8x8 block
+                        x_center = x_start + int(scale_x / 2)  # Center = start + 4 (since scale_x = 8)
+                        y_center = y_start + int(scale_y / 2)  # Center = start + 4 (since scale_y = 8)
+                        
+                        # Clamp to grid boundaries
+                        x_center = min(grid_size_x - 1, max(0, x_center))
+                        y_center = min(grid_size_y - 1, max(0, y_center))
+                        
+                        # Create ONE voxel at the center of the 8x8 region at this Z level
+                        voxel_coors.append([b, z_level, y_center, x_center])
+        
+        if len(voxel_coors) == 0:
+            return None
+        
+        return np.array(voxel_coors, dtype=np.int32)
+    
+    # Calculate grid size for info
+    if gt_occupancy_map is not None:
+        occ_np = np.asarray(gt_occupancy_map)
+        if occ_np.ndim == 4:
+            B, C, H, W = occ_np.shape
+            grid_size_x = int((pcr[3] - pcr[0]) / voxel_size[0])
+            grid_size_y = int((pcr[4] - pcr[1]) / voxel_size[1])
+            grid_size_z = int((pcr[5] - pcr[2]) / voxel_size[2])
+            scale_x = grid_size_x / W
+            scale_y = grid_size_y / H
+            scale_z = grid_size_z / C
+            print(f"  Occupancy map shape: (B={B}, C={C}, H={H}, W={W})")
+            print(f"  Original grid size: ({grid_size_x}, {grid_size_y}, {grid_size_z})")
+            print(f"  Scale factor: ({scale_x:.2f}, {scale_y:.2f}, {scale_z:.2f}) - each BEV cell = {scale_x:.0f}x{scale_y:.0f}x{scale_z:.0f} grid cells")
+            import sys
+            sys.stdout.flush()
+    
+    # Convert occupancy maps to voxel coordinates
+    gt_occ_voxels = occupancy_map_to_voxels(gt_occupancy_map, pcr, voxel_size, occupancy_threshold=0.5)
+    # pseudo_occ_voxels = occupancy_map_to_voxels(pseudo_occupancy_map, pcr, voxel_size, occupancy_threshold=0.5, num_z_levels=41)
+    
+    print(f"  GT occupancy voxels: {None if gt_occ_voxels is None else gt_occ_voxels.shape}")
+    # print(f"  Pseudo occupancy voxels: {None if pseudo_occ_voxels is None else pseudo_occ_voxels.shape}")
+    import sys
+    sys.stdout.flush()
+    
+    # Create voxel wireframes from occupancy maps
+    gt_occ_lines = gt_occ_colors = None
+    pseudo_occ_lines = pseudo_occ_colors = None
+    
+    if gt_occ_voxels is not None:
+        gt_occ_voxel_size = np.array([scale_x*voxel_size[0], scale_y*voxel_size[1], scale_z])
+        gt_occ_lines, gt_occ_colors = _make_voxel_lines(gt_occ_voxels, gt_occ_voxel_size, pcr, (0, 1, 0))  # Green for GT
+    # if pseudo_occ_voxels is not None:
+    #     pseudo_occ_lines, pseudo_occ_colors = _make_voxel_lines(pseudo_occ_voxels, voxel_size, pcr, (1, 0, 0))  # Red for pseudo
+    
+    # # Original voxel wireframes from coordinates (if available)
     pseudo_lines = pseudo_colors = None
     gt_lines = gt_colors = None
-    if pseudo_coors is not None:
-        pseudo_lines, pseudo_colors = _make_voxel_lines(pseudo_coors, voxel_size, pcr, (1, 0, 0))
+    # if pseudo_coors is not None:
+    #     pseudo_lines, pseudo_colors = _make_voxel_lines(pseudo_coors, voxel_size, pcr, (1, 0.5, 0))  # Orange for original pseudo
     if gt_coors is not None:
-        gt_lines, gt_colors = _make_voxel_lines(gt_coors, voxel_size, pcr, (0, 1, 0))
+        gt_lines, gt_colors = _make_voxel_lines(gt_coors, voxel_size, pcr, (0, 0.5, 1))  # Blue for original GT
 
-    def make_feat_pcd(coors, feats, base_color):
-        if coors is None or feats is None:
-            return None
-        # map feature norm to intensity
-        centers = np.zeros((coors.shape[0], 3), dtype=np.float32)
-        centers[:, 0] = pcr[0] + (coors[:, 3] + 0.5) * voxel_size[0]
-        centers[:, 1] = pcr[1] + (coors[:, 2] + 0.5) * voxel_size[1]
-        centers[:, 2] = pcr[2] + (coors[:, 1] + 0.5) * voxel_size[2]
-        # Same color as voxel wireframe (uniform)
-        colors = np.tile(np.asarray(base_color, dtype=np.float32), (centers.shape[0], 1))
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(centers)
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-        return pcd
-
-    # Build feature point clouds (norm-coded)
-    pcd_pseudo = make_feat_pcd(pseudo_coors, pseudo_feat_vecs, (1, 0, 0))
-    pcd_gt = make_feat_pcd(gt_coors, gt_feat_vecs, (0, 1, 0))
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(window_name=os.path.basename(path), width=1280, height=720, visible=True)
@@ -227,28 +328,42 @@ def visualize_file(path: str):
     vis.add_geometry(axis)
     vis.add_geometry(ls_bbox)
 
-    if pseudo_lines is not None:
-        ls_p = o3d.geometry.LineSet()
-        pts = pseudo_lines.reshape(-1, 3)
-        lines_idx = np.arange(len(pts), dtype=np.int32).reshape(-1, 2)
-        ls_p.points = o3d.utility.Vector3dVector(pts)
-        ls_p.lines = o3d.utility.Vector2iVector(lines_idx)
-        ls_p.colors = o3d.utility.Vector3dVector(np.tile(pseudo_colors[0:1], (lines_idx.shape[0], 1)))
-        vis.add_geometry(ls_p)
+    # if pseudo_lines is not None:
+    #     ls_p = o3d.geometry.LineSet()
+    #     pts = pseudo_lines.reshape(-1, 3)
+    #     lines_idx = np.arange(len(pts), dtype=np.int32).reshape(-1, 2)
+    #     ls_p.points = o3d.utility.Vector3dVector(pts)
+    #     ls_p.lines = o3d.utility.Vector2iVector(lines_idx)
+    #     ls_p.colors = o3d.utility.Vector3dVector(np.tile(pseudo_colors[0:1], (lines_idx.shape[0], 1)))
+    #     vis.add_geometry(ls_p)
 
-    if gt_lines is not None:
-        ls_g = o3d.geometry.LineSet()
-        pts = gt_lines.reshape(-1, 3)
+    # if gt_lines is not None:
+    #     ls_g = o3d.geometry.LineSet()
+    #     pts = gt_lines.reshape(-1, 3)
+    #     lines_idx = np.arange(len(pts), dtype=np.int32).reshape(-1, 2)
+    #     ls_g.points = o3d.utility.Vector3dVector(pts)
+    #     ls_g.lines = o3d.utility.Vector2iVector(lines_idx)
+    #     ls_g.colors = o3d.utility.Vector3dVector(np.tile(gt_colors[0:1], (lines_idx.shape[0], 1)))
+    #     vis.add_geometry(ls_g)
+    
+    # Add occupancy-based voxels
+    if gt_occ_lines is not None:
+        ls_gt_occ = o3d.geometry.LineSet()
+        pts = gt_occ_lines.reshape(-1, 3)
         lines_idx = np.arange(len(pts), dtype=np.int32).reshape(-1, 2)
-        ls_g.points = o3d.utility.Vector3dVector(pts)
-        ls_g.lines = o3d.utility.Vector2iVector(lines_idx)
-        ls_g.colors = o3d.utility.Vector3dVector(np.tile(gt_colors[0:1], (lines_idx.shape[0], 1)))
-        vis.add_geometry(ls_g)
-
-    if pcd_pseudo is not None:
-        vis.add_geometry(pcd_pseudo)
-    if pcd_gt is not None:
-        vis.add_geometry(pcd_gt)
+        ls_gt_occ.points = o3d.utility.Vector3dVector(pts)
+        ls_gt_occ.lines = o3d.utility.Vector2iVector(lines_idx)
+        ls_gt_occ.colors = o3d.utility.Vector3dVector(np.tile(gt_occ_colors[0:1], (lines_idx.shape[0], 1)))
+        vis.add_geometry(ls_gt_occ)
+    
+    # if pseudo_occ_lines is not None:
+    #     ls_pseudo_occ = o3d.geometry.LineSet()
+    #     pts = pseudo_occ_lines.reshape(-1, 3)
+    #     lines_idx = np.arange(len(pts), dtype=np.int32).reshape(-1, 2)
+    #     ls_pseudo_occ.points = o3d.utility.Vector3dVector(pts)
+    #     ls_pseudo_occ.lines = o3d.utility.Vector2iVector(lines_idx)
+    #     ls_pseudo_occ.colors = o3d.utility.Vector3dVector(np.tile(pseudo_occ_colors[0:1], (lines_idx.shape[0], 1)))
+    #     vis.add_geometry(ls_pseudo_occ)
 
     vis.run()
     vis.destroy_window()

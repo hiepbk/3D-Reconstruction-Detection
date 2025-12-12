@@ -10,6 +10,8 @@ from ..builder import VOXEL_ENCODERS
 from .utils import VFELayer, get_paddings_indicator
 
 
+
+
 @VOXEL_ENCODERS.register_module()
 class HardSimpleVFE(nn.Module):
     """Simple voxel feature encoder used in SECOND.

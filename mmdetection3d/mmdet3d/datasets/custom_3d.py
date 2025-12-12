@@ -356,7 +356,7 @@ class Custom3DDataset(Dataset):
         while True:
             # Hiep add for first sample dataset
             
-            # idx = 0
+            idx = 0
             
             data = self.prepare_train_data(idx)
             if data is None:
