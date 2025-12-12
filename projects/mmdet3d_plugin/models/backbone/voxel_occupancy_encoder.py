@@ -39,74 +39,59 @@ class HardVoxelOccupancyVFE(nn.Module):
     
 @VOXEL_ENCODERS.register_module()
 class SoftVoxelOccupancyVFE(nn.Module):
-    """Soft voxel occupancy encoder.
+    """
+    Deterministic soft voxel occupancy encoder.
+    Uses:
+        - number of points (n)
+        - spatial variance of xyz (mean variance)
+    to compute occupancy probability in [0, 1].
 
-    Produces voxel occupancy probability in [0, 1] by combining:
-     - number of points inside voxel
-     - spatial distribution of points (xyz mean/variance)
-     - learnable voting MLP
+    Formula:
+        p_occ = 1 - exp( -λ*n - γ*var )
     """
 
-    def __init__(self, max_points_norm=10):
-        super(SoftVoxelOccupancyVFE, self).__init__()
+    def __init__(self, lambda_n=0.3, gamma_var=5.0, eps=1e-6):
+        super().__init__()
+        self.lambda_n = lambda_n
+        self.gamma_var = gamma_var
+        self.eps = eps
         self.fp16_enabled = False
-        self.max_points_norm = max_points_norm
-
-        # MLP voting head: input 1 (density) + 1 (variance) + 3 (mean xyz) = 5 features
-        self.mlp = nn.Sequential(
-            nn.Linear(5, 16),
-            nn.ReLU(inplace=True),
-            nn.Linear(16, 1)
-        )
 
     @force_fp32(out_fp16=True)
     def forward(self, features, num_points, coors):
         """
         Args:
-            features: (N, M, C) , typically xyz or xyz+other
-            num_points: (N,)
-            coors: (N, 3 or 4)
+            features: (N, M, C) padded points, first 3 dims must be xyz
+            num_points: (N,) number of valid points in each voxel
+            coors: unused
 
         Returns:
-            (N,1) soft occupancy probability
+            occupancy: (N, 1) soft occupancy probability
         """
 
         N, M, C = features.shape
 
-        # ---------------------
-        # 1. Density-based probability
-        # ---------------------
-        # clamp to avoid extreme density
-        clamped_pts = torch.clamp(num_points, max=self.max_points_norm)
-        p_density = (clamped_pts / float(self.max_points_norm)).float()
-        p_density = p_density.view(N, 1)
+        # ----- Extract xyz -----
+        xyz = features[:, :, :3]
 
-        # ---------------------
-        # 2. Feature-based probability (xyz distribution)
-        # ---------------------
-        xyz = features[:, :, :3]                           # (N, M, 3)
-        mask = (torch.arange(M, device=features.device).unsqueeze(0) < num_points.unsqueeze(1)).float()
-        mask = mask.unsqueeze(-1)                          # (N, M, 1)
+        # ----- Build mask for padded points -----
+        mask = (torch.arange(M, device=xyz.device)
+                .unsqueeze(0) < num_points.unsqueeze(1))  # (N, M)
 
-        # mean xyz
-        masked_xyz = xyz * mask
-        sum_xyz = masked_xyz.sum(dim=1)                   # (N, 3)
-        mean_xyz = sum_xyz / torch.clamp(num_points.view(N, 1).float(), min=1)
+        mask_exp = mask.unsqueeze(-1).float()            # (N, M, 1)
 
-        # variance xyz
-        diff = (xyz - mean_xyz.unsqueeze(1)) * mask
-        var_xyz = (diff ** 2).sum(dim=1) / torch.clamp(num_points.view(N, 1).float(), min=1)
-        var_xyz_mean = var_xyz.mean(dim=1, keepdim=True)  # (N,1)
+        # ----- Compute masked mean -----
+        xyz_sum = (xyz * mask_exp).sum(dim=1)            # (N, 3)
+        denom = num_points.unsqueeze(1).float() + self.eps
+        xyz_mean = xyz_sum / denom                       # (N, 3)
 
-        # convert variance to probability
-        # high variance → lower confidence
-        p_var = torch.exp(-0.5 * var_xyz_mean)
+        # ----- Compute variance -----
+        diff = (xyz - xyz_mean.unsqueeze(1)) * mask_exp  # (N, M, 3)
+        var = (diff.pow(2).sum(dim=1) / denom).mean(dim=1)   # (N,)
 
-        # ---------------------
-        # 3. Voting MLP
-        # ---------------------
-        mlp_input = torch.cat([p_density, p_var, mean_xyz], dim=1)
-        logits = self.mlp(mlp_input)                      # (N,1)
-        occupancy = torch.sigmoid(logits)                 # convert to probability
+        # ----- Combined deterministic occupancy -----
+        # p = 1 - exp(-λ*n - γ*var)
+        n = num_points.float()
+        occupancy = 1.0 - torch.exp(-self.lambda_n * n - self.gamma_var * var)
 
-        return occupancy.contiguous()
+        return occupancy.view(-1, 1).contiguous()
