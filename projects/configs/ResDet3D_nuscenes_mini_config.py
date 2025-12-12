@@ -263,13 +263,12 @@ model = dict(
                 ),
 
             occupancy_voxel_encoder=dict(
-                # type='HardVoxelOccupancyVFE',
                 type='SoftVoxelOccupancyVFE',
                 lambda_n=0.3,
                 gamma_var=5.0,
                 eps=1e-6,
-                sparse_shape=[255, 180, 180], # [Z, Y, X] the feature map shape of the occupancy map
-                ),
+                occ_sparse_shape=[255, 180, 180], # [Z, Y, X] the feature map shape of the occupancy map
+            ),
             loss_occupancy=dict(
                 type='OccupancyLoss',
                 reduction='mean',

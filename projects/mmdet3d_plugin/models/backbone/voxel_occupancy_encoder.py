@@ -20,7 +20,7 @@ class HardVoxelOccupancyVFE(nn.Module):
         self.fp16_enabled = False
 
     @force_fp32(out_fp16=True)
-    def forward(self, features, num_points, coors):
+    def forward(self, features, num_points, coors, occ_sparse_shape):
         """
         Args:
             features: (N, M, C) point features (unused)
@@ -33,6 +33,9 @@ class HardVoxelOccupancyVFE(nn.Module):
 
         # occupancy = 1 if voxel has any points, else 0
         occupancy = (num_points > 0).float().view(-1, 1)
+        
+        # then, convert to the feature map with shape of occ_sparse_shape [Z, Y, X]
+        occupancy = occupancy.view(-1, 1, occ_sparse_shape[0], occ_sparse_shape[1], occ_sparse_shape[2])
 
         return occupancy.contiguous()
     
@@ -50,12 +53,13 @@ class SoftVoxelOccupancyVFE(nn.Module):
         p_occ = 1 - exp( -λ*n - γ*var )
     """
 
-    def __init__(self, lambda_n=0.3, gamma_var=5.0, eps=1e-6):
+    def __init__(self, lambda_n=0.3, gamma_var=5.0, eps=1e-6, occ_sparse_shape=None):
         super().__init__()
         self.lambda_n = lambda_n
         self.gamma_var = gamma_var
         self.eps = eps
         self.fp16_enabled = False
+        self.occ_sparse_shape = occ_sparse_shape
 
     @force_fp32(out_fp16=True)
     def forward(self, features, num_points, coors):
@@ -93,5 +97,8 @@ class SoftVoxelOccupancyVFE(nn.Module):
         # p = 1 - exp(-λ*n - γ*var)
         n = num_points.float()
         occupancy = 1.0 - torch.exp(-self.lambda_n * n - self.gamma_var * var)
+        
+        # then, convert to the feature map with shape of occ_sparse_shape [Z, Y, X]
+        occupancy = occupancy.view(-1, 1, self.occ_sparse_shape[0], self.occ_sparse_shape[1], self.occ_sparse_shape[2])
 
         return occupancy.view(-1, 1).contiguous()

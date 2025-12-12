@@ -189,9 +189,18 @@ class SparseRefinement(nn.Module):
         
         
         
+        # Build occupancy voxelization params (for GT occupancy generation)
         point_cloud_range = pts_voxel_layer.get('point_cloud_range', None)
-        occ_sparse_shape = bev_height_occupancy.get('sparse_shape', None)
-        occ_voxel_size = (point_cloud_range[3:] - point_cloud_range[:3]) / occ_sparse_shape
+        occ_sparse_shape = occupancy_voxel_encoder.get('occ_sparse_shape', None)
+        if point_cloud_range is None or occ_sparse_shape is None:
+            raise ValueError("point_cloud_range and sparse_shape must be provided for occupancy voxelization")
+
+        # Convert to tensors for arithmetic, then back to list for Voxelization
+        pcr_tensor = torch.tensor(point_cloud_range, dtype=torch.float32)
+        occ_shape_tensor = torch.tensor(occ_sparse_shape, dtype=torch.float32)
+        occ_voxel_size = (pcr_tensor[3:] - pcr_tensor[:3]) / occ_shape_tensor  # (3,)
+        occ_voxel_size = occ_voxel_size.tolist()
+
         max_num_points = pts_voxel_layer.get('max_num_points', None)
         max_voxels = pts_voxel_layer.get('max_voxels', None)
         
