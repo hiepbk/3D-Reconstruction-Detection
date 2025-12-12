@@ -260,11 +260,16 @@ model = dict(
                 type='BEVHeightOccupancy',
                 in_channels=256,  # out channels have to equal to input channels
                 Unet_channels=[128, 256, 512],
-                sparse_shape=[255, 180, 180], # [Z, Y, X] the feature map shape of the occupancy map
-                voxel_encoder=dict(
-                    type='HardVoxelOccupancyVFE',
                 ),
-            ),
+
+            occupancy_voxel_encoder=dict(
+                # type='HardVoxelOccupancyVFE',
+                type='SoftVoxelOccupancyVFE',
+                lambda_n=0.3,
+                gamma_var=5.0,
+                eps=1e-6,
+                sparse_shape=[255, 180, 180], # [Z, Y, X] the feature map shape of the occupancy map
+                ),
             loss_occupancy=dict(
                 type='OccupancyLoss',
                 reduction='mean',

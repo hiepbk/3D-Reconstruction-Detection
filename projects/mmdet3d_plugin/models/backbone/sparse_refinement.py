@@ -145,6 +145,7 @@ class SparseRefinement(nn.Module):
         pts_voxel_encoder: Dict,
         pts_middle_encoder: Dict,
         bev_height_occupancy: Dict,
+        occupancy_voxel_encoder: Dict,
         loss_occupancy: Dict,
         loss_weight: float = 1.0,
         use_color: bool = False,
@@ -197,7 +198,7 @@ class SparseRefinement(nn.Module):
         
         # build the voxelization layer for the occupancy ground truth
         self.gt_occupancty_layer = Voxelization(occ_voxel_size, point_cloud_range, max_num_points, max_voxels)
-        self.gt_occupancty_voxel_encoder = builder.build_voxel_encoder(bev_height_occupancy.get('voxel_encoder', None))
+        self.gt_occupancty_voxel_encoder = builder.build_voxel_encoder(occupancy_voxel_encoder)
         # Build occupancy loss from config
         self.loss_occupancy = build_loss(loss_occupancy)
         
