@@ -306,7 +306,9 @@ def main():
         datasets,
         cfg,
         distributed=distributed,
-        validate=(not args.no_validate),
+        # validate=(not args.no_validate),
+        validate=False, #temporary disable validation
+        
         timestamp=timestamp,
         meta=meta)
 

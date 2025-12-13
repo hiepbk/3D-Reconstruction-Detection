@@ -4,15 +4,17 @@ import os
 import pickle
 import numpy as np
 import open3d as o3d
+from sympy import false
 
 # CROP_SIZE = [500, 500, 20]  # [X,Y,Z] voxels (centered crop); set None to disable
 CROP_SIZE = None
 
 # Channel to visualize (None = all channels, otherwise specific channel index)
-OCCUPANCY_CHANNEL = 16
+OCCUPANCY_CHANNEL = None
 
 # Occupancy threshold: minimum probability to visualize a voxel (0.0-1.0)
-OCCUPANCY_THRESHOLD = 0.9
+GT_OCCUPANCY_THRESHOLD = 0.05
+PSEUDO_OCCUPANCY_THRESHOLD = 0.5001
 
 # Probability ranges for intensity (0.0-0.1, 0.1-0.2, ..., 0.9-1.0)
 PROB_RANGES = [(i * 0.1, (i + 1) * 0.1) for i in range(10)]
@@ -358,7 +360,7 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
     
     # Convert occupancy maps to voxel meshes with intensity-based transparency
     # Only visualize voxels above threshold to avoid heavy rendering
-    threshold = OCCUPANCY_THRESHOLD
+
     
     # Process pseudo occupancy map if flag is enabled
     pseudo_voxel_groups = []
@@ -370,11 +372,11 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
             if channel_idx is None:
                 # Process all channels
                 print(f"  Visualizing ALL {C} channels of pseudo occupancy map")
-                print(f"  Occupancy threshold: {threshold}")
+                print(f"  Occupancy threshold: {PSEUDO_OCCUPANCY_THRESHOLD}")
                 for ch_idx in range(C):
                     groups, num_non_empty = occupancy_channel_to_voxels(
                         pseudo_occupancy_map, ch_idx, pcr, occ_voxel_size,
-                        PROB_RANGES, INTENSITY_MAP, threshold=threshold
+                        PROB_RANGES, INTENSITY_MAP, threshold=PSEUDO_OCCUPANCY_THRESHOLD
                     )
                     pseudo_voxel_groups.extend([(ch_idx, g) for g in groups])
                     total_pseudo_non_empty += num_non_empty
@@ -388,10 +390,10 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
                     print(f"  Warning: channel_idx {channel_idx} >= C {C}, using channel {C-1}")
                     channel_idx = C - 1
                 print(f"  Visualizing channel {channel_idx} of pseudo occupancy map")
-                print(f"  Occupancy threshold: {threshold}")
+                print(f"  Occupancy threshold: {PSEUDO_OCCUPANCY_THRESHOLD}")
                 groups, num_non_empty = occupancy_channel_to_voxels(
                     pseudo_occupancy_map, channel_idx, pcr, occ_voxel_size,
-                    PROB_RANGES, INTENSITY_MAP, threshold=threshold
+                    PROB_RANGES, INTENSITY_MAP, threshold=PSEUDO_OCCUPANCY_THRESHOLD
                 )
                 pseudo_voxel_groups = [(channel_idx, g) for g in groups]
                 total_pseudo_non_empty = num_non_empty
@@ -399,9 +401,9 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
                 print(f"    Channel {channel_idx}: {num_non_empty} non-empty voxels, {total_voxels} to visualize")
             
             if channel_idx is None:
-                print(f"  Total pseudo occupancy - Non-empty voxels (>{threshold}): {total_pseudo_non_empty}")
+                print(f"  Total pseudo occupancy - Non-empty voxels (>{PSEUDO_OCCUPANCY_THRESHOLD}): {total_pseudo_non_empty}")
             else:
-                print(f"  Pseudo occupancy channel {channel_idx} - Non-empty voxels (>{threshold}): {total_pseudo_non_empty}")
+                print(f"  Pseudo occupancy channel {channel_idx} - Non-empty voxels (>{PSEUDO_OCCUPANCY_THRESHOLD}): {total_pseudo_non_empty}")
             total_pseudo_voxels = sum(
                 len(voxel_indices) for _, (voxel_indices, _, _, _) in pseudo_voxel_groups
             )
@@ -427,7 +429,7 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
                 channels_to_vis = [channel_idx]
                 print(f"  Visualizing channel {channel_idx} of GT occupancy map")
             
-            print(f"  Occupancy threshold: {threshold}")
+            print(f"  Occupancy threshold: {GT_OCCUPANCY_THRESHOLD}")
             
             all_gt_voxel_groups = []
             total_gt_non_empty = 0
@@ -435,7 +437,7 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
             for ch_idx in channels_to_vis:
                 gt_voxel_groups, gt_num_non_empty = occupancy_channel_to_voxels(
                     gt_occupancy_map, ch_idx, pcr, occ_voxel_size,
-                    PROB_RANGES, INTENSITY_MAP, threshold=threshold
+                    PROB_RANGES, INTENSITY_MAP, threshold=GT_OCCUPANCY_THRESHOLD
                 )
                 all_gt_voxel_groups.append((ch_idx, gt_voxel_groups, gt_num_non_empty))
                 total_gt_non_empty += gt_num_non_empty
@@ -444,7 +446,7 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
                     total_voxels = sum(len(voxels) for voxels, _, _, _ in gt_voxel_groups)
                     print(f"    Channel {ch_idx}: {gt_num_non_empty} non-empty voxels, {total_voxels} to visualize")
             
-            print(f"  Total GT occupancy - Non-empty voxels (>{threshold}): {total_gt_non_empty}")
+            print(f"  Total GT occupancy - Non-empty voxels (>{GT_OCCUPANCY_THRESHOLD}): {total_gt_non_empty}")
             total_gt_voxels = sum(
                 sum(len(voxels) for voxels, _, _, _ in groups) 
                 for _, groups, _ in all_gt_voxel_groups
@@ -561,7 +563,7 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize occupancy maps with transparency.")
     parser.add_argument("--dir", default="work_dirs/resdet3d_nuscenes_mini/debug_viz", 
                        type=str, required=True, help="Directory containing *.pkl debug files.")
-    parser.add_argument("--coors-mode", type=str, default="voxel", choices=["voxel", "point"],
+    parser.add_argument("--coors-mode", type=str, default="point", choices=["voxel", "point"],
                        help="Visualization mode for coors: 'voxel' (wireframe boxes) or 'point' (center points only)")
     args = parser.parse_args()
     
@@ -571,6 +573,9 @@ def main():
         return
     
     for fpath in files:
+        
+        
+        fpath = fpath.replace("debug_iter_000000.pkl", "debug_iter_000050.pkl")
         print(f"Showing {fpath} (close window to continue)")
         visualize_file(fpath, channel_idx=OCCUPANCY_CHANNEL, coors_mode=args.coors_mode)
 

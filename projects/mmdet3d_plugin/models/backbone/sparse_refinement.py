@@ -25,78 +25,132 @@ import pickle
 class BEVHeightOccupancy(BaseModule):
     """BEV height occupancy module using U-Net style 2D convolutions.
     
-    Takes sparse features (B, C, H, W) and outputs occupancy maps (B, in_channels, H, W)
+    Main purpose: Predict occupancy for volume [180, 180, 32] based on sparse features.
+    Target: Same voxel grid [180, 180, 32] generated from real LiDAR scene.
+    
+    Takes sparse features (B, C, H, W) and outputs occupancy maps (B, occ_feature_shape[2], H, W)
     where each channel represents occupancy probability (0-1) at different height levels.
-    The output has the same number of channels as the input.
     
     Args:
         in_channels: Number of input channels (e.g., 256 from SparseEncoder)
-        Unet_channels: List of channel sizes for U-Net [128, 256, 512]
+        Unet_channels: List of channel sizes for U-Net [256, 512, 1024, 2048]
+        occ_feature_shape: [X, Y, C] BEV feature shape of occupancy [180, 180, 32]
+        use_residual: Whether to use residual connections in encoder/decoder
+        use_attention: Whether to use attention mechanism
         norm_cfg: Config for normalization layer
-        init_cfg: Config for initialization
+        init_cfg: Config for initialization (default: Kaiming for Conv2d)
     Returns:
-        occupancy_map: (B, in_channels, H, W) occupancy probability maps
+        occupancy_map: (B, occ_feature_shape[2], H, W) occupancy probability maps
     """
     def __init__(self, 
                  in_channels=256,
-                 Unet_channels = [128, 256, 512],
-                 occ_feature_shape = [180, 180, 32], # [X,Y,C] BEV feature of occupancy
+                 Unet_channels=[256, 512, 1024, 2048],
+                 occ_feature_shape=[180, 180, 32],  # [X,Y,C] BEV feature of occupancy
+                 use_residual=True,
+                 use_attention=True,
                  norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
                  init_cfg=None):
+        # Set default init_cfg if not provided
+        if init_cfg is None:
+            init_cfg = dict(
+                type='Kaiming',
+                layer='Conv2d',
+                mode='fan_out',
+                nonlinearity='relu'
+            )
         super(BEVHeightOccupancy, self).__init__(init_cfg=init_cfg)
         
-        # Unet_channels = [128, 256, 512]
-        # encoder1: 128 -> 128 -> 256 (same spatial size)
-        # encoder2: 256 -> 512 (stride 2, half size)
-        # decoder2: 512 -> 256 (upsample, concat with encoder1's 256 -> 256)
-        # decoder1: 256 -> 128 (upsample to original size)
-        # output: 128 -> self.occ_feature_shape[2]
         self.occ_feature_shape = occ_feature_shape
+        self.use_residual = use_residual
+        self.use_attention = use_attention
+        
         # Project input to Unet_channels[0]
         self.input_proj = nn.Conv2d(in_channels, Unet_channels[0], 1)
         
-        # Encoder: 128 -> 256 -> 512
-        self.encoder1 = nn.Sequential(
-            nn.Conv2d(Unet_channels[0], Unet_channels[0], 3, padding=1),  # 128 -> 128
-            build_norm_layer(norm_cfg, Unet_channels[0])[1],
-            nn.ReLU(inplace=True),
-            nn.Conv2d(Unet_channels[0], Unet_channels[1], 3, padding=1),  # 128 -> 256
-            build_norm_layer(norm_cfg, Unet_channels[1])[1],
-            nn.ReLU(inplace=True),
-        )
-        self.encoder2 = nn.Sequential(
-            nn.Conv2d(Unet_channels[1], Unet_channels[2], 3, stride=2, padding=1),  # 256 -> 512, half size
-            build_norm_layer(norm_cfg, Unet_channels[2])[1],
-            nn.ReLU(inplace=True),
-            nn.Conv2d(Unet_channels[2], Unet_channels[2], 3, padding=1),  # 512 -> 512
-            build_norm_layer(norm_cfg, Unet_channels[2])[1],
-            nn.ReLU(inplace=True),
-        )
+        # Build deeper encoder: 256 -> 512 -> 1024 -> 2048
+        self.encoders = nn.ModuleList()
+        self.encoder_residual_flags = []  # Track which encoders can use residual
         
-        # Decoder: 512 -> 256 -> 128
-        # decoder2 processes concatenated features: 512 (from e2_up) + 256 (from e1) = 768 -> 256
-        self.decoder2 = nn.Sequential(
-            nn.Conv2d(Unet_channels[2] + Unet_channels[1], Unet_channels[1], 3, padding=1),  # 512+256=768 -> 256
-            build_norm_layer(norm_cfg, Unet_channels[1])[1],
-            nn.ReLU(inplace=True),
-            nn.Conv2d(Unet_channels[1], Unet_channels[1], 3, padding=1),  # 256 -> 256
-            build_norm_layer(norm_cfg, Unet_channels[1])[1],
-            nn.ReLU(inplace=True),
-        )
-        # decoder1 processes: 256 -> 128
-        self.decoder1 = nn.Sequential(
-            nn.Conv2d(Unet_channels[1], Unet_channels[0], 3, padding=1),  # 256 -> 128
-            build_norm_layer(norm_cfg, Unet_channels[0])[1],
-            nn.ReLU(inplace=True),
-            nn.Conv2d(Unet_channels[0], Unet_channels[0], 3, padding=1),  # 128 -> 128
-            build_norm_layer(norm_cfg, Unet_channels[0])[1],
-            nn.ReLU(inplace=True),
-        )
+        for i in range(len(Unet_channels) - 1):
+            in_ch = Unet_channels[i]
+            out_ch = Unet_channels[i + 1]
+            
+            # First conv: may use stride 2 for downsampling (except first encoder)
+            encoder_block = []
+            if i == 0:
+                # First encoder: same spatial size, can use residual
+                encoder_block.append(nn.Conv2d(in_ch, in_ch, 3, padding=1))
+                encoder_block.append(build_norm_layer(norm_cfg, in_ch)[1])
+                encoder_block.append(nn.ReLU(inplace=True))
+                encoder_block.append(nn.Conv2d(in_ch, out_ch, 3, padding=1))
+                # Can use residual if enabled and channels match (but first encoder changes channels, so no residual)
+                self.encoder_residual_flags.append(False)
+            else:
+                # Subsequent encoders: stride 2 for downsampling
+                encoder_block.append(nn.Conv2d(in_ch, out_ch, 3, stride=2, padding=1))
+                encoder_block.append(build_norm_layer(norm_cfg, out_ch)[1])
+                encoder_block.append(nn.ReLU(inplace=True))
+                encoder_block.append(nn.Conv2d(out_ch, out_ch, 3, padding=1))
+                # Can use residual if enabled and channels match
+                self.encoder_residual_flags.append(use_residual and in_ch == out_ch)
+            
+            encoder_block.append(build_norm_layer(norm_cfg, out_ch)[1])
+            encoder_block.append(nn.ReLU(inplace=True))
+            
+            self.encoders.append(nn.Sequential(*encoder_block))
+        
+        # Build attention modules (if enabled) - one for each encoder output
+        if use_attention:
+            self.attention_modules = nn.ModuleList()
+            for ch in Unet_channels[1:]:  # One attention module per encoder output
+                # Simple channel attention: GlobalAvgPool -> FC -> Sigmoid
+                self.attention_modules.append(
+                    nn.Sequential(
+                        nn.AdaptiveAvgPool2d(1),
+                        nn.Conv2d(ch, ch // 4, 1),
+                        nn.ReLU(inplace=True),
+                        nn.Conv2d(ch // 4, ch, 1),
+                        nn.Sigmoid()
+                    )
+                )
+        else:
+            self.attention_modules = None
+        
+        # Build deeper decoder: 2048 -> 1024 -> 512 -> 256
+        # Decoders process: upsampled_features + encoder_skip_features -> output
+        # Forward pass logic:
+        # - decoder[0]: processes encoder_features[3] (2048) -> (1024)
+        # - decoder[1]: receives upsampled decoder[0] output (1024) + encoder_features[2] (1024) = (2048) -> (512)
+        # - decoder[2]: receives upsampled decoder[1] output (512) + encoder_features[1] (512) = (1024) -> (256)
+        self.decoders = nn.ModuleList()
+        for decoder_idx in range(len(Unet_channels) - 1):  # 0, 1, 2
+            if decoder_idx == 0:
+                # Bottom decoder: no skip connection, just process 2048 -> 1024
+                in_ch = Unet_channels[-1]  # 2048 (from last encoder)
+                out_ch = Unet_channels[-2]  # 1024
+            else:
+                # Middle decoders: concatenate upsampled decoder output with encoder skip features
+                # decoder[decoder_idx-1] outputs Unet_channels[-(decoder_idx+1)] channels
+                # We concatenate with encoder_features[-(decoder_idx+1)] which also has Unet_channels[-(decoder_idx+1)] channels
+                # So: in_ch = 2 * Unet_channels[-(decoder_idx+1)]
+                #     out_ch = Unet_channels[-(decoder_idx+2)]
+                skip_ch = Unet_channels[-(decoder_idx + 1)]  # Channels in skip connection
+                in_ch = 2 * skip_ch  # decoder output + skip feature
+                out_ch = Unet_channels[-(decoder_idx + 2)]  # Output channels
+            
+            decoder_block = []
+            decoder_block.append(nn.Conv2d(in_ch, out_ch, 3, padding=1))
+            decoder_block.append(build_norm_layer(norm_cfg, out_ch)[1])
+            decoder_block.append(nn.ReLU(inplace=True))
+            decoder_block.append(nn.Conv2d(out_ch, out_ch, 3, padding=1))
+            decoder_block.append(build_norm_layer(norm_cfg, out_ch)[1])
+            decoder_block.append(nn.ReLU(inplace=True))
+            
+            self.decoders.append(nn.Sequential(*decoder_block))
         
         # Final output: gradually compress channels from Unet_channels[0] to occ_feature_shape[2]
-        # Example: 128 -> 64 -> 32 (gradual compression, not shocking)
         target_channels = self.occ_feature_shape[2]  # e.g., 32
-        input_channels = Unet_channels[0]  # e.g., 128
+        input_channels = Unet_channels[0]  # e.g., 256
         
         # Build gradual compression path: divide by 2 until reaching target
         compression_layers = []
@@ -120,8 +174,12 @@ class BEVHeightOccupancy(BaseModule):
             )
         
         self.occupancy_head = nn.Sequential(*compression_layers)
-        self.occupancy_head.add_module('sigmoid', nn.Sigmoid())  # Output probability in [0, 1]
+        # Note: No sigmoid here - output logits instead of probabilities
+        # Sigmoid will be applied in loss function (binary_cross_entropy_with_logits)
+        # or during inference/visualization when needed
         
+    # Note: No custom init_weights needed - default Kaiming initialization (from init_cfg) 
+    # is sufficient for logits. No sigmoid means no special bias initialization required.
         
     def forward(self, sparse_features: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -130,27 +188,64 @@ class BEVHeightOccupancy(BaseModule):
             sparse_features: (B, C, H, W) input feature map
             
         Returns:
-            occupancy_map: (B, self.occ_feature_shape[2], H, W) occupancy probability maps
+            occupancy_logits: (B, self.occ_feature_shape[2], H, W) occupancy logits (not probabilities)
+                Apply torch.sigmoid() to get probabilities [0, 1] if needed
         """
-        # Project input to Unet_channels[0] (128)
-        x = self.input_proj(sparse_features)  # (B, 128, H, W)
+        # Project input to Unet_channels[0]
+        x = self.input_proj(sparse_features)  # (B, 256, H, W)
         
-        # Encoder: 128 -> 256 -> 512
-        e1 = self.encoder1(x)  # (B, 256, H, W)
-        e2 = self.encoder2(e1)  # (B, 512, H/2, W/2)
+        # Encoder path: store features for skip connections
+        encoder_features = [x]  # Store input for first skip connection
         
-        # Decoder: 512 -> 256 -> 128
-        # Upsample e2 to match e1's spatial size, then concat
-        e2_up = F.interpolate(e2, size=e1.shape[2:], mode='bilinear', align_corners=False)  # (B, 512, H, W)
-        d2 = self.decoder2(torch.cat([e2_up, e1], dim=1))  # (B, 256, H, W) - concat 512+256 -> 256
+        for i, encoder in enumerate(self.encoders):
+            out = encoder(encoder_features[-1])
+            
+            # Apply attention if enabled (one attention module per encoder output)
+            if self.use_attention and i < len(self.attention_modules):
+                attn = self.attention_modules[i]
+                out = out * attn(out)  # Channel attention
+            
+            # Residual connection (if enabled and channels match)
+            if self.encoder_residual_flags[i] and encoder_features[-1].shape[1] == out.shape[1]:
+                out = out + encoder_features[-1]
+            
+            encoder_features.append(out)
         
-        # Final decoder: 256 -> 128
-        d1 = self.decoder1(d2)  # (B, 128, H, W)
+        # Decoder path: upsample and concatenate with encoder features
+        # encoder_features: [input(256), e1_out(512), e2_out(1024), e3_out(2048)]
+        # indices:            [0]          [1]          [2]          [3]
+        x = encoder_features[-1]  # Start from deepest encoder output (2048, 45, 45)
         
-        # Final occupancy map: 128 -> in_channels with sigmoid
-        occupancy_map = self.occupancy_head(d1)  # (B, self.occ_feature_shape[2], H, W)
+        for i, decoder in enumerate(self.decoders):
+            # i=0: decoder 3 (2048->1024), no skip, just process
+            # i=1: decoder 2 (1024->512), upsample + skip from encoder_features[2] (1024)
+            # i=2: decoder 1 (512->256), upsample + skip from encoder_features[1] (512)
+            
+            if i == 0:
+                # First decoder (bottom): no skip connection, just process
+                x = decoder(x)  # (2048, 45, 45) -> (1024, 45, 45)
+            else:
+                # Subsequent decoders: upsample then concatenate with skip connection
+                # Get the corresponding encoder feature for skip connection
+                # encoder_features[-(i+1)] gives us the right skip feature
+                # For i=1: encoder_features[-(2)] = encoder_features[2] = e2_out (1024, 90, 90)
+                # For i=2: encoder_features[-(3)] = encoder_features[1] = e1_out (512, 180, 180)
+                skip_idx = len(encoder_features) - (i + 1)  # 3-2=1 for i=1, 3-3=0 for i=2
+                skip_feat = encoder_features[skip_idx]  # Get skip feature
+                
+                # Upsample x to match skip feature's spatial size
+                x = F.interpolate(x, size=skip_feat.shape[2:], mode='bilinear', align_corners=False)
+                
+                # Concatenate: upsampled decoder output + encoder skip feature
+                x = torch.cat([x, skip_feat], dim=1)
+                
+                # Process through decoder
+                x = decoder(x)
         
-        return occupancy_map
+        # Final occupancy logits: compress to target channels (no sigmoid)
+        occupancy_logits = self.occupancy_head(x)  # (B, self.occ_feature_shape[2], H, W)
+        
+        return occupancy_logits  # Return logits, not probabilities
 
 @BACKBONES.register_module()
 class SparseRefinement(nn.Module):
@@ -324,24 +419,24 @@ class SparseRefinement(nn.Module):
             batch_size: Batch size
         
         Returns:
+            occupancy_logits: (B, num_height_levels, H, W) Occupancy logits (not probabilities)
+                Apply torch.sigmoid() to get probabilities [0, 1] if needed
             sparse_features: (B, C, H, W) Sparse feature representation from SparseEncoder
-            occupancy_map: (B, in_channels, H, W) Occupancy probability maps (same channels as input)
         """
         # Process through sparse middle encoder
         sparse_features = self.middle_encoder(voxel_features, coors, batch_size) # (B, C, H, W)
         
-        # Process through BEV height occupancy
-        occupancy_map = self.bev_height_occupancy(sparse_features) # (B, num_height_levels, H, W)
+        # Process through BEV height occupancy (returns logits, not probabilities)
+        occupancy_logits = self.bev_height_occupancy(sparse_features) # (B, num_height_levels, H, W)
         
-        
-        return occupancy_map, sparse_features
+        return occupancy_logits, sparse_features
     
 
     
     def _gather_feats_from_occupancy(
         self,
         sparse_features: torch.Tensor,
-        occupancy_map: torch.Tensor,
+        occupancy_logits: torch.Tensor,
         coors: torch.Tensor,
         bev_shape: Tuple[int, int],
         sparse_shape: List[int],
@@ -350,7 +445,7 @@ class SparseRefinement(nn.Module):
         
         Args:
             sparse_features: (B, C, H, W) sparse features from SparseEncoder
-            occupancy_map: (B, occupancy_channels, H, W) occupancy probability maps
+            occupancy_logits: (B, occupancy_channels, H, W) occupancy logits (not probabilities)
             coors: (M, 4) voxel coordinates [batch, z, y, x]
             bev_shape: (H, W) BEV feature map shape
             sparse_shape: [Z, Y, X] full grid shape
@@ -365,8 +460,11 @@ class SparseRefinement(nn.Module):
         
         H, W = bev_shape
         B, C = sparse_features.shape[:2]
-        occupancy_channels = occupancy_map.shape[1]
+        occupancy_channels = occupancy_logits.shape[1]
         num_z_levels = sparse_shape[0]
+        
+        # Convert logits to probabilities for thresholding
+        occupancy_prob = torch.sigmoid(occupancy_logits)  # (B, occupancy_channels, H, W)
         
         # Map Z dimension to occupancy channels proportionally
         z_to_channel_scale = occupancy_channels / num_z_levels
@@ -394,7 +492,7 @@ class SparseRefinement(nn.Module):
                 channel_idx = int(z * z_to_channel_scale)
                 channel_idx = min(occupancy_channels - 1, channel_idx)
                 # Check occupancy probability at this location and mapped channel
-                occ_prob = occupancy_map[b, channel_idx, bev_y, bev_x]
+                occ_prob = occupancy_prob[b, channel_idx, bev_y, bev_x]
                 # Use threshold to filter (e.g., > 0.5)
                 if occ_prob > 0.5:
                     # Gather feature from sparse_features
@@ -414,22 +512,23 @@ class SparseRefinement(nn.Module):
     
     def calculate_loss(
         self,
-        pseudo_occupancy_map: torch.Tensor,
+        pseudo_occupancy_logits: torch.Tensor,
         gt_occupancy_map: torch.Tensor,
     ) -> torch.Tensor:
         """Calculate occupancy loss.
         
         Args:
-            pseudo_occupancy_map: (B, in_channels, H, W) pseudo occupancy probability maps
-            gt_occupancy_map: (B, in_channels, H, W) GT occupancy probability maps
+            pseudo_occupancy_logits: (B, in_channels, H, W) pseudo occupancy logits (not probabilities)
+            gt_occupancy_map: (B, in_channels, H, W) GT occupancy probability maps [0, 1]
         
         Returns:
             Loss value
         """
-        # gt_occupancy_map is (B, in_channels, H, W) eg. [2, 256, 180, 180]
-        # pseudo_occupancy_map is (B, in_channels, H, W) eg. [2, 256, 180, 180]
+        # gt_occupancy_map is (B, in_channels, H, W) eg. [2, 32, 180, 180] - probabilities
+        # pseudo_occupancy_logits is (B, in_channels, H, W) eg. [2, 32, 180, 180] - logits
         
-        return self.loss_occupancy(pseudo_occupancy_map, gt_occupancy_map)
+        # Loss function will use binary_cross_entropy_with_logits internally (more stable)
+        return self.loss_occupancy(pseudo_occupancy_logits, gt_occupancy_map, use_logits=True)
     
     def _generate_gt_occupancy_map(
         self,
@@ -491,7 +590,7 @@ class SparseRefinement(nn.Module):
         self,
         pseudo_coors: torch.Tensor,
         gt_points: torch.Tensor,
-        pseudo_occupancy_map: torch.Tensor,
+        pseudo_occupancy_logits: torch.Tensor,
         gt_occupancy_map: torch.Tensor,
     ):
         """Save debug visualization data to pickle file.
@@ -499,8 +598,8 @@ class SparseRefinement(nn.Module):
         Args:
             pseudo_coors: (M, 4) pseudo voxel coordinates [batch, z, y, x]
             gt_points: (B, N, 3) GT point cloud
-            pseudo_occupancy_map: (B, C, H, W) pseudo occupancy map
-            gt_occupancy_map: (B, C, H, W) GT occupancy map
+            pseudo_occupancy_logits: (B, C, H, W) pseudo occupancy logits (will be converted to probabilities)
+            gt_occupancy_map: (B, C, H, W) GT occupancy map (probabilities)
         """
         import os
         
@@ -525,7 +624,10 @@ class SparseRefinement(nn.Module):
             if gt_coors_list:
                 gt_coors = torch.cat(gt_coors_list, dim=0)
         
-        # Prepare data for saving
+        # Convert logits to probabilities for visualization (better for visualization)
+        pseudo_occupancy_map = torch.sigmoid(pseudo_occupancy_logits) if pseudo_occupancy_logits is not None else None
+        
+        # Prepare data for saving (save probabilities, not logits, for visualization)
         debug_data = {
             "pseudo_coors": pseudo_coors.detach().cpu() if pseudo_coors is not None else None,
             "gt_coors": gt_coors.detach().cpu() if gt_coors is not None else None,
@@ -536,7 +638,7 @@ class SparseRefinement(nn.Module):
         }
         
         # Save to pickle file
-        self.debug_counter += 1
+        # Note: debug_counter is incremented in forward() before calling this function
         filename = f"debug_iter_{self.debug_counter:06d}.pkl"
         filepath = os.path.join(self.debug_viz_dir, filename)
         
@@ -575,7 +677,7 @@ class SparseRefinement(nn.Module):
         pseudo_voxel_features, pseudo_num_points, pseudo_coors = self._voxelize_and_encode(pseudo_points_xyz)
         
         # Process through sparse encoder and BEV height occupancy
-        pseudo_occupancy_map, pseudo_sparse_features = self._generate_occupancy_map(
+        pseudo_occupancy_logits, pseudo_sparse_features = self._generate_occupancy_map(
             pseudo_voxel_features, pseudo_num_points, pseudo_coors, batch_size
         )
         
@@ -589,16 +691,21 @@ class SparseRefinement(nn.Module):
             
             if return_loss:
                 # Calculate occupancy loss (reuse gt_occupancy_map to avoid regenerating)
-                loss_value = self.calculate_loss(pseudo_occupancy_map, gt_occupancy_map)
+                loss_value = self.calculate_loss(pseudo_occupancy_logits, gt_occupancy_map)
                 
+
+                self.debug_counter += 1
                 # save the debug data here if viz flag is True and debug_counter is divisible by 300
-                if self.debug_viz and self.debug_counter % 300 == 0:
+                if self.debug_viz and self.debug_counter % 10 == 0:
                     self._save_debug_data(
                         pseudo_coors=pseudo_coors,
                         gt_points=gt_points,
-                        pseudo_occupancy_map=pseudo_occupancy_map,
+                        pseudo_occupancy_logits=pseudo_occupancy_logits,
                         gt_occupancy_map=gt_occupancy_map,
                     )
+                    
+                # Increment debug counter every iteration (to track all iterations, not just saved ones)
+                
                 losses = dict(loss_occupancy=loss_value)
         
         

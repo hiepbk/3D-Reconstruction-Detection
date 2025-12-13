@@ -258,10 +258,18 @@ model = dict(
             ),
             bev_height_occupancy=dict(
                 type='BEVHeightOccupancy',
-                in_channels=256,  # out channels have to equal to input channels
-                Unet_channels=[128, 256, 512],
-                occ_feature_shape=[180, 180, 32], # [X,Y,C] BEV feature of occupancy
+                in_channels=256,  # Input channels from SparseEncoder
+                Unet_channels=[256, 512, 1024, 2048],  # Deeper U-Net with more channels
+                occ_feature_shape=[180, 180, 32],  # [X,Y,C] BEV feature of occupancy - target grid from real LiDAR
+                use_residual=True,  # Add residual connections
+                use_attention=True,  # Add attention mechanism
+                init_cfg=dict(
+                    type='Kaiming',
+                    layer='Conv2d',
+                    mode='fan_out',
+                    nonlinearity='relu'
                 ),
+            ),
             occupancy_voxel_layer=dict(
                 max_num_points=10,
                 occ_feature_shape=[180, 180, 32], # [X,Y,C] BEV feature of occupancy
@@ -276,10 +284,9 @@ model = dict(
             ),
             loss_occupancy=dict(
                 type='OccupancyLoss',
-                loss_type='bce_dice',  # Combined BCE + Dice for better convergence
-                dice_weight=0.5,  # Weight for dice component
+                loss_type='bce',  # Switch to BCE with logits (better gradients than focal)
                 reduction='mean',
-                loss_weight=1.0,
+                loss_weight=10.0,  # Significantly increased to 10.0 to get much larger gradients
                 # Optional: channel_weights to emphasize certain height levels
                 # channel_weights=None,  # Equal weights for all channels
             ),
@@ -344,8 +351,12 @@ model = dict(
     
     )
 
-optimizer = dict(type='AdamW', lr=0.0001, weight_decay=0.01)
-optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
+optimizer = dict(
+    type='AdamW', 
+    lr=0.001,  # Increased base learning rate (10x from 0.0001) - refinement network will benefit
+    weight_decay=0.01,
+)
+optimizer_config = dict(grad_clip=dict(max_norm=100.0, norm_type=2))  # Increased to 10.0 to allow larger gradients
 lr_config = dict(
     policy='cyclic',
     target_ratio=(10, 0.0001),

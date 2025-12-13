@@ -138,16 +138,20 @@ class OccupancyLoss(nn.Module):
             loss = loss * weights
         return loss
     
-    def forward(self, pred_occupancy, gt_occupancy, reduction_override=None, **kwargs):
+    def forward(self, pred_occupancy, gt_occupancy, reduction_override=None, use_logits=True, **kwargs):
         """Forward function of loss calculation.
         
         Args:
             pred_occupancy (torch.Tensor): Predicted occupancy map with shape [B, C, H, W].
-                Values should be in [0, 1] (already sigmoid-activated).
+                If use_logits=True: Values are logits (unbounded, from network).
+                If use_logits=False: Values are probabilities [0, 1] (already sigmoid-activated).
             gt_occupancy (torch.Tensor): Ground truth occupancy map with shape [B, C, H, W].
                 Values should be in [0, 1] (soft probabilities from SoftVoxelOccupancyVFE).
             reduction_override (str, optional): Method to reduce losses.
                 Options: 'none', 'sum', 'mean'. Defaults to None.
+            use_logits (bool): If True, pred_occupancy contains logits and we use 
+                binary_cross_entropy_with_logits. If False, pred_occupancy contains probabilities.
+                Defaults to True.
         
         Returns:
             torch.Tensor: Occupancy loss value.
@@ -156,25 +160,49 @@ class OccupancyLoss(nn.Module):
         reduction = (
             reduction_override if reduction_override else self.reduction)
         
-        # Clamp predictions to avoid numerical issues
-        pred_occupancy = pred_occupancy.clamp(min=1e-6, max=1.0 - 1e-6)
+        # Convert logits to probabilities if needed (for focal/dice losses that need probabilities)
+        if use_logits:
+            # For BCE with logits, we can use logits directly
+            # For focal/dice, we need probabilities
+            if self.loss_type in ['focal', 'dice', 'bce_dice']:
+                pred_prob = torch.sigmoid(pred_occupancy)
+            else:
+                pred_prob = None  # Will use logits directly
+        else:
+            # Already probabilities, just clamp to avoid numerical issues
+            pred_occupancy = pred_occupancy.clamp(min=1e-6, max=1.0 - 1e-6)
+            pred_prob = pred_occupancy
         
         if self.loss_type == 'bce':
-            loss = self._compute_bce_loss(pred_occupancy, gt_occupancy)
+            if use_logits:
+                # Use more numerically stable version with logits
+                loss = F.binary_cross_entropy_with_logits(
+                    pred_occupancy, gt_occupancy, reduction='none'
+                )
+            else:
+                loss = self._compute_bce_loss(pred_occupancy, gt_occupancy)
             
         elif self.loss_type == 'focal':
-            loss = self._compute_focal_loss(pred_occupancy, gt_occupancy)
+            # Focal loss needs probabilities
+            loss = self._compute_focal_loss(pred_prob, gt_occupancy)
             
         elif self.loss_type == 'dice':
-            loss = self._compute_dice_loss(pred_occupancy, gt_occupancy)
+            # Dice loss needs probabilities
+            loss = self._compute_dice_loss(pred_prob, gt_occupancy)
             # Dice loss returns (B, C), expand to (B, C, H, W) for consistency
-            loss = loss.unsqueeze(-1).unsqueeze(-1).expand_as(pred_occupancy)
+            loss = loss.unsqueeze(-1).unsqueeze(-1).expand_as(pred_prob)
             
         elif self.loss_type == 'bce_dice':
-            bce_loss = self._compute_bce_loss(pred_occupancy, gt_occupancy)
-            dice_loss = self._compute_dice_loss(pred_occupancy, gt_occupancy)
+            # BCE with logits, Dice with probabilities
+            if use_logits:
+                bce_loss = F.binary_cross_entropy_with_logits(
+                    pred_occupancy, gt_occupancy, reduction='none'
+                )
+            else:
+                bce_loss = self._compute_bce_loss(pred_occupancy, gt_occupancy)
+            dice_loss = self._compute_dice_loss(pred_prob, gt_occupancy)
             # Expand dice_loss to match bce_loss shape
-            dice_loss = dice_loss.unsqueeze(-1).unsqueeze(-1).expand_as(pred_occupancy)
+            dice_loss = dice_loss.unsqueeze(-1).unsqueeze(-1).expand_as(bce_loss)
             loss = bce_loss + self.dice_weight * dice_loss
         
         # Apply channel weights if specified
