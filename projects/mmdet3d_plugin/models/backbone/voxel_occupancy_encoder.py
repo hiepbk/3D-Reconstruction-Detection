@@ -20,7 +20,7 @@ class HardVoxelOccupancyVFE(nn.Module):
         self.fp16_enabled = False
 
     @force_fp32(out_fp16=True)
-    def forward(self, features, num_points, coors, occ_sparse_shape):
+    def forward(self, features, num_points, coors):
         """
         Args:
             features: (N, M, C) point features (unused)
@@ -28,15 +28,12 @@ class HardVoxelOccupancyVFE(nn.Module):
             coors: (N, 3 or 4) voxel coords (unused here)
 
         Returns:
-            torch.Tensor: Occupancy map of shape (N, 1)
+            occupancy: (N, 1) Occupancy map
         """
 
         # occupancy = 1 if voxel has any points, else 0
         occupancy = (num_points > 0).float().view(-1, 1)
         
-        # then, convert to the feature map with shape of occ_sparse_shape [Z, Y, X]
-        occupancy = occupancy.view(-1, 1, occ_sparse_shape[0], occ_sparse_shape[1], occ_sparse_shape[2])
-
         return occupancy.contiguous()
     
     
@@ -53,13 +50,12 @@ class SoftVoxelOccupancyVFE(nn.Module):
         p_occ = 1 - exp( -λ*n - γ*var )
     """
 
-    def __init__(self, lambda_n=0.3, gamma_var=5.0, eps=1e-6, occ_sparse_shape=None):
+    def __init__(self, lambda_n=0.3, gamma_var=5.0, eps=1e-6):
         super().__init__()
         self.lambda_n = lambda_n
         self.gamma_var = gamma_var
         self.eps = eps
         self.fp16_enabled = False
-        self.occ_sparse_shape = occ_sparse_shape
 
     @force_fp32(out_fp16=True)
     def forward(self, features, num_points, coors):
@@ -67,38 +63,38 @@ class SoftVoxelOccupancyVFE(nn.Module):
         Args:
             features: (N, M, C) padded points, first 3 dims must be xyz
             num_points: (N,) number of valid points in each voxel
-            coors: unused
+            coors: (N, 4) voxel coords [batch_idx, z, y, x]
 
         Returns:
-            occupancy: (N, 1) soft occupancy probability
+            occupancy: (N, 1) Occupancy map
         """
 
         N, M, C = features.shape
+        B = coors[:, 0].max().item() + 1
 
-        # ----- Extract xyz -----
+        # ===== Extract xyz =====
         xyz = features[:, :, :3]
 
-        # ----- Build mask for padded points -----
+        # ===== Build mask for padded points =====
         mask = (torch.arange(M, device=xyz.device)
                 .unsqueeze(0) < num_points.unsqueeze(1))  # (N, M)
+        mask_exp = mask.unsqueeze(-1).float()             # (N, M, 1)
 
-        mask_exp = mask.unsqueeze(-1).float()            # (N, M, 1)
-
-        # ----- Compute masked mean -----
-        xyz_sum = (xyz * mask_exp).sum(dim=1)            # (N, 3)
+        # ===== Compute masked mean =====
+        xyz_sum = (xyz * mask_exp).sum(dim=1)             # (N, 3)
         denom = num_points.unsqueeze(1).float() + self.eps
-        xyz_mean = xyz_sum / denom                       # (N, 3)
+        xyz_mean = xyz_sum / denom                        # (N, 3)
 
-        # ----- Compute variance -----
-        diff = (xyz - xyz_mean.unsqueeze(1)) * mask_exp  # (N, M, 3)
-        var = (diff.pow(2).sum(dim=1) / denom).mean(dim=1)   # (N,)
+        # ===== Compute variance =====
+        diff = (xyz - xyz_mean.unsqueeze(1)) * mask_exp   # (N, M, 3)
+        var = (diff.pow(2).sum(dim=1) / denom).mean(dim=1)  # (N,)
 
-        # ----- Combined deterministic occupancy -----
-        # p = 1 - exp(-λ*n - γ*var)
+        # ===== Deterministic soft occupancy =====
         n = num_points.float()
-        occupancy = 1.0 - torch.exp(-self.lambda_n * n - self.gamma_var * var)
-        
-        # then, convert to the feature map with shape of occ_sparse_shape [Z, Y, X]
-        occupancy = occupancy.view(-1, 1, self.occ_sparse_shape[0], self.occ_sparse_shape[1], self.occ_sparse_shape[2])
+        occupancy = 1.0 - torch.exp(
+            -self.lambda_n * n - self.gamma_var * var
+        )  # (N,)
 
-        return occupancy.view(-1, 1).contiguous()
+        occupancy = occupancy.view(-1, 1).contiguous()  # (N, 1)
+
+        return occupancy.contiguous()

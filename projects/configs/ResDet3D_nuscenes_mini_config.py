@@ -260,19 +260,28 @@ model = dict(
                 type='BEVHeightOccupancy',
                 in_channels=256,  # out channels have to equal to input channels
                 Unet_channels=[128, 256, 512],
+                occ_feature_shape=[180, 180, 32], # [X,Y,C] BEV feature of occupancy
                 ),
-
+            occupancy_voxel_layer=dict(
+                max_num_points=10,
+                occ_feature_shape=[180, 180, 32], # [X,Y,C] BEV feature of occupancy
+                max_voxels=(120000, 160000),  # (training, testing) max voxels
+                point_cloud_range=point_cloud_range,
+            ),
             occupancy_voxel_encoder=dict(
                 type='SoftVoxelOccupancyVFE',
                 lambda_n=0.3,
                 gamma_var=5.0,
                 eps=1e-6,
-                occ_sparse_shape=[255, 180, 180], # [Z, Y, X] the feature map shape of the occupancy map
             ),
             loss_occupancy=dict(
                 type='OccupancyLoss',
+                loss_type='bce_dice',  # Combined BCE + Dice for better convergence
+                dice_weight=0.5,  # Weight for dice component
                 reduction='mean',
                 loss_weight=1.0,
+                # Optional: channel_weights to emphasize certain height levels
+                # channel_weights=None,  # Equal weights for all channels
             ),
             loss_weight=1.0,  # Weight for occupancy loss
         ),

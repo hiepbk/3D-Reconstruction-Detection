@@ -427,11 +427,11 @@ def load_point_cloud_from_prediction(
             # Store points for this camera (in camera coordinates)
             result['points_by_camera'][cam_name] = points_cam_valid
             
-        # Get colors from processed images
-        if hasattr(prediction, 'processed_images'):
-            img = prediction.processed_images[i]
-            colors = img.reshape(-1, 3)[valid] / 255.0
-            result['colors_by_camera'][cam_name] = colors
+            # Get colors from processed images
+            if hasattr(prediction, 'processed_images'):
+                img = prediction.processed_images[i]
+                colors = img.reshape(-1, 3)[valid] / 255.0
+                result['colors_by_camera'][cam_name] = colors
     
     return result
 
@@ -695,9 +695,9 @@ def run_inference_for_frame(
     
     
     
-
-    # Prepare export_kwargs for GLB export filtering options
-    export_kwargs = {}
+    
+        # Prepare export_kwargs for GLB export filtering options
+        export_kwargs = {}
     if "glb" in cfg.EXPORT_FORMAT:
             export_kwargs["glb"] = {
                 "sky_depth_def": cfg.GLB_CONFIG["sky_depth_def"],
@@ -705,70 +705,70 @@ def run_inference_for_frame(
                 "filter_black_bg": cfg.GLB_CONFIG["filter_black_bg"],
                 "filter_white_bg": cfg.GLB_CONFIG["filter_white_bg"],
             }
-    
-    # Run inference (no extrinsics/intrinsics - model estimates them!)
-    prediction = model.inference(
-        image=image_files,
-        export_dir=frame_output_dir,
+        
+        # Run inference (no extrinsics/intrinsics - model estimates them!)
+        prediction = model.inference(
+            image=image_files,
+            export_dir=frame_output_dir,
     export_format=cfg.EXPORT_FORMAT,
     ref_view_strategy=cfg.REF_VIEW_STRATEGY,
     use_ray_pose=cfg.USE_RAY_POSE,
     num_max_points=cfg.MAX_POINTS,
-        export_kwargs=export_kwargs if export_kwargs else None,
-    )
-    
-    print(f"✓ Successfully processed sample {sample_token}")
-    print(f"  Output directory: {frame_output_dir}")
-    
-    # Display camera images and point cloud simultaneously
-    if display:
-        # Display camera images (all 6 cameras) in a separate thread (OpenCV is thread-safe)
-        camera_thread = display_camera_images_threaded(image_paths, sample_token, nusc_info['polygon_by_camera'], cfg)
-        
-        # Load point clouds from prediction (points stay in camera coordinates)
-        # Apply filtering for sky, confidence, and max depth
-        pcd_data = load_point_cloud_from_prediction(
-            prediction, 
-            image_paths,
-            max_depth=cfg.GLB_CONFIG["max_depth"],
-            conf_thresh_percentile=cfg.GLB_CONFIG["conf_thresh_percentile"],
-            polygon_by_camera=None,
-            cfg=cfg,
+            export_kwargs=export_kwargs if export_kwargs else None,
         )
         
-        if pcd_data and pcd_data['points_by_camera']:
-            # Transform each camera's points from camera coordinates to LiDAR coordinates
-            # using ground truth extrinsics from nuScenes (not model's predicted extrinsics)
-            all_points_lidar = []
-            all_colors = []
+        print(f"✓ Successfully processed sample {sample_token}")
+        print(f"  Output directory: {frame_output_dir}")
+        
+        # Display camera images and point cloud simultaneously
+        if display:
+            # Display camera images (all 6 cameras) in a separate thread (OpenCV is thread-safe)
+        camera_thread = display_camera_images_threaded(image_paths, sample_token, nusc_info['polygon_by_camera'], cfg)
             
-            print(f"  Transforming points from camera coordinates to LiDAR coordinates...")
-            total_points_before_downsample = 0
-            for cam_name in pcd_data['camera_order']:
-                if cam_name in pcd_data['points_by_camera']:
-                    points_cam = pcd_data['points_by_camera'][cam_name]
-                    
-                    # Check if we have transformation for this camera
-                    if cam_name in nusc_info:
-                        # Transform points from camera coordinates to LiDAR coordinates
-                        # using ground truth extrinsics from nuScenes
-                        R = nusc_info[cam_name]['cam2lidar_rotation']
-                        T = nusc_info[cam_name]['cam2lidar_translation']
+            # Load point clouds from prediction (points stay in camera coordinates)
+            # Apply filtering for sky, confidence, and max depth
+            pcd_data = load_point_cloud_from_prediction(
+                prediction, 
+                image_paths,
+                max_depth=cfg.GLB_CONFIG["max_depth"],
+                conf_thresh_percentile=cfg.GLB_CONFIG["conf_thresh_percentile"],
+            polygon_by_camera=None,
+            cfg=cfg,
+            )
+            
+            if pcd_data and pcd_data['points_by_camera']:
+                # Transform each camera's points from camera coordinates to LiDAR coordinates
+                # using ground truth extrinsics from nuScenes (not model's predicted extrinsics)
+                all_points_lidar = []
+                all_colors = []
+                
+                print(f"  Transforming points from camera coordinates to LiDAR coordinates...")
+                total_points_before_downsample = 0
+                for cam_name in pcd_data['camera_order']:
+                    if cam_name in pcd_data['points_by_camera']:
+                        points_cam = pcd_data['points_by_camera'][cam_name]
                         
-                        # Transform: points_lidar = points_cam @ R.T + T
-                        points_lidar = points_cam @ R.T + T
-                        
-                        # Get colors if available
-                        cam_colors = None
-                        if cam_name in pcd_data['colors_by_camera']:
-                            cam_colors = pcd_data['colors_by_camera'][cam_name]
-                        
-                        # DOWNSAMPLE PER CAMERA BEFORE COMBINING (much more memory efficient!)
-                        # This avoids building huge KDTree on 600k+ points
-                        if nusc_info.get('downsample_voxel_size', None) is not None:
-                            num_points_before = len(points_lidar)
-                            total_points_before_downsample += num_points_before
+                        # Check if we have transformation for this camera
+                        if cam_name in nusc_info:
+                            # Transform points from camera coordinates to LiDAR coordinates
+                            # using ground truth extrinsics from nuScenes
+                            R = nusc_info[cam_name]['cam2lidar_rotation']
+                            T = nusc_info[cam_name]['cam2lidar_translation']
                             
+                            # Transform: points_lidar = points_cam @ R.T + T
+                            points_lidar = points_cam @ R.T + T
+                            
+                            # Get colors if available
+                            cam_colors = None
+                            if cam_name in pcd_data['colors_by_camera']:
+                                cam_colors = pcd_data['colors_by_camera'][cam_name]
+                            
+                            # DOWNSAMPLE PER CAMERA BEFORE COMBINING (much more memory efficient!)
+                            # This avoids building huge KDTree on 600k+ points
+                            if nusc_info.get('downsample_voxel_size', None) is not None:
+                                num_points_before = len(points_lidar)
+                                total_points_before_downsample += num_points_before
+                                
                             # Per-camera voxel downsample via pipeline (only VoxelDownsample step)
                             per_cam_pipeline_cfg = [
                                 dict(
@@ -788,69 +788,69 @@ def run_inference_for_frame(
                             points_lidar = per_cam_output.get('points', points_lidar)
                             cam_colors = per_cam_output.get('colors', cam_colors)
                                 
-                            num_points_after = len(points_lidar)
-                            reduction = num_points_before - num_points_after
-                            reduction_pct = (reduction / num_points_before * 100) if num_points_before > 0 else 0
-                            print(f"    {cam_name}: {len(points_cam)} points -> {num_points_before} points in LiDAR -> {num_points_after} after downsampling ({reduction_pct:.1f}% reduction)")
+                                num_points_after = len(points_lidar)
+                                reduction = num_points_before - num_points_after
+                                reduction_pct = (reduction / num_points_before * 100) if num_points_before > 0 else 0
+                                print(f"    {cam_name}: {len(points_cam)} points -> {num_points_before} points in LiDAR -> {num_points_after} after downsampling ({reduction_pct:.1f}% reduction)")
+                            else:
+                                total_points_before_downsample += len(points_lidar)
+                                print(f"    {cam_name}: {len(points_cam)} points -> {len(points_lidar)} points in LiDAR frame")
+                            
+                            all_points_lidar.append(points_lidar)
+                            
+                            if cam_colors is not None:
+                                all_colors.append(cam_colors)
+                            
                         else:
-                            total_points_before_downsample += len(points_lidar)
-                            print(f"    {cam_name}: {len(points_cam)} points -> {len(points_lidar)} points in LiDAR frame")
-                        
-                        all_points_lidar.append(points_lidar)
-                        
-                        if cam_colors is not None:
-                            all_colors.append(cam_colors)
-                        
-                    else:
-                        print(f"    WARNING: No transformation found for {cam_name}, skipping...")
-            
-            if all_points_lidar:
-                # Concatenate all points (already downsampled per camera)
-                combined_points = np.concatenate(all_points_lidar, axis=0)
-                combined_colors = None
+                            print(f"    WARNING: No transformation found for {cam_name}, skipping...")
                 
-                if all_colors:
-                    combined_colors = np.concatenate(all_colors, axis=0)
-                
-                num_points_after_camera_downsample = len(combined_points)
-                print(f"  Total points in LiDAR frame (after per-camera downsampling): {num_points_after_camera_downsample} (was {total_points_before_downsample} before)")
+                if all_points_lidar:
+                    # Concatenate all points (already downsampled per camera)
+                    combined_points = np.concatenate(all_points_lidar, axis=0)
+                    combined_colors = None
+                    
+                    if all_colors:
+                        combined_colors = np.concatenate(all_colors, axis=0)
+                    
+                    num_points_after_camera_downsample = len(combined_points)
+                    print(f"  Total points in LiDAR frame (after per-camera downsampling): {num_points_after_camera_downsample} (was {total_points_before_downsample} before)")
 
-                # Apply configurable post-processing pipeline (mmdet3d-style)
-                pipeline_input = {
-                    'points': combined_points,
-                    'colors': combined_colors,
-                    'indices': None,
-                }
-                pipeline_output = run_post_processing_pipeline(
-                    pipeline_input,
+                    # Apply configurable post-processing pipeline (mmdet3d-style)
+                    pipeline_input = {
+                        'points': combined_points,
+                        'colors': combined_colors,
+                        'indices': None,
+                    }
+                    pipeline_output = run_post_processing_pipeline(
+                        pipeline_input,
                 post_pipeline,
-                )
+                    )
 
-                combined_points = pipeline_output.get('points', combined_points)
-                combined_colors = pipeline_output.get('colors', combined_colors)
-                print(f"  Points after pipeline: {len(combined_points)}")
-                
-                # Create point cloud
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(combined_points)
-                
-                if combined_colors is not None:
-                    pcd.colors = o3d.utility.Vector3dVector(combined_colors)
-                
-                print(f"  Total points in LiDAR frame (final): {len(combined_points)}")
-                
-                # Display point cloud in MAIN thread (Open3D/Qt requires main thread)
-                print(f"  Both windows are open. Close both windows to continue...")
-                display_point_cloud(pcd, sample_token, nusc_info['gt_lidar_boxes'])
+                    combined_points = pipeline_output.get('points', combined_points)
+                    combined_colors = pipeline_output.get('colors', combined_colors)
+                    print(f"  Points after pipeline: {len(combined_points)}")
+                    
+                    # Create point cloud
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(combined_points)
+                    
+                    if combined_colors is not None:
+                        pcd.colors = o3d.utility.Vector3dVector(combined_colors)
+                    
+                    print(f"  Total points in LiDAR frame (final): {len(combined_points)}")
+                    
+                    # Display point cloud in MAIN thread (Open3D/Qt requires main thread)
+                    print(f"  Both windows are open. Close both windows to continue...")
+                    display_point_cloud(pcd, sample_token, nusc_info['gt_lidar_boxes'])
+                else:
+                    print(f"  Warning: No valid points to display")
             else:
-                print(f"  Warning: No valid points to display")
-        else:
-            print(f"  Warning: Could not load point cloud for display")
+                print(f"  Warning: Could not load point cloud for display")
+            
+            # Wait for camera images window to close
+            camera_thread.join()
         
-        # Wait for camera images window to close
-        camera_thread.join()
-    
-    return True, prediction
+        return True, prediction
 
 
 def main():

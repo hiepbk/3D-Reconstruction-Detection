@@ -143,7 +143,7 @@ def main():
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
-    
+
     # import modules from string list.
     if cfg.get('custom_imports', None):
         import_modules_from_strings(**cfg['custom_imports'])
@@ -269,7 +269,7 @@ def main():
         # in case we use a dataset wrapper
         if 'dataset' in cfg.data.train:
             val_dataset.pipeline = cfg.data.train.dataset.pipeline
-        else:
+    else:
             val_dataset.pipeline = cfg.data.train.pipeline
         # set test_mode=False here in deep copied config
         # which do not affect AP/AR calculation later
@@ -300,7 +300,7 @@ def main():
     print(f"Distributed: {distributed}")
     print(f"GPU IDs: {cfg.gpu_ids}")
     print(f"{'='*60}\n")
-    
+
     train_model(
         model,
         datasets,

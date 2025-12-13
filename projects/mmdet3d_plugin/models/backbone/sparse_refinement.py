@@ -40,6 +40,7 @@ class BEVHeightOccupancy(BaseModule):
     def __init__(self, 
                  in_channels=256,
                  Unet_channels = [128, 256, 512],
+                 occ_feature_shape = [180, 180, 32], # [X,Y,C] BEV feature of occupancy
                  norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
                  init_cfg=None):
         super(BEVHeightOccupancy, self).__init__(init_cfg=init_cfg)
@@ -49,8 +50,8 @@ class BEVHeightOccupancy(BaseModule):
         # encoder2: 256 -> 512 (stride 2, half size)
         # decoder2: 512 -> 256 (upsample, concat with encoder1's 256 -> 256)
         # decoder1: 256 -> 128 (upsample to original size)
-        # output: 128 -> in_channels
-        
+        # output: 128 -> self.occ_feature_shape[2]
+        self.occ_feature_shape = occ_feature_shape
         # Project input to Unet_channels[0]
         self.input_proj = nn.Conv2d(in_channels, Unet_channels[0], 1)
         
@@ -92,11 +93,35 @@ class BEVHeightOccupancy(BaseModule):
             nn.ReLU(inplace=True),
         )
         
-        # Final output: map back to in_channels with sigmoid for occupancy probability
-        self.occupancy_head = nn.Sequential(
-            nn.Conv2d(Unet_channels[0], in_channels, 1),
-            nn.Sigmoid()  # Output probability in [0, 1]
-        )
+        # Final output: gradually compress channels from Unet_channels[0] to occ_feature_shape[2]
+        # Example: 128 -> 64 -> 32 (gradual compression, not shocking)
+        target_channels = self.occ_feature_shape[2]  # e.g., 32
+        input_channels = Unet_channels[0]  # e.g., 128
+        
+        # Build gradual compression path: divide by 2 until reaching target
+        compression_layers = []
+        current_channels = input_channels
+        
+        while current_channels > target_channels:
+            next_channels = max(current_channels // 2, target_channels)
+            compression_layers.append(
+                nn.Sequential(
+                    nn.Conv2d(current_channels, next_channels, 1),
+                    build_norm_layer(norm_cfg, next_channels)[1],
+                    nn.ReLU(inplace=True),
+                )
+            )
+            current_channels = next_channels
+        
+        # Final layer: ensure we reach exactly target_channels and apply sigmoid
+        if current_channels != target_channels:
+            compression_layers.append(
+                nn.Conv2d(current_channels, target_channels, 1)
+            )
+        
+        self.occupancy_head = nn.Sequential(*compression_layers)
+        self.occupancy_head.add_module('sigmoid', nn.Sigmoid())  # Output probability in [0, 1]
+        
         
     def forward(self, sparse_features: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -105,7 +130,7 @@ class BEVHeightOccupancy(BaseModule):
             sparse_features: (B, C, H, W) input feature map
             
         Returns:
-            occupancy_map: (B, in_channels, H, W) occupancy probability maps
+            occupancy_map: (B, self.occ_feature_shape[2], H, W) occupancy probability maps
         """
         # Project input to Unet_channels[0] (128)
         x = self.input_proj(sparse_features)  # (B, 128, H, W)
@@ -123,7 +148,7 @@ class BEVHeightOccupancy(BaseModule):
         d1 = self.decoder1(d2)  # (B, 128, H, W)
         
         # Final occupancy map: 128 -> in_channels with sigmoid
-        occupancy_map = self.occupancy_head(d1)  # (B, in_channels, H, W)
+        occupancy_map = self.occupancy_head(d1)  # (B, self.occ_feature_shape[2], H, W)
         
         return occupancy_map
 
@@ -145,8 +170,10 @@ class SparseRefinement(nn.Module):
         pts_voxel_encoder: Dict,
         pts_middle_encoder: Dict,
         bev_height_occupancy: Dict,
+        occupancy_voxel_layer: Dict,
         occupancy_voxel_encoder: Dict,
         loss_occupancy: Dict,
+
         loss_weight: float = 1.0,
         use_color: bool = False,
         debug_viz: bool = False,
@@ -158,6 +185,8 @@ class SparseRefinement(nn.Module):
             pts_voxel_encoder: Config for voxel encoder (e.g., HardSimpleVFE)
             pts_middle_encoder: Config for sparse middle encoder (e.g., SparseEncoder)
             bev_height_occupancy: Config for BEV height occupancy layer (e.g., BEVHeightOccupancy)
+            occupancy_voxel_layer: Config for occupancy voxelization layer (e.g., Voxelization)
+            occupancy_voxel_encoder: Config for occupancy voxel encoder (e.g., SoftVoxelOccupancyVFE)
             loss_occupancy: Config for occupancy loss (e.g., OccupancyLoss)
             loss_weight: Weight for the occupancy loss
             use_color: If True, use RGB colors in addition to XYZ
@@ -188,25 +217,8 @@ class SparseRefinement(nn.Module):
         self.bev_height_occupancy = builder.build_middle_encoder(bev_height_occupancy)
         
         
-        
-        # Build occupancy voxelization params (for GT occupancy generation)
-        point_cloud_range = pts_voxel_layer.get('point_cloud_range', None)
-        occ_sparse_shape = occupancy_voxel_encoder.get('occ_sparse_shape', None)
-        if point_cloud_range is None or occ_sparse_shape is None:
-            raise ValueError("point_cloud_range and sparse_shape must be provided for occupancy voxelization")
-
-        # Convert to tensors for arithmetic, then back to list for Voxelization
-        pcr_tensor = torch.tensor(point_cloud_range, dtype=torch.float32)
-        occ_shape_tensor = torch.tensor(occ_sparse_shape, dtype=torch.float32)
-        occ_voxel_size = (pcr_tensor[3:] - pcr_tensor[:3]) / occ_shape_tensor  # (3,)
-        occ_voxel_size = occ_voxel_size.tolist()
-
-        max_num_points = pts_voxel_layer.get('max_num_points', None)
-        max_voxels = pts_voxel_layer.get('max_voxels', None)
-        
-        
+        self.gt_occupancty_layer = self._build_occupancy_voxelization(occupancy_voxel_layer)
         # build the voxelization layer for the occupancy ground truth
-        self.gt_occupancty_layer = Voxelization(occ_voxel_size, point_cloud_range, max_num_points, max_voxels)
         self.gt_occupancty_voxel_encoder = builder.build_voxel_encoder(occupancy_voxel_encoder)
         # Build occupancy loss from config
         self.loss_occupancy = build_loss(loss_occupancy)
@@ -232,6 +244,29 @@ class SparseRefinement(nn.Module):
         self.debug_counter = 0
         
         
+        
+    def _build_occupancy_voxelization(self, occupancy_voxel_layer: Dict) -> Voxelization:
+        """Build occupancy voxelization layer.
+        
+        Args:
+            occupancy_voxel_layer: Config for occupancy voxelization layer (e.g., Voxelization)
+        """
+        
+        point_cloud_range = occupancy_voxel_layer.get('point_cloud_range', None)
+        self.occ_feature_shape = occupancy_voxel_layer.get('occ_feature_shape', None)
+        if point_cloud_range is None or self.occ_feature_shape is None:
+            raise ValueError("point_cloud_range and sparse_shape must be provided for occupancy voxelization")
+
+        # Convert to tensors for arithmetic, then back to list for Voxelization
+        pcr_tensor = torch.tensor(point_cloud_range, dtype=torch.float32)
+        occ_shape_tensor = torch.tensor(self.occ_feature_shape, dtype=torch.float32)
+        occ_voxel_size = (pcr_tensor[3:] - pcr_tensor[:3]) / occ_shape_tensor  # (3,)
+        occ_voxel_size = occ_voxel_size.tolist()
+        
+        # update the occupancy_voxel_layer voxel_size and remove the occ_feature_shape
+        occupancy_voxel_layer['voxel_size'] = occ_voxel_size
+        occupancy_voxel_layer.pop('occ_feature_shape', None)
+        return Voxelization(**occupancy_voxel_layer)
     
     def _voxelize_and_encode(self, points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Voxelize and encode batched point clouds.
@@ -380,16 +415,19 @@ class SparseRefinement(nn.Module):
     def calculate_loss(
         self,
         pseudo_occupancy_map: torch.Tensor,
-        gt_points: torch.Tensor,
+        gt_occupancy_map: torch.Tensor,
     ) -> torch.Tensor:
         """Calculate occupancy loss.
         
         Args:
             pseudo_occupancy_map: (B, in_channels, H, W) pseudo occupancy probability maps
             gt_occupancy_map: (B, in_channels, H, W) GT occupancy probability maps
+        
+        Returns:
+            Loss value
         """
-        gt_occupancy_map = self._generate_gt_occupancy_map(gt_points)
-
+        # gt_occupancy_map is (B, in_channels, H, W) eg. [2, 256, 180, 180]
+        # pseudo_occupancy_map is (B, in_channels, H, W) eg. [2, 256, 180, 180]
         
         return self.loss_occupancy(pseudo_occupancy_map, gt_occupancy_map)
     
@@ -404,10 +442,10 @@ class SparseRefinement(nn.Module):
             batch_size: Batch size
         """
         
-        batch_size = gt_points.shape[0]
+        B = gt_points.shape[0]
         voxels_list, coors_list, num_points_list = [], [], []
         
-        for b in range(batch_size):
+        for b in range(B):
             res = gt_points[b]
             if not res.is_contiguous():
                 res = res.contiguous()
@@ -427,11 +465,86 @@ class SparseRefinement(nn.Module):
             coors_batch.append(coor_pad)
         coors = torch.cat(coors_batch, dim=0)
         
-        
         voxel_occupancy = self.gt_occupancty_voxel_encoder(voxels, num_points, coors)
+        voxel_occupancy_per_batch = torch.split(
+            voxel_occupancy, [c.shape[0] for c in coors_list], dim=0
+        )
+
+        X, Y, C = self.occ_feature_shape
+        gt_occupancy_feature_map = torch.zeros(
+            B, C, Y, X, device=voxel_occupancy.device
+        )
+
+        for b_idx in range(B):
+            coors_b = coors_list[b_idx]                 # (Nb, 3) [z, y, x]
+            occ_b   = voxel_occupancy_per_batch[b_idx] # (Nb, 1)
+
+            z = coors_b[:, 0].long()
+            y = coors_b[:, 1].long()
+            x = coors_b[:, 2].long()
+
+            gt_occupancy_feature_map[b_idx, z, y, x] = occ_b.squeeze(-1)
+
+        return gt_occupancy_feature_map
+
+    def _save_debug_data(
+        self,
+        pseudo_coors: torch.Tensor,
+        gt_points: torch.Tensor,
+        pseudo_occupancy_map: torch.Tensor,
+        gt_occupancy_map: torch.Tensor,
+    ):
+        """Save debug visualization data to pickle file.
         
-        # replace
-        return voxel_occupancy, num_points, coors
+        Args:
+            pseudo_coors: (M, 4) pseudo voxel coordinates [batch, z, y, x]
+            gt_points: (B, N, 3) GT point cloud
+            pseudo_occupancy_map: (B, C, H, W) pseudo occupancy map
+            gt_occupancy_map: (B, C, H, W) GT occupancy map
+        """
+        import os
+        
+        # Create debug directory if it doesn't exist
+        os.makedirs(self.debug_viz_dir, exist_ok=True)
+        
+        # Get GT coors by voxelizing GT points
+        gt_coors = None
+        if gt_points is not None:
+            B = gt_points.shape[0]
+            gt_coors_list = []
+            for b in range(B):
+                res = gt_points[b]
+                if not res.is_contiguous():
+                    res = res.contiguous()
+                if not torch.is_floating_point(res):
+                    res = res.float()
+                _, res_coors, _ = self.voxel_layer(res)
+                # Add batch index
+                coor_pad = F.pad(res_coors, (1, 0), mode='constant', value=b)
+                gt_coors_list.append(coor_pad)
+            if gt_coors_list:
+                gt_coors = torch.cat(gt_coors_list, dim=0)
+        
+        # Prepare data for saving
+        debug_data = {
+            "pseudo_coors": pseudo_coors.detach().cpu() if pseudo_coors is not None else None,
+            "gt_coors": gt_coors.detach().cpu() if gt_coors is not None else None,
+            "pseudo_occupancy_map": pseudo_occupancy_map.detach().cpu() if pseudo_occupancy_map is not None else None,
+            "gt_occupancy_map": gt_occupancy_map.detach().cpu() if gt_occupancy_map is not None else None,
+            "voxel_size": self.voxel_size.cpu().numpy().tolist(),
+            "point_cloud_range": self.point_cloud_range.cpu().numpy().tolist(),
+        }
+        
+        # Save to pickle file
+        self.debug_counter += 1
+        filename = f"debug_iter_{self.debug_counter:06d}.pkl"
+        filepath = os.path.join(self.debug_viz_dir, filename)
+        
+        with open(filepath, "wb") as f:
+            pickle.dump(debug_data, f)
+        
+
+ 
     
     
     
@@ -466,17 +579,32 @@ class SparseRefinement(nn.Module):
             pseudo_voxel_features, pseudo_num_points, pseudo_coors, batch_size
         )
         
-        # Cache pseudo coors for visualization (only if enabled)
-        if self.enable_visual_debug or self.debug_viz:
-            self.last_coors = pseudo_coors.detach().cpu()
-
         # Compute losses if needed
         losses = None
+        gt_occupancy_map = None
         
-        if return_loss and gt_points is not None:
-            # Calculate occupancy loss
-            losses = self.calculate_loss(pseudo_occupancy_map, gt_points)
-
+        # Generate GT occupancy map if we have GT points (needed for loss and/or visualization)
+        if gt_points is not None:
+            gt_occupancy_map = self._generate_gt_occupancy_map(gt_points)
             
-        return _, losses
+            if return_loss:
+                # Calculate occupancy loss (reuse gt_occupancy_map to avoid regenerating)
+                loss_value = self.calculate_loss(pseudo_occupancy_map, gt_occupancy_map)
+                
+                # save the debug data here if viz flag is True
+                if self.debug_viz:
+                    self._save_debug_data(
+                        pseudo_coors=pseudo_coors,
+                        gt_points=gt_points,
+                        pseudo_occupancy_map=pseudo_occupancy_map,
+                        gt_occupancy_map=gt_occupancy_map,
+                    )
+                losses = dict(loss_occupancy=loss_value)
+        
+        
+        # TODO: Implement refined_points generation from occupancy map
+        # For now, return pseudo_points as placeholder
+        refined_points = pseudo_points
+        
+        return refined_points, losses
 
