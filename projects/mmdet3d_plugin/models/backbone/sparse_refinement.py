@@ -591,8 +591,8 @@ class SparseRefinement(nn.Module):
                 # Calculate occupancy loss (reuse gt_occupancy_map to avoid regenerating)
                 loss_value = self.calculate_loss(pseudo_occupancy_map, gt_occupancy_map)
                 
-                # save the debug data here if viz flag is True
-                if self.debug_viz:
+                # save the debug data here if viz flag is True and debug_counter is divisible by 300
+                if self.debug_viz and self.debug_counter % 300 == 0:
                     self._save_debug_data(
                         pseudo_coors=pseudo_coors,
                         gt_points=gt_points,

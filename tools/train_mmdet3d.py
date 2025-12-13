@@ -269,7 +269,7 @@ def main():
         # in case we use a dataset wrapper
         if 'dataset' in cfg.data.train:
             val_dataset.pipeline = cfg.data.train.dataset.pipeline
-    else:
+        else:
             val_dataset.pipeline = cfg.data.train.pipeline
         # set test_mode=False here in deep copied config
         # which do not affect AP/AR calculation later
