@@ -9,13 +9,27 @@ import open3d as o3d
 CROP_SIZE = None
 
 # Channel to visualize (None = all channels, otherwise specific channel index)
-OCCUPANCY_CHANNEL = None
+OCCUPANCY_CHANNEL = 16
+
+# Occupancy threshold: minimum probability to visualize a voxel (0.0-1.0)
+OCCUPANCY_THRESHOLD = 0.9
 
 # Probability ranges for intensity (0.0-0.1, 0.1-0.2, ..., 0.9-1.0)
 PROB_RANGES = [(i * 0.1, (i + 1) * 0.1) for i in range(10)]
 # Intensity: lower probability = darker color (appears more transparent)
 # Range: 0.1 (very dark/transparent) to 1.0 (full brightness/opaque)
 INTENSITY_MAP = [0.1 + i * 0.09 for i in range(10)]  # 0.1 to 1.0
+
+
+DISPLAY_FLAGS = {
+    "pseudo_coors": False,
+    "gt_coors": False,
+    "pseudo_occupancy_map": True,
+    "gt_occupancy_map": True,
+    
+}
+
+
 
 
 def _make_voxel_mesh(voxel_indices: np.ndarray, voxel_size: np.ndarray, pcr: np.ndarray, 
@@ -343,17 +357,59 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
         occ_voxel_size = voxel_size
     
     # Convert occupancy maps to voxel meshes with intensity-based transparency
-    # Only visualize voxels above threshold (0.05) to avoid heavy rendering
-    threshold = 0.05
+    # Only visualize voxels above threshold to avoid heavy rendering
+    threshold = OCCUPANCY_THRESHOLD
     
-    # Temporarily skip pseudo occupancy visualization
-    # pseudo_voxel_groups, pseudo_num_non_empty = occupancy_channel_to_voxels(
-    #     pseudo_occupancy_map, channel_idx, pcr, voxel_size, 
-    #     PROB_RANGES, INTENSITY_MAP, threshold=threshold
-    # )
+    # Process pseudo occupancy map if flag is enabled
+    pseudo_voxel_groups = []
+    total_pseudo_non_empty = 0
+    if DISPLAY_FLAGS.get("pseudo_occupancy_map", True) and pseudo_occupancy_map is not None:
+        occ_np = np.asarray(pseudo_occupancy_map)
+        if occ_np.ndim == 4:
+            B, C, H, W = occ_np.shape
+            if channel_idx is None:
+                # Process all channels
+                print(f"  Visualizing ALL {C} channels of pseudo occupancy map")
+                print(f"  Occupancy threshold: {threshold}")
+                for ch_idx in range(C):
+                    groups, num_non_empty = occupancy_channel_to_voxels(
+                        pseudo_occupancy_map, ch_idx, pcr, occ_voxel_size,
+                        PROB_RANGES, INTENSITY_MAP, threshold=threshold
+                    )
+                    pseudo_voxel_groups.extend([(ch_idx, g) for g in groups])
+                    total_pseudo_non_empty += num_non_empty
+                    
+                    if ch_idx < 5 or ch_idx % 50 == 0 or ch_idx == C - 1:
+                        total_voxels = sum(len(voxels) for voxels, _, _, _ in groups)
+                        print(f"    Channel {ch_idx}: {num_non_empty} non-empty voxels, {total_voxels} to visualize")
+            else:
+                # Process specific channel
+                if channel_idx >= C:
+                    print(f"  Warning: channel_idx {channel_idx} >= C {C}, using channel {C-1}")
+                    channel_idx = C - 1
+                print(f"  Visualizing channel {channel_idx} of pseudo occupancy map")
+                print(f"  Occupancy threshold: {threshold}")
+                groups, num_non_empty = occupancy_channel_to_voxels(
+                    pseudo_occupancy_map, channel_idx, pcr, occ_voxel_size,
+                    PROB_RANGES, INTENSITY_MAP, threshold=threshold
+                )
+                pseudo_voxel_groups = [(channel_idx, g) for g in groups]
+                total_pseudo_non_empty = num_non_empty
+                total_voxels = sum(len(voxels) for voxels, _, _, _ in groups)
+                print(f"    Channel {channel_idx}: {num_non_empty} non-empty voxels, {total_voxels} to visualize")
+            
+            if channel_idx is None:
+                print(f"  Total pseudo occupancy - Non-empty voxels (>{threshold}): {total_pseudo_non_empty}")
+            else:
+                print(f"  Pseudo occupancy channel {channel_idx} - Non-empty voxels (>{threshold}): {total_pseudo_non_empty}")
+            total_pseudo_voxels = sum(
+                len(voxel_indices) for _, (voxel_indices, _, _, _) in pseudo_voxel_groups
+            )
+            print(f"  Total pseudo voxels to visualize: {total_pseudo_voxels}")
     
-    # Visualize GT occupancy map (all channels or specific channel)
-    if gt_occupancy_map is not None:
+    # Visualize GT occupancy map (all channels or specific channel) if flag is enabled
+    all_gt_voxel_groups = []
+    if DISPLAY_FLAGS.get("gt_occupancy_map", True) and gt_occupancy_map is not None:
         occ_np = np.asarray(gt_occupancy_map)
         if occ_np.ndim == 4:
             B, C, H, W = occ_np.shape
@@ -378,7 +434,7 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
             
             for ch_idx in channels_to_vis:
                 gt_voxel_groups, gt_num_non_empty = occupancy_channel_to_voxels(
-                    gt_occupancy_map, ch_idx, pcr, voxel_size,
+                    gt_occupancy_map, ch_idx, pcr, occ_voxel_size,
                     PROB_RANGES, INTENSITY_MAP, threshold=threshold
                 )
                 all_gt_voxel_groups.append((ch_idx, gt_voxel_groups, gt_num_non_empty))
@@ -395,11 +451,12 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
             )
             print(f"  Total GT voxels to visualize: {total_gt_voxels}")
         else:
-            all_gt_voxel_groups = []
             print(f"  GT occupancy map has wrong shape: {occ_np.shape}")
     else:
-        all_gt_voxel_groups = []
-        print(f"  GT occupancy map is None")
+        if not DISPLAY_FLAGS.get("gt_occupancy_map", True):
+            print(f"  GT occupancy map visualization disabled by DISPLAY_FLAGS")
+        else:
+            print(f"  GT occupancy map is None")
     
     sys.stdout.flush()
     
@@ -421,64 +478,49 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
     vis.add_geometry(ls_bbox)
     
     # Add non-empty voxels from coors (wireframes or center points)
-    if coors_mode == "voxel":
-        # Draw wireframe boxes
-        if pseudo_coors is not None:
-            pseudo_lines, pseudo_colors = _make_voxel_lines(pseudo_coors, voxel_size, pcr, (1, 0.5, 0))  # Orange
-            if pseudo_lines is not None:
-                ls_p = o3d.geometry.LineSet()
-                pts = pseudo_lines.reshape(-1, 3)
-                lines_idx = np.arange(len(pts), dtype=np.int32).reshape(-1, 2)
-                ls_p.points = o3d.utility.Vector3dVector(pts)
-                ls_p.lines = o3d.utility.Vector2iVector(lines_idx)
-                ls_p.colors = o3d.utility.Vector3dVector(np.tile(pseudo_colors[0:1], (lines_idx.shape[0], 1)))
-                vis.add_geometry(ls_p)
+    if DISPLAY_FLAGS.get("pseudo_coors", True) or DISPLAY_FLAGS.get("gt_coors", True):
+        if coors_mode == "voxel":
+            # Draw wireframe boxes
+            if DISPLAY_FLAGS.get("pseudo_coors", True) and pseudo_coors is not None:
+                pseudo_lines, pseudo_colors = _make_voxel_lines(pseudo_coors, voxel_size, pcr, (1, 0.5, 0))  # Orange
+                if pseudo_lines is not None:
+                    ls_p = o3d.geometry.LineSet()
+                    pts = pseudo_lines.reshape(-1, 3)
+                    lines_idx = np.arange(len(pts), dtype=np.int32).reshape(-1, 2)
+                    ls_p.points = o3d.utility.Vector3dVector(pts)
+                    ls_p.lines = o3d.utility.Vector2iVector(lines_idx)
+                    ls_p.colors = o3d.utility.Vector3dVector(np.tile(pseudo_colors[0:1], (lines_idx.shape[0], 1)))
+                    vis.add_geometry(ls_p)
+            
+            if DISPLAY_FLAGS.get("gt_coors", True) and gt_coors is not None:
+                gt_lines, gt_colors = _make_voxel_lines(gt_coors, voxel_size, pcr, (0, 0.5, 1))  # Blue
+                if gt_lines is not None:
+                    ls_g = o3d.geometry.LineSet()
+                    pts = gt_lines.reshape(-1, 3)
+                    lines_idx = np.arange(len(pts), dtype=np.int32).reshape(-1, 2)
+                    ls_g.points = o3d.utility.Vector3dVector(pts)
+                    ls_g.lines = o3d.utility.Vector2iVector(lines_idx)
+                    ls_g.colors = o3d.utility.Vector3dVector(np.tile(gt_colors[0:1], (lines_idx.shape[0], 1)))
+                    vis.add_geometry(ls_g)
         
-        if gt_coors is not None:
-            gt_lines, gt_colors = _make_voxel_lines(gt_coors, voxel_size, pcr, (0, 0.5, 1))  # Blue
-            if gt_lines is not None:
-                ls_g = o3d.geometry.LineSet()
-                pts = gt_lines.reshape(-1, 3)
-                lines_idx = np.arange(len(pts), dtype=np.int32).reshape(-1, 2)
-                ls_g.points = o3d.utility.Vector3dVector(pts)
-                ls_g.lines = o3d.utility.Vector2iVector(lines_idx)
-                ls_g.colors = o3d.utility.Vector3dVector(np.tile(gt_colors[0:1], (lines_idx.shape[0], 1)))
-                vis.add_geometry(ls_g)
-    
-    elif coors_mode == "point":
-        # Draw center points only
-        if pseudo_coors is not None:
-            pcd_pseudo = _make_voxel_center_points(pseudo_coors, voxel_size, pcr, (1, 0.5, 0))  # Orange
-            if pcd_pseudo is not None:
-                vis.add_geometry(pcd_pseudo)
-        
-        if gt_coors is not None:
-            pcd_gt = _make_voxel_center_points(gt_coors, voxel_size, pcr, (0, 0.5, 1))  # Blue
-            if pcd_gt is not None:
-                vis.add_geometry(pcd_gt)
+        elif coors_mode == "point":
+            # Draw center points only
+            if DISPLAY_FLAGS.get("pseudo_coors", True) and pseudo_coors is not None:
+                pcd_pseudo = _make_voxel_center_points(pseudo_coors, voxel_size, pcr, (1, 0.5, 0))  # Orange
+                if pcd_pseudo is not None:
+                    vis.add_geometry(pcd_pseudo)
+            
+            if DISPLAY_FLAGS.get("gt_coors", True) and gt_coors is not None:
+                pcd_gt = _make_voxel_center_points(gt_coors, voxel_size, pcr, (0, 0.5, 1))  # Blue
+                if pcd_gt is not None:
+                    vis.add_geometry(pcd_gt)
     
     # Add occupancy-based voxel wireframes (lines) for better performance
-    # Temporarily skip pseudo occupancy visualization
-    # if pseudo_voxel_groups:
-    #     for voxel_indices, intensity, min_prob, max_prob in pseudo_voxel_groups:
-    #         # Adjust color intensity based on probability
-    #         color = tuple(c * intensity for c in (1.0, 0.0, 0.0))  # Red for pseudo
-    #         lines, colors = _make_voxel_lines(voxel_indices, voxel_size, pcr, color)
-    #         if lines is not None:
-    #             ls = o3d.geometry.LineSet()
-    #             pts = lines.reshape(-1, 3)
-    #             lines_idx = np.arange(len(pts), dtype=np.int32).reshape(-1, 2)
-    #             ls.points = o3d.utility.Vector3dVector(pts)
-    #             ls.lines = o3d.utility.Vector2iVector(lines_idx)
-    #             ls.colors = o3d.utility.Vector3dVector(np.tile(colors[0:1], (lines_idx.shape[0], 1)))
-    #             vis.add_geometry(ls)
-    
-    # Add occupancy-based voxel wireframes for ALL channels of GT occupancy map (Green)
-    # Use occupancy voxel size (not original voxel size)
-    for ch_idx, gt_voxel_groups, _ in all_gt_voxel_groups:
-        for voxel_indices, intensity, min_prob, max_prob in gt_voxel_groups:
+    # Pseudo occupancy map visualization
+    if DISPLAY_FLAGS.get("pseudo_occupancy_map", True) and pseudo_voxel_groups:
+        for ch_idx, (voxel_indices, intensity, min_prob, max_prob) in pseudo_voxel_groups:
             # Adjust color intensity based on probability
-            color = tuple(c * intensity for c in (0.0, 1.0, 0.0))  # Green for GT
+            color = tuple(c * intensity for c in (1.0, 0.0, 0.0))  # Red for pseudo
             # Use occupancy voxel size for visualization (occupancy grid coordinates)
             lines, colors = _make_voxel_lines(voxel_indices, occ_voxel_size, pcr, color)
             if lines is not None:
@@ -489,6 +531,23 @@ def visualize_file(path: str, channel_idx: int = OCCUPANCY_CHANNEL, coors_mode: 
                 ls.lines = o3d.utility.Vector2iVector(lines_idx)
                 ls.colors = o3d.utility.Vector3dVector(np.tile(colors[0:1], (lines_idx.shape[0], 1)))
                 vis.add_geometry(ls)
+    
+    # GT occupancy map visualization
+    if DISPLAY_FLAGS.get("gt_occupancy_map", True):
+        for ch_idx, gt_voxel_groups, _ in all_gt_voxel_groups:
+            for voxel_indices, intensity, min_prob, max_prob in gt_voxel_groups:
+                # Adjust color intensity based on probability
+                color = tuple(c * intensity for c in (0.0, 1.0, 0.0))  # Green for GT
+                # Use occupancy voxel size for visualization (occupancy grid coordinates)
+                lines, colors = _make_voxel_lines(voxel_indices, occ_voxel_size, pcr, color)
+                if lines is not None:
+                    ls = o3d.geometry.LineSet()
+                    pts = lines.reshape(-1, 3)
+                    lines_idx = np.arange(len(pts), dtype=np.int32).reshape(-1, 2)
+                    ls.points = o3d.utility.Vector3dVector(pts)
+                    ls.lines = o3d.utility.Vector2iVector(lines_idx)
+                    ls.colors = o3d.utility.Vector3dVector(np.tile(colors[0:1], (lines_idx.shape[0], 1)))
+                    vis.add_geometry(ls)
     
     # Note: Using color intensity to represent probability/transparency
     # Lower intensity = darker color = appears more transparent
@@ -502,7 +561,7 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize occupancy maps with transparency.")
     parser.add_argument("--dir", default="work_dirs/resdet3d_nuscenes_mini/debug_viz", 
                        type=str, required=True, help="Directory containing *.pkl debug files.")
-    parser.add_argument("--coors-mode", type=str, default="point", choices=["voxel", "point"],
+    parser.add_argument("--coors-mode", type=str, default="voxel", choices=["voxel", "point"],
                        help="Visualization mode for coors: 'voxel' (wireframe boxes) or 'point' (center points only)")
     args = parser.parse_args()
     
