@@ -82,3 +82,6 @@ data/
 *.manifest.in
 *.manifest.in.in
 
+# Local third-party research repos (not tracked)
+/projects/mmdet3d_plugin/models/backbone/ShapeFormer/
+

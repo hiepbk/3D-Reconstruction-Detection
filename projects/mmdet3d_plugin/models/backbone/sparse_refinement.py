@@ -400,6 +400,7 @@ class SparseRefinement(nn.Module):
             gt_voxel_features, gt_coors, batch_size
         )
         
+        
         refined_features, refined_indices, transformer_losses = self.pattern_adaptation(
             pseudo_sparse_features=pseudo_sparse_features,
             pseudo_sparse_indices=pseudo_sparse_indices,

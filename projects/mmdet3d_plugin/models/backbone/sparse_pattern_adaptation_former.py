@@ -58,70 +58,148 @@ def sort_by_row_major(
     return features[sort_idx], indices[sort_idx], coord_ids[sort_idx]
 
 
-class DecoderOnlyTransformer(nn.Module):
-    """Decoder-only transformer block (GPT-style) with causal self-attention.
+class SparseSwin3D(nn.Module):
+    """Window-based local self-attention on a 3D grid (Swin-style, with optional shift).
+    
+    Operates on sparse tokens laid out on a regular grid. For each window,
+    self-attention is computed only among tokens inside that window, so the
+    attention matrix is at most (Wh*Ww)^2 instead of T^2.
+    
+    A simple shifted-window variant is implemented: odd layers use a cyclic
+    shift of (Sh, Sw) before windowing, even layers use no shift. Given our
+    grid is effectively 2D with D=1, only Y/X are shifted.
     
     Args:
-        d_model: Model dimension
-        nhead: Number of attention heads
-        num_layers: Number of transformer layers
-        dim_feedforward: Feedforward dimension
-        dropout: Dropout rate
-        activation: Activation function
+        d_model: Feature dimension.
+        nhead: Number of attention heads.
+        num_layers: Number of stacked Swin blocks.
+        window_size: (Wh, Ww) window size in grid cells (D dimension is assumed 1).
+        shift_size: (Sh, Sw) shift size; if None, defaults to half window.
+        dropout: Dropout rate.
+        dim_feedforward: FFN hidden dimension.
     """
-    
+
     def __init__(
         self,
         d_model: int = 512,
         nhead: int = 8,
-        num_layers: int = 6,
-        dim_feedforward: int = 2048,
+        num_layers: int = 2,
+        window_size: Tuple[int, int] = (8, 8),
+        shift_size: Optional[Tuple[int, int]] = None,
         dropout: float = 0.1,
-        activation: str = 'gelu',
+        dim_feedforward: int = 2048,
     ):
         super().__init__()
-        
         self.d_model = d_model
-        
-        # Build decoder layers (causal self-attention only)
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation=activation,
-            batch_first=True,
-            norm_first=True,
-        )
-        self.layers = nn.ModuleList([decoder_layer for _ in range(num_layers)])
-    
+        self.window_h, self.window_w = window_size
+        if shift_size is None:
+            self.shift_h, self.shift_w = self.window_h // 2, self.window_w // 2
+        else:
+            self.shift_h, self.shift_w = shift_size
+        self.num_layers = num_layers
+
+        self.attn_blocks = nn.ModuleList()
+        self.ffn_blocks = nn.ModuleList()
+        self.norm1 = nn.ModuleList()
+        self.norm2 = nn.ModuleList()
+
+        for _ in range(num_layers):
+            self.attn_blocks.append(
+                nn.MultiheadAttention(
+                    embed_dim=d_model,
+                    num_heads=nhead,
+                    dropout=dropout,
+                    batch_first=True,
+                )
+            )
+            self.ffn_blocks.append(
+                nn.Sequential(
+                    nn.Linear(d_model, dim_feedforward),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(dim_feedforward, d_model),
+                    nn.Dropout(dropout),
+                )
+            )
+            self.norm1.append(nn.LayerNorm(d_model))
+            self.norm2.append(nn.LayerNorm(d_model))
+
+    def _compute_window_ids(
+        self,
+        coord_ids: torch.Tensor,
+        grid_shape: List[int],
+        shift: bool = False,
+    ) -> torch.Tensor:
+        """Compute window id for each token based on its 3D grid coordinate."""
+        D, H, W = grid_shape
+        # coord_ids are flattened; convert back to (z,y,x)
+        z = coord_ids // (H * W)
+        rem = coord_ids % (H * W)
+        y = rem // W
+        x = rem % W
+
+        if shift:
+            # cyclic shift on Y/X (D is 1 so we skip Z)
+            y = (y + self.shift_h) % H
+            x = (x + self.shift_w) % W
+
+        win_y = y // self.window_h
+        win_x = x // self.window_w
+        num_win_y = (H + self.window_h - 1) // self.window_h
+        window_id = win_y * num_win_y + win_x  # (T,)
+        return window_id
+
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        coord_ids: torch.Tensor,
+        grid_shape: List[int],
     ) -> torch.Tensor:
-        """Forward pass with causal self-attention.
+        """Windowed self-attention.
         
         Args:
-            x: (B, T, d_model) input sequence
-            attn_mask: (T, T) causal mask (optional, will be created if None)
+            x: (B, T, d_model) token features.
+            coord_ids: (T,) flattened coordinate IDs for each token.
+            grid_shape: [D, H, W] grid shape.
         
         Returns:
-            output: (B, T, d_model) output sequence
+            x_out: (B, T, d_model) refined features.
         """
-        B, T, _ = x.shape
-        
-        # Create causal mask if not provided
-        if attn_mask is None:
-            # Causal mask: upper triangular (True = masked, cannot attend)
-            # Lower triangular (False = can attend to past and present)
-            attn_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-        
-        # Apply decoder layers (self-attention only, no cross-attention)
-        # Use memory=x for self-attention (query, key, value all from x)
-        for layer in self.layers:
-            x = layer(x, x, tgt_mask=attn_mask)  # self-attention: query=x, key=x, value=x
-        
+        assert x.dim() == 3, "Expected (B, T, C)"
+        B, T, C = x.shape
+        assert B == 1, "SparseSwin3D currently assumes batch size = 1 (handled per batch outside)."
+
+        for layer_idx in range(self.num_layers):
+            apply_shift = (layer_idx % 2 == 1) and (self.shift_h > 0 or self.shift_w > 0)
+            window_id = self._compute_window_ids(coord_ids, grid_shape, shift=apply_shift)  # (T,)
+            attn = self.attn_blocks[layer_idx]
+            ffn = self.ffn_blocks[layer_idx]
+            norm1 = self.norm1[layer_idx]
+            norm2 = self.norm2[layer_idx]
+
+            # Pre-norm
+            x_ln = norm1(x)
+            x_new = x.clone()
+
+            # Process each window independently
+            unique_windows = torch.unique(window_id)
+            for wid in unique_windows:
+                mask = window_id == wid
+                if not mask.any():
+                    continue
+                idx = mask.nonzero(as_tuple=False).squeeze(-1)  # (Tw,)
+                if idx.numel() == 0:
+                    continue
+
+                tokens = x_ln[:, idx, :]  # (1, Tw, C)
+                # MultiheadAttention expects (B, Tw, C) when batch_first=True
+                attn_out, _ = attn(tokens, tokens, tokens, need_weights=False)
+                x_new[:, idx, :] = x_new[:, idx, :] + attn_out
+
+            # FFN with residual
+            x_ffn_ln = norm2(x_new)
+            x = x_new + ffn(x_ffn_ln)
+
         return x
 
 
@@ -164,7 +242,7 @@ class SparsePatternAdaptationFormer(nn.Module):
         codebook_size: int = 4096,
         codebook_dim: int = 128,
         commitment_cost: float = 0.25,
-        spatial_shape: List[int] = [2, 180, 180],
+        grid_shape: List[int] = [64, 64, 64],
         max_seq_length: int = 10000,
     ):
         super().__init__()
@@ -172,10 +250,10 @@ class SparsePatternAdaptationFormer(nn.Module):
         self.d_model = d_model
         self.codebook_size = codebook_size
         self.codebook_dim = codebook_dim
-        self.spatial_shape = spatial_shape
+        self.grid_shape = grid_shape
         self.max_seq_length = max_seq_length
         
-        D, H, W = spatial_shape
+        D, H, W = grid_shape
         self.max_coord_id = D * H * W  # Maximum coordinate ID (for coordinate vocabulary)
         
         # Vector Quantization codebook
@@ -197,24 +275,24 @@ class SparsePatternAdaptationFormer(nn.Module):
         # Input projection: combine coord and value embeddings
         self.input_proj = nn.Linear(d_model * 2, d_model)  # coord + value -> d_model
         
-        # Coordinate Transformer: predicts next coordinate
-        self.coord_transformer = DecoderOnlyTransformer(
+        # Coordinate Transformer: predicts next coordinate (windowed attention)
+        self.coord_transformer = SparseSwin3D(
             d_model=d_model,
             nhead=nhead,
             num_layers=num_coord_layers,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            activation=activation,
+            window_size=(8, 8),
         )
         
-        # Value Transformer: predicts codebook index given coordinate
-        self.value_transformer = DecoderOnlyTransformer(
+        # Value Transformer: predicts codebook index given coordinate (windowed attention)
+        self.value_transformer = SparseSwin3D(
             d_model=d_model,
             nhead=nhead,
             num_layers=num_value_layers,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            activation=activation,
+            window_size=(8, 8),
         )
         
         # Output heads
@@ -268,6 +346,10 @@ class SparsePatternAdaptationFormer(nn.Module):
         return_loss: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         """Parent forward: dispatch to train/test paths based on return_loss."""
+        
+        
+        assert self.grid_shape == spatial_shape, "Grid shape mismatch"
+        
         if return_loss:
             return self.forward_train(
                 pseudo_sparse_features=pseudo_sparse_features,
@@ -293,7 +375,7 @@ class SparsePatternAdaptationFormer(nn.Module):
         """Training forward: shared pseudo ops + per-batch train."""
         device = pseudo_sparse_features.device
         # Always use model-configured spatial shape to keep coord ids in range
-        spatial_shape_model = self.spatial_shape
+        spatial_shape_model = self.grid_shape
 
         batch_indices = pseudo_sparse_indices[:, 0].long()
         unique_batches = torch.unique(batch_indices).tolist()
@@ -359,12 +441,12 @@ class SparsePatternAdaptationFormer(nn.Module):
             seq_pos_ids = torch.arange(len(seq_coords), device=device).clamp(max=self.max_seq_length - 1)
 
             seq_embedded = self._embed_tokens(seq_coords, seq_values, seq_pos_ids).unsqueeze(0)
-            coord_hidden = self.coord_transformer(seq_embedded)
+            coord_hidden = self.coord_transformer(seq_embedded, seq_coords, spatial_shape_model)
             coord_logits = self.coord_head(coord_hidden)
 
             coord_emb_for_value = self.coord_embed(seq_coords).unsqueeze(0)
             value_input = coord_hidden + coord_emb_for_value
-            value_hidden = self.value_transformer(value_input)
+            value_hidden = self.value_transformer(value_input, seq_coords, spatial_shape_model)
             value_logits = self.value_head(value_hidden)
 
             pseudo_len = len(pseudo_coord_ids) + 1  # include END
@@ -415,7 +497,7 @@ class SparsePatternAdaptationFormer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         """Inference forward: shared pseudo ops + per-batch test."""
         device = pseudo_sparse_features.device
-        spatial_shape_model = self.spatial_shape
+        spatial_shape_model = self.grid_shape
 
         batch_indices = pseudo_sparse_indices[:, 0].long()
         unique_batches = torch.unique(batch_indices).tolist()
@@ -458,7 +540,7 @@ class SparsePatternAdaptationFormer(nn.Module):
                 seq_pos_ids = torch.arange(len(seq_coords), device=device).clamp(max=self.max_seq_length - 1)
                 seq_embedded = self._embed_tokens(seq_coords, seq_values, seq_pos_ids).unsqueeze(0)
 
-                coord_hidden = self.coord_transformer(seq_embedded)
+                coord_hidden = self.coord_transformer(seq_embedded, seq_coords, spatial_shape_model)
                 coord_logits = self.coord_head(coord_hidden[:, -1:, :])
                 coord_probs = F.softmax(coord_logits, dim=-1)
                 next_coord = torch.multinomial(coord_probs.view(-1), 1)[0].item()
@@ -467,7 +549,7 @@ class SparsePatternAdaptationFormer(nn.Module):
 
                 coord_emb = self.coord_embed(torch.tensor([next_coord], device=device)).unsqueeze(0)
                 value_input_seq = coord_hidden[:, -1:, :] + coord_emb
-                value_hidden = self.value_transformer(value_input_seq)
+                value_hidden = self.value_transformer(value_input_seq, torch.tensor([next_coord], device=device), spatial_shape_model)
                 value_logits = self.value_head(value_hidden)
                 value_probs = F.softmax(value_logits, dim=-1)
                 next_value = torch.multinomial(value_probs.view(-1), 1)[0].item()

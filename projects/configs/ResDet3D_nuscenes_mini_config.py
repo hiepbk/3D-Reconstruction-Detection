@@ -250,9 +250,9 @@ model = dict(
                 type='SparseEncoderV2',
                 in_channels=3,  # Should match num_features in voxel_encoder
                 sparse_shape=[41, 1440, 1440],  # [Z, Y, X] calculated from point_cloud_range and voxel_size
-                output_channels=64,
+                output_channels=256,
                 order=('conv', 'norm', 'act'),
-                encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128, 64), (64,64)),
+                encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128, 256), (256,256)),
                 encoder_strides=((1, 1, 2), (1, 1, 2), (1, 1, 2), (1, 1, 3), (1, 1)),
                 encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, [0, 6, 6]), (0, 0, 0)),
                 block_type='basicblock',
@@ -308,11 +308,10 @@ model = dict(
                 dropout=0.1,
                 activation='gelu',  # GELU for better transformer performance
                 codebook_size=4096,  # Vocabulary size for VQ codebook
-                codebook_dim=64,  # Feature dimension (matches sparse encoder output)
+                codebook_dim=256,  # Feature dimension (matches sparse encoder output)
                 commitment_cost=0.25,  # Weight for VQ commitment loss
-                # spatial_shape=[2, 180, 180],  # [D, H, W] spatial shape
-                spatial_shape=[1, 64, 64],
-                max_seq_length=1024,  # Maximum sequence length for generation
+                grid_shape=[1, 64, 64], # [D, H, W] spatial shape
+                max_seq_length=2048,  # Maximum sequence length for generation
             ),
             # Losses are handled internally by transformer (loss_coord, loss_value, loss_vq)
             # Optional auxiliary losses (can be None)
