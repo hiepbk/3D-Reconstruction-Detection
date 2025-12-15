@@ -388,27 +388,37 @@ class ReconstructionBackbone(nn.Module):
     def _padding_samples(
         self,
         pseudo_points: List[torch.Tensor],
-        gt_points: List[torch.Tensor],
+        gt_points: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Pad pseudo and GT point clouds in the batch to the same number of points.
         
         Returns batched tensors with unified point count: (B, N, C).
         """
-        assert len(pseudo_points) == len(gt_points), "Pseudo and GT points must have the same batch size"
+        if gt_points is not None:
+            assert len(pseudo_points) == len(gt_points), "Pseudo and GT points must have the same batch size"
         batch_size = len(pseudo_points)
 
         # Determine target number of points across pseudo and gt
         max_num_points = max(len(pseudo_points[i]) for i in range(batch_size))
-        max_num_points_gt = max(len(gt_points[i]) for i in range(batch_size))
-        target_num_points = max(max_num_points, max_num_points_gt)
+        if gt_points is not None:
+            max_num_points_gt = max(len(gt_points[i]) for i in range(batch_size))
+            target_num_points = max(max_num_points, max_num_points_gt)
+        else:
+            target_num_points = max_num_points
 
         # Pad to target size
         padded_pseudo_points = self._pad_point_clouds(pseudo_points, target_num_points)
-        padded_gt_points = self._pad_point_clouds(gt_points, target_num_points)
+        if gt_points is not None:
+            padded_gt_points = self._pad_point_clouds(gt_points, target_num_points)
+        else:
+            padded_gt_points = None
 
         # Stack to tensors (B, N, C)
         padded_pseudo_points = torch.stack(padded_pseudo_points, dim=0)
-        padded_gt_points = torch.stack(padded_gt_points, dim=0)
+        if gt_points is not None:
+            padded_gt_points = torch.stack(padded_gt_points, dim=0)
+        else:
+            padded_gt_points = None
 
         return padded_pseudo_points, padded_gt_points
 
@@ -494,7 +504,7 @@ class ReconstructionBackbone(nn.Module):
         img_metas: List[Dict],
         return_loss: bool = False,
         points: Optional[torch.Tensor] = None,  # GT point cloud for training
-    ) -> Tuple[List[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
+    ) -> Tuple[dict, Optional[Dict[str, torch.Tensor]]]:
         """Forward pass: generate point cloud from images.
         
         Routes to forward_train or forward_test based on return_loss flag.
@@ -507,8 +517,7 @@ class ReconstructionBackbone(nn.Module):
             points: Ground truth point clouds (B, N, 3) or list of (N, 3) tensors for training
         
         Returns:
-            batch_point_clouds: List of point cloud tensors, one per batch item
-                Each tensor has shape (N_points, 3) or (N_points, 6) if colors included
+            pts_feat: Dict of refined point cloud features and indices
             losses: Dict of loss values (if return_loss=True and refinement enabled)
         """
         if return_loss:
@@ -521,7 +530,7 @@ class ReconstructionBackbone(nn.Module):
         img: torch.Tensor,
         img_metas: List[Dict],
         points: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
+    ) -> Tuple[dict, Optional[Dict[str, torch.Tensor]]]:
         """Forward pass for training mode.
         
         Args:
@@ -530,7 +539,7 @@ class ReconstructionBackbone(nn.Module):
             points: Ground truth point clouds (B, N, 3) or list of (N, 3) tensors
         
         Returns:
-            batch_point_clouds: List of refined point cloud tensors
+            pts_feat: Dict of refined point cloud features and indices
             losses: Dict of loss values (if refinement enabled)
         """
         
@@ -544,7 +553,11 @@ class ReconstructionBackbone(nn.Module):
         multi_batch_ori_imgs = self._extract_images_from_data(img)
         B, N, C, H, W = multi_batch_ori_imgs.shape
         
-        batch_point_clouds = []
+        pts_feat = dict(
+            features=None,
+            indices=None,
+        )
+        losses = None
 
         # Run DA3 forward once for the whole batch
         imgs_processed, _, _ = self.input_processor(
@@ -660,35 +673,33 @@ class ReconstructionBackbone(nn.Module):
             #     display_point_cloud(pseudo_points_list[b_idx].cpu().numpy(), colors=pseudo_points_list[b_idx].cpu().numpy()[:, 3:], gt_bboxes_3d=None)
                 
             # Apply refinement in batch mode (if enabled)
-            if self.refinement is not None:
-                # Refine entire batch at once
-                if gt_points_list is None:
-                    raise ValueError("GT points are required for refinement")
 
-                # Pad pseudo and GT to the same number of points per batch
-                padded_pseudo, padded_gt = self._padding_samples(pseudo_points_list, gt_points_list)
+            # Refine entire batch at once
+            if gt_points_list is None:
+                raise ValueError("GT points are required for refinement")
 
-                refined_batch, refinement_losses = self.refinement(
-                    pseudo_points=padded_pseudo,  # (B, N, C) tensor
-                    gt_points=padded_gt,         # (B, N, C) tensor
-                    return_loss=True,            # Always compute loss in training
-                )
-                
-                # refined_batch is (B, N, C) tensor, convert to list
-                batch_point_clouds = [refined_batch[i] for i in range(refined_batch.shape[0])]
-                losses = refinement_losses
-            else:
-                # No refinement, convert batch tensor to list
-                batch_point_clouds = [pseudo_points_list[i] for i in range(B)]
-                losses = None
+            # Pad pseudo and GT to the same number of points per batch
+            padded_pseudo, padded_gt = self._padding_samples(pseudo_points_list, gt_points_list)
+
+            refined_features, refined_indices, refinement_losses = self.refinement(
+                pseudo_points=padded_pseudo,  # (B, N, C) tensor
+                gt_points=padded_gt,         # (B, N, C) tensor
+                return_loss=True,            # Always compute loss in training
+            )
+            
+            # refined_batch is (B, N, C) tensor, convert to list
+            pts_feat['features'] = [refined_features[i] for i in range(refined_features.shape[0])]
+            pts_feat['indices'] = [refined_indices[i] for i in range(refined_indices.shape[0])]
+            losses = refinement_losses
+
         
-        return batch_point_clouds, losses
+        return pts_feat, losses
     
     def forward_test(
         self,
         img: torch.Tensor,
         img_metas: List[Dict],
-    ) -> Tuple[List[torch.Tensor], None]:
+    ) -> Tuple[dict, None]:
         """Forward pass for test/inference mode.
         
         Args:
@@ -696,7 +707,7 @@ class ReconstructionBackbone(nn.Module):
             img_metas: Image metadata list (one dict per batch item)
         
         Returns:
-            batch_point_clouds: List of refined point cloud tensors
+            pts_feat: Dict of refined point cloud features and indices
             losses: Always None in test mode
         """
         device = next(self.parameters()).device
@@ -709,7 +720,11 @@ class ReconstructionBackbone(nn.Module):
         multi_batch_ori_imgs = self._extract_images_from_data(img)
         B, N, C, H, W = multi_batch_ori_imgs.shape
         
-        batch_point_clouds = []
+        pts_feat = dict(
+            features=None,
+            indices=None,
+        )
+        losses = None
 
         # Run DA3 forward once for the whole batch (always frozen in test mode)
         imgs_processed, _, _ = self.input_processor(
@@ -777,22 +792,21 @@ class ReconstructionBackbone(nn.Module):
                 
                 pseudo_points_list.append(merged.float().to(device))
             
-            # Apply refinement in batch mode (if enabled)
-            if self.refinement is not None:
-                # Refine entire batch at once (no GT in test mode)
-                refined_batch, _ = self.refinement(
-                    pseudo_points=pseudo_points_list,  # list of (N, C) tensors
-                    gt_points=None,  # No GT in test mode
-                    return_loss=False,  # No loss computation in test
-                )
-                
-                # refined_batch is (B, N, C) tensor, convert to list
-                batch_point_clouds = [refined_batch[i] for i in range(B)]
-            else:
-                # No refinement, convert batch tensor to list
-                batch_point_clouds = [pseudo_points_list[i] for i in range(B)]
+
+            padded_pseudo, _ = self._padding_samples(pseudo_points_list, None)
+            # Refine entire batch at once (no GT in test mode)
+            refined_features, refined_indices, _ = self.refinement(
+                pseudo_points=padded_pseudo,  # (B, N, C) tensor
+                gt_points=None,  # No GT in test mode
+                return_loss=False,  # No loss computation in test
+            )
+            
+            # refined_batch is (B, N, C) tensor, convert to list
+            pts_feat['features'] = [refined_features[i] for i in range(refined_features.shape[0])]
+            pts_feat['indices'] = [refined_indices[i] for i in range(refined_indices.shape[0])]
+
         
-        return batch_point_clouds, None
+        return pts_feat, None
         
 
 

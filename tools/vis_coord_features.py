@@ -14,7 +14,7 @@ OCCUPANCY_CHANNEL = None
 
 # Occupancy threshold: minimum probability to visualize a voxel (0.0-1.0)
 GT_OCCUPANCY_THRESHOLD = 0.05
-PSEUDO_OCCUPANCY_THRESHOLD = 0.5001
+PSEUDO_OCCUPANCY_THRESHOLD = 0.55
 
 # Probability ranges for intensity (0.0-0.1, 0.1-0.2, ..., 0.9-1.0)
 PROB_RANGES = [(i * 0.1, (i + 1) * 0.1) for i in range(10)]
@@ -575,7 +575,7 @@ def main():
     for fpath in files:
         
         
-        fpath = fpath.replace("debug_iter_000000.pkl", "debug_iter_000050.pkl")
+        fpath = fpath.replace("debug_iter_000000.pkl", "debug_iter_000030.pkl")
         print(f"Showing {fpath} (close window to continue)")
         visualize_file(fpath, channel_idx=OCCUPANCY_CHANNEL, coors_mode=args.coors_mode)
 

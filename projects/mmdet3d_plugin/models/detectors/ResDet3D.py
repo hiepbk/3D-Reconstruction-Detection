@@ -146,7 +146,7 @@ class ResDet3D(MVXTwoStageDetector):
         
         if self.reconstruction_backbone is not None:
             # Extract features (generates point cloud with refinement)
-            img_feats, pseudo_points = self.extract_feat(
+            img_feats, pts_feats = self.extract_feat(
                 points=points,  # GT points for refinement loss
                 img=img,
                 img_metas=img_metas,
@@ -167,7 +167,7 @@ class ResDet3D(MVXTwoStageDetector):
         
         if has_pts_bbox_head or has_img_backbone:
             parent_losses = super().forward_train(
-                points=pseudo_points if self.reconstruction_backbone is not None else points,
+                points=pts_feats if self.reconstruction_backbone is not None else points,
                 img_metas=img_metas,
                 gt_bboxes_3d=gt_bboxes_3d,
                 gt_labels_3d=gt_labels_3d,
@@ -189,27 +189,27 @@ class ResDet3D(MVXTwoStageDetector):
         """
         if self.reconstruction_backbone is not None:
             # Extract features (generates point cloud)
-            img_feats, pseudo_points = self.extract_feat(points, img=img, img_metas=img_metas)
+            img_feats, pts_feats = self.extract_feat(points, img=img, img_metas=img_metas)
             
             # Handle tuple return (backward compatibility)
             if isinstance(pseudo_points, tuple):
-                pseudo_points, _ = pseudo_points
+                pts_feats, _ = pts_feats
             
             # For now, return empty results since we don't have head/neck
             # Later, when head/neck are added, this will call simple_test_pts
             bbox_list = [dict() for i in range(len(img_metas))]
             
             # Store pseudo points and colors in result for potential use
-            if pseudo_points is not None:
+            if pts_feats is not None:
                 # Handle list of point clouds (one per batch item)
-                if isinstance(pseudo_points, list):
+                if isinstance(pts_feats, list):
                     for i, result_dict in enumerate(bbox_list):
-                        if i < len(pseudo_points):
-                            result_dict['pseudo_points'] = pseudo_points[i]
+                        if i < len(pts_feats):
+                            result_dict['pseudo_points'] = pts_feats[i]
                 else:
                     # Single point cloud for all
                     for i, result_dict in enumerate(bbox_list):
-                        result_dict['pseudo_points'] = pseudo_points
+                        result_dict['pseudo_points'] = pts_feats
             
             return bbox_list
         else:

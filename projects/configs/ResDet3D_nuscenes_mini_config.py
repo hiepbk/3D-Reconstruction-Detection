@@ -131,7 +131,7 @@ rescon_pipeline = [
         type='DepthAnything3Filter',
         
         transforms=[
-            # Voxel downsample (always runs if voxel_size is not None)
+    # Voxel downsample (always runs if voxel_size is not None)
             # dict(
             #     type='VoxelDownsample',
             #     voxel_size=0.1,
@@ -143,21 +143,21 @@ rescon_pipeline = [
                 type='FilterPointByRange', 
                 point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 6.0]),
             
-            # Density-aware ball query (optional)
-            dict(
+    # Density-aware ball query (optional)
+    dict(
                 type='BallQueryDownsample',
-                enabled=True,
-                min_radius=0.0,
-                max_radius=0.5,
-                sample_num=16,
-                anchor_points=25000,
-            ),
-            # Uniform cap with FPS (optional)
-            dict(
+        enabled=True,
+        min_radius=0.0,
+        max_radius=0.5,
+        sample_num=16,
+        anchor_points=25000,
+    ),
+    # Uniform cap with FPS (optional)
+    dict(
                 type='FPSDownsample',
-                enabled=True,
+        enabled=True,
                 num_points=40000,  # 40k points for convergence to real LiDAR point clouds
-            ),
+    ),
             
         ]
     )
@@ -247,49 +247,77 @@ model = dict(
             ),
             # Sparse middle encoder: 3D sparse convolutions
             pts_middle_encoder=dict(
-                type='SparseEncoder',
+                type='SparseEncoderV2',
                 in_channels=3,  # Should match num_features in voxel_encoder
                 sparse_shape=[41, 1440, 1440],  # [Z, Y, X] calculated from point_cloud_range and voxel_size
-                output_channels=128,
+                output_channels=64,
                 order=('conv', 'norm', 'act'),
-                encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
-                encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
+                encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128, 64), (64,64)),
+                encoder_strides=((1, 1, 2), (1, 1, 2), (1, 1, 2), (1, 1, 3), (1, 1)),
+                encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, [0, 6, 6]), (0, 0, 0)),
                 block_type='basicblock',
+                return_type='sparse',
             ),
-            bev_height_occupancy=dict(
-                type='BEVHeightOccupancy',
-                in_channels=256,  # Input channels from SparseEncoder
-                Unet_channels=[256, 512, 1024, 2048],  # Deeper U-Net with more channels
-                occ_feature_shape=[180, 180, 32],  # [X,Y,C] BEV feature of occupancy - target grid from real LiDAR
-                use_residual=True,  # Add residual connections
-                use_attention=True,  # Add attention mechanism
-                init_cfg=dict(
-                    type='Kaiming',
-                    layer='Conv2d',
-                    mode='fan_out',
-                    nonlinearity='relu'
-                ),
+            # ===== OLD OCCUPANCY-BASED APPROACH (COMMENTED OUT) =====
+            # bev_height_occupancy=dict(
+            #     type='BEVHeightOccupancy',
+            #     in_channels=256,  # Input channels from SparseEncoder
+            #     Unet_channels=[256, 512, 1024, 2048],  # Deeper U-Net with more channels
+            #     occ_feature_shape=[180, 180, 32],  # [X,Y,C] BEV feature of occupancy - target grid from real LiDAR
+            #     use_residual=True,  # Add residual connections
+            #     use_attention=True,  # Add attention mechanism
+            #     init_cfg=dict(
+            #         type='Kaiming',
+            #         layer='Conv2d',
+            #         mode='fan_out',
+            #         nonlinearity='relu'
+            #     ),
+            # ),
+            # occupancy_voxel_layer=dict(
+            #     max_num_points=10,
+            #     occ_feature_shape=[180, 180, 32], # [X,Y,C] BEV feature of occupancy
+            #     max_voxels=(120000, 160000),  # (training, testing) max voxels
+            #     point_cloud_range=point_cloud_range,
+            # ),
+            # occupancy_voxel_encoder=dict(
+            #     type='SoftVoxelOccupancyVFE',
+            #     lambda_n=0.3,
+            #     gamma_var=5.0,
+            #     eps=1e-6,
+            # ),
+            # loss_occupancy=dict(
+            #     type='OccupancyLoss',
+            #     loss_type='bce',  # Switch to BCE with logits (better gradients than focal)
+            #     reduction='mean',
+            #     loss_weight=10.0,  # Significantly increased to 10.0 to get much larger gradients
+            #     # Optional: channel_weights to emphasize certain height levels
+            #     # channel_weights=None,  # Equal weights for all channels
+            # ),
+            
+            # ===== NEW TRANSFORMER-BASED APPROACH =====
+            # Transformer to refine sparse features and indices
+            # Input: pseudo_sparse_features [N, 128], pseudo_sparse_indices [N, 4]
+            # Output: refined_features [M', 128], refined_indices [M', 4] where M' ≈ M (GT)
+            sparse_refinement_transformer=dict(
+                type='SparsePatternAdaptationFormer',
+                d_model=512,  # Model dimension (larger than feature dim for transformer capacity)
+                nhead=8,  # Number of attention heads
+                num_coord_layers=6,  # Number of layers in Coordinate Transformer
+                num_value_layers=6,  # Number of layers in Value Transformer
+                dim_feedforward=2048,  # Feedforward network dimension
+                dropout=0.1,
+                activation='gelu',  # GELU for better transformer performance
+                codebook_size=4096,  # Vocabulary size for VQ codebook
+                codebook_dim=64,  # Feature dimension (matches sparse encoder output)
+                commitment_cost=0.25,  # Weight for VQ commitment loss
+                # spatial_shape=[2, 180, 180],  # [D, H, W] spatial shape
+                spatial_shape=[1, 64, 64],
+                max_seq_length=1024,  # Maximum sequence length for generation
             ),
-            occupancy_voxel_layer=dict(
-                max_num_points=10,
-                occ_feature_shape=[180, 180, 32], # [X,Y,C] BEV feature of occupancy
-                max_voxels=(120000, 160000),  # (training, testing) max voxels
-                point_cloud_range=point_cloud_range,
-            ),
-            occupancy_voxel_encoder=dict(
-                type='SoftVoxelOccupancyVFE',
-                lambda_n=0.3,
-                gamma_var=5.0,
-                eps=1e-6,
-            ),
-            loss_occupancy=dict(
-                type='OccupancyLoss',
-                loss_type='bce',  # Switch to BCE with logits (better gradients than focal)
-                reduction='mean',
-                loss_weight=10.0,  # Significantly increased to 10.0 to get much larger gradients
-                # Optional: channel_weights to emphasize certain height levels
-                # channel_weights=None,  # Equal weights for all channels
-            ),
+            # Losses are handled internally by transformer (loss_coord, loss_value, loss_vq)
+            # Optional auxiliary losses (can be None)
+            loss_feature=None,  # Transformer has its own losses
+            loss_index=None,  # Not needed, transformer handles coordinate prediction
             loss_weight=1.0,  # Weight for occupancy loss
         ),
         # refinement=None
@@ -350,7 +378,7 @@ model = dict(
         ))
     
     )
-
+    
 optimizer = dict(
     type='AdamW', 
     lr=0.001,  # Increased base learning rate (10x from 0.0001) - refinement network will benefit

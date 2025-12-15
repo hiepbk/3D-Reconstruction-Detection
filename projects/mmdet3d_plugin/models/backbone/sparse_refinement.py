@@ -20,6 +20,14 @@ from mmcv.runner import BaseModule
 import torch
 import pickle
 
+import matplotlib.pyplot as plt
+
+
+# We will use the transforme
+# @MIDDLE_ENCODERS.register_module()
+# class Transformer
+
+
 
 @MIDDLE_ENCODERS.register_module()
 class BEVHeightOccupancy(BaseModule):
@@ -264,11 +272,9 @@ class SparseRefinement(nn.Module):
         pts_voxel_layer: Dict,
         pts_voxel_encoder: Dict,
         pts_middle_encoder: Dict,
-        bev_height_occupancy: Dict,
-        occupancy_voxel_layer: Dict,
-        occupancy_voxel_encoder: Dict,
-        loss_occupancy: Dict,
-
+        sparse_refinement_transformer: Dict,
+        loss_feature: Dict = None,
+        loss_index: Dict = None,
         loss_weight: float = 1.0,
         use_color: bool = False,
         debug_viz: bool = False,
@@ -278,12 +284,11 @@ class SparseRefinement(nn.Module):
         Args:
             pts_voxel_layer: Config for voxelization layer
             pts_voxel_encoder: Config for voxel encoder (e.g., HardSimpleVFE)
-            pts_middle_encoder: Config for sparse middle encoder (e.g., SparseEncoder)
-            bev_height_occupancy: Config for BEV height occupancy layer (e.g., BEVHeightOccupancy)
-            occupancy_voxel_layer: Config for occupancy voxelization layer (e.g., Voxelization)
-            occupancy_voxel_encoder: Config for occupancy voxel encoder (e.g., SoftVoxelOccupancyVFE)
-            loss_occupancy: Config for occupancy loss (e.g., OccupancyLoss)
-            loss_weight: Weight for the occupancy loss
+            pts_middle_encoder: Config for sparse middle encoder (e.g., SparseEncoderV2 with return_type='sparse')
+            sparse_refinement_transformer: Config for ShapeFormer-style transformer
+            loss_feature: Config for feature alignment loss (optional, transformer has its own losses)
+            loss_index: Config for index alignment loss (optional)
+            loss_weight: Weight for the losses
             use_color: If True, use RGB colors in addition to XYZ
         """
         super().__init__()
@@ -303,35 +308,24 @@ class SparseRefinement(nn.Module):
         # Build voxel encoder
         self.voxel_encoder = builder.build_voxel_encoder(pts_voxel_encoder)
         
-        # Build sparse middle encoder
+        # Build sparse middle encoder (should return sparse features + indices when return_type='sparse')
         self.middle_encoder = builder.build_middle_encoder(pts_middle_encoder)
         
-        # (B, C*D, H, W) -> (B, C*D, H, W)
-        # Build the BEV height refinement layer (multi-occupancy feature of height)
+        # Build pattern adaptation transformer (using builder pattern)
+        self.pattern_adaptation = builder.build_middle_encoder(sparse_refinement_transformer)
         
-        self.bev_height_occupancy = builder.build_middle_encoder(bev_height_occupancy)
+        # Build losses (optional, transformer has its own losses)
+        if loss_feature is not None:
+            self.loss_feature = build_loss(loss_feature)
+        else:
+            self.loss_feature = None
         
+        if loss_index is not None:
+            self.loss_index = build_loss(loss_index)
+        else:
+            self.loss_index = None
         
-        self.gt_occupancty_layer = self._build_occupancy_voxelization(occupancy_voxel_layer)
-        # build the voxelization layer for the occupancy ground truth
-        self.gt_occupancty_voxel_encoder = builder.build_voxel_encoder(occupancy_voxel_encoder)
-        # Build occupancy loss from config
-        self.loss_occupancy = build_loss(loss_occupancy)
-        
-        # Projection layer to normalize feature dimensions (will be created on first forward)
-        # sparse_features might have variable channels (C or C*D), project to 256
-        self.feat_proj_conv = None  # Will be created dynamically based on input channels
-        
-        # Decoder: (M', 256) -> (M', 3) to decode features back to xyz coordinates
-        self.decoder = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 3),  # Output xyz
-        )
-        
-        # Get sparse_shape from middle_encoder config for mapping back to full grid
+        # Get sparse_shape from middle_encoder config
         self.sparse_shape = pts_middle_encoder.get('sparse_shape', [41, 1440, 1440])  # [Z, Y, X]
 
         # Visualization caching flag
@@ -340,30 +334,12 @@ class SparseRefinement(nn.Module):
         
         
         
-    def _build_occupancy_voxelization(self, occupancy_voxel_layer: Dict) -> Voxelization:
-        """Build occupancy voxelization layer.
-        
-        Args:
-            occupancy_voxel_layer: Config for occupancy voxelization layer (e.g., Voxelization)
-        """
-        
-        point_cloud_range = occupancy_voxel_layer.get('point_cloud_range', None)
-        self.occ_feature_shape = occupancy_voxel_layer.get('occ_feature_shape', None)
-        if point_cloud_range is None or self.occ_feature_shape is None:
-            raise ValueError("point_cloud_range and sparse_shape must be provided for occupancy voxelization")
-
-        # Convert to tensors for arithmetic, then back to list for Voxelization
-        pcr_tensor = torch.tensor(point_cloud_range, dtype=torch.float32)
-        occ_shape_tensor = torch.tensor(self.occ_feature_shape, dtype=torch.float32)
-        occ_voxel_size = (pcr_tensor[3:] - pcr_tensor[:3]) / occ_shape_tensor  # (3,)
-        occ_voxel_size = occ_voxel_size.tolist()
-        
-        # update the occupancy_voxel_layer voxel_size and remove the occ_feature_shape
-        occupancy_voxel_layer['voxel_size'] = occ_voxel_size
-        occupancy_voxel_layer.pop('occ_feature_shape', None)
-        return Voxelization(**occupancy_voxel_layer)
+    # ===== OLD OCCUPANCY METHODS (COMMENTED OUT) =====
+    # def _build_occupancy_voxelization(self, occupancy_voxel_layer: Dict) -> Voxelization:
+    #     """Build occupancy voxelization layer."""
+    #     ...
     
-    def _voxelize_and_encode(self, points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _voxel_encoder(self, points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Voxelize and encode batched point clouds.
         
         Args:
@@ -403,252 +379,59 @@ class SparseRefinement(nn.Module):
 
         return voxel_features, num_points, coors
     
-    def _generate_occupancy_map(
+    # ===== OLD OCCUPANCY METHODS (COMMENTED OUT) =====
+    # All occupancy-related methods removed - using transformer approach instead
+    
+    def forward_train(
         self,
-        voxel_features: torch.Tensor,
-        num_points: torch.Tensor,
-        coors: torch.Tensor,
-        batch_size: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate occupancy map from voxel features (sparse conv + bev height occupancy).
+        pseudo_sparse_features: torch.Tensor,
+        pseudo_sparse_indices: torch.Tensor,
+        pseudo_sparse_spatial_shape: List[int],
+        gt_points: Optional[torch.Tensor] = None,
         
-        Args:
-            voxel_features: Voxel features
-            num_points: Number of points per voxel
-            coors: Voxel coordinates
-            batch_size: Batch size
+        return_loss: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         
-        Returns:
-            occupancy_logits: (B, num_height_levels, H, W) Occupancy logits (not probabilities)
-                Apply torch.sigmoid() to get probabilities [0, 1] if needed
-            sparse_features: (B, C, H, W) Sparse feature representation from SparseEncoder
-        """
-        # Process through sparse middle encoder
-        sparse_features = self.middle_encoder(voxel_features, coors, batch_size) # (B, C, H, W)
+        assert gt_points is not None, "GT points are required for training"
         
-        # Process through BEV height occupancy (returns logits, not probabilities)
-        occupancy_logits = self.bev_height_occupancy(sparse_features) # (B, num_height_levels, H, W)
-        
-        return occupancy_logits, sparse_features
-    
-
-    
-    def _gather_feats_from_occupancy(
-        self,
-        sparse_features: torch.Tensor,
-        occupancy_logits: torch.Tensor,
-        coors: torch.Tensor,
-        bev_shape: Tuple[int, int],
-        sparse_shape: List[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Gather features from BEV feature map using occupancy mask.
-        
-        Args:
-            sparse_features: (B, C, H, W) sparse features from SparseEncoder
-            occupancy_logits: (B, occupancy_channels, H, W) occupancy logits (not probabilities)
-            coors: (M, 4) voxel coordinates [batch, z, y, x]
-            bev_shape: (H, W) BEV feature map shape
-            sparse_shape: [Z, Y, X] full grid shape
-        
-        Returns:
-            gathered_feats: (M', C) gathered feature vectors
-            new_coors: (M', 4) new voxel coordinates after occupancy filtering
-        """
-        if coors.shape[0] == 0:
-            return torch.empty((0, sparse_features.shape[1]), device=sparse_features.device), \
-                   torch.empty((0, 4), device=coors.device, dtype=coors.dtype)
-        
-        H, W = bev_shape
-        B, C = sparse_features.shape[:2]
-        occupancy_channels = occupancy_logits.shape[1]
-        num_z_levels = sparse_shape[0]
-        
-        # Convert logits to probabilities for thresholding
-        occupancy_prob = torch.sigmoid(occupancy_logits)  # (B, occupancy_channels, H, W)
-        
-        # Map Z dimension to occupancy channels proportionally
-        z_to_channel_scale = occupancy_channels / num_z_levels
-        
-        # Calculate downsample ratios
-        max_x = coors[:, 3].max().item()
-        max_y = coors[:, 2].max().item()
-        ratio_x = max(1, int((max_x + 1) / W))
-        ratio_y = max(1, int((max_y + 1) / H))
-        
-        gathered_feats = []
-        new_coors = []
-        
-        for coor in coors:
-            b, z, y, x = coor.int().cpu().tolist()
-            if b >= B:
-                continue
-            
-            # Map to BEV indices
-            bev_y = min(H - 1, y // ratio_y)
-            bev_x = min(W - 1, x // ratio_x)
-            
-            # Map Z index to occupancy channel
-            if 0 <= z < num_z_levels:
-                channel_idx = int(z * z_to_channel_scale)
-                channel_idx = min(occupancy_channels - 1, channel_idx)
-                # Check occupancy probability at this location and mapped channel
-                occ_prob = occupancy_prob[b, channel_idx, bev_y, bev_x]
-                # Use threshold to filter (e.g., > 0.5)
-                if occ_prob > 0.5:
-                    # Gather feature from sparse_features
-                    feat = sparse_features[b, :, bev_y, bev_x]  # (C,)
-                    gathered_feats.append(feat)
-                    new_coors.append(coor)
-        
-        if not gathered_feats:
-            return torch.empty((0, C), device=sparse_features.device), \
-                   torch.empty((0, 4), device=coors.device, dtype=coors.dtype)
-        
-        gathered_feats = torch.stack(gathered_feats, dim=0)  # (M', C)
-        new_coors = torch.stack(new_coors, dim=0)  # (M', 4)
-        
-        return gathered_feats, new_coors
-    
-    
-    def calculate_loss(
-        self,
-        pseudo_occupancy_logits: torch.Tensor,
-        gt_occupancy_map: torch.Tensor,
-    ) -> torch.Tensor:
-        """Calculate occupancy loss.
-        
-        Args:
-            pseudo_occupancy_logits: (B, in_channels, H, W) pseudo occupancy logits (not probabilities)
-            gt_occupancy_map: (B, in_channels, H, W) GT occupancy probability maps [0, 1]
-        
-        Returns:
-            Loss value
-        """
-        # gt_occupancy_map is (B, in_channels, H, W) eg. [2, 32, 180, 180] - probabilities
-        # pseudo_occupancy_logits is (B, in_channels, H, W) eg. [2, 32, 180, 180] - logits
-        
-        # Loss function will use binary_cross_entropy_with_logits internally (more stable)
-        return self.loss_occupancy(pseudo_occupancy_logits, gt_occupancy_map, use_logits=True)
-    
-    def _generate_gt_occupancy_map(
-        self,
-        gt_points: torch.Tensor,
-    ) -> torch.Tensor:
-        """Generate GT occupancy map from GT points.
-        
-        Args:
-            gt_points: (B, N, 3) GT point cloud coordinates [x, y, z]
-            batch_size: Batch size
-        """
-        
-        B = gt_points.shape[0]
-        voxels_list, coors_list, num_points_list = [], [], []
-        
-        for b in range(B):
-            res = gt_points[b]
-            if not res.is_contiguous():
-                res = res.contiguous()
-            if not torch.is_floating_point(res):
-                res = res.float()
-            res_voxels, res_coors, res_num_points = self.gt_occupancty_layer(res)
-            voxels_list.append(res_voxels)
-            coors_list.append(res_coors)
-            num_points_list.append(res_num_points)
-        
-        voxels = torch.cat(voxels_list, dim=0)
-        num_points = torch.cat(num_points_list, dim=0)
-        
-        coors_batch = []
-        for i, coor in enumerate(coors_list):
-            coor_pad = F.pad(coor, (1, 0), mode='constant', value=i)
-            coors_batch.append(coor_pad)
-        coors = torch.cat(coors_batch, dim=0)
-        
-        voxel_occupancy = self.gt_occupancty_voxel_encoder(voxels, num_points, coors)
-        voxel_occupancy_per_batch = torch.split(
-            voxel_occupancy, [c.shape[0] for c in coors_list], dim=0
+        batch_size = gt_points.shape[0]
+        gt_voxel_features, gt_num_points, gt_coors = self._voxel_encoder(gt_points)
+        gt_sparse_features, gt_sparse_indices, gt_sparse_spatial_shape = self.middle_encoder(
+            gt_voxel_features, gt_coors, batch_size
         )
-
-        X, Y, C = self.occ_feature_shape
-        gt_occupancy_feature_map = torch.zeros(
-            B, C, Y, X, device=voxel_occupancy.device
+        
+        refined_features, refined_indices, transformer_losses = self.pattern_adaptation(
+            pseudo_sparse_features=pseudo_sparse_features,
+            pseudo_sparse_indices=pseudo_sparse_indices,
+            spatial_shape=pseudo_sparse_spatial_shape,
+            gt_sparse_features=gt_sparse_features,
+            gt_sparse_indices=gt_sparse_indices,
+            return_loss=True,
         )
+        losses = None
+        if transformer_losses:
+            losses = transformer_losses.copy()
+            for k, v in losses.items():
+                losses[k] = v * self.loss_weight
+        return refined_features, refined_indices, losses
 
-        for b_idx in range(B):
-            coors_b = coors_list[b_idx]                 # (Nb, 3) [z, y, x]
-            occ_b   = voxel_occupancy_per_batch[b_idx] # (Nb, 1)
-
-            z = coors_b[:, 0].long()
-            y = coors_b[:, 1].long()
-            x = coors_b[:, 2].long()
-
-            gt_occupancy_feature_map[b_idx, z, y, x] = occ_b.squeeze(-1)
-
-        return gt_occupancy_feature_map
-
-    def _save_debug_data(
+    
+    def forward_test(
         self,
-        pseudo_coors: torch.Tensor,
-        gt_points: torch.Tensor,
-        pseudo_occupancy_logits: torch.Tensor,
-        gt_occupancy_map: torch.Tensor,
-    ):
-        """Save debug visualization data to pickle file.
-        
-        Args:
-            pseudo_coors: (M, 4) pseudo voxel coordinates [batch, z, y, x]
-            gt_points: (B, N, 3) GT point cloud
-            pseudo_occupancy_logits: (B, C, H, W) pseudo occupancy logits (will be converted to probabilities)
-            gt_occupancy_map: (B, C, H, W) GT occupancy map (probabilities)
-        """
-        import os
-        
-        # Create debug directory if it doesn't exist
-        os.makedirs(self.debug_viz_dir, exist_ok=True)
-        
-        # Get GT coors by voxelizing GT points
-        gt_coors = None
-        if gt_points is not None:
-            B = gt_points.shape[0]
-            gt_coors_list = []
-            for b in range(B):
-                res = gt_points[b]
-                if not res.is_contiguous():
-                    res = res.contiguous()
-                if not torch.is_floating_point(res):
-                    res = res.float()
-                _, res_coors, _ = self.voxel_layer(res)
-                # Add batch index
-                coor_pad = F.pad(res_coors, (1, 0), mode='constant', value=b)
-                gt_coors_list.append(coor_pad)
-            if gt_coors_list:
-                gt_coors = torch.cat(gt_coors_list, dim=0)
-        
-        # Convert logits to probabilities for visualization (better for visualization)
-        pseudo_occupancy_map = torch.sigmoid(pseudo_occupancy_logits) if pseudo_occupancy_logits is not None else None
-        
-        # Prepare data for saving (save probabilities, not logits, for visualization)
-        debug_data = {
-            "pseudo_coors": pseudo_coors.detach().cpu() if pseudo_coors is not None else None,
-            "gt_coors": gt_coors.detach().cpu() if gt_coors is not None else None,
-            "pseudo_occupancy_map": pseudo_occupancy_map.detach().cpu() if pseudo_occupancy_map is not None else None,
-            "gt_occupancy_map": gt_occupancy_map.detach().cpu() if gt_occupancy_map is not None else None,
-            "voxel_size": self.voxel_size.cpu().numpy().tolist(),
-            "point_cloud_range": self.point_cloud_range.cpu().numpy().tolist(),
-        }
-        
-        # Save to pickle file
-        # Note: debug_counter is incremented in forward() before calling this function
-        filename = f"debug_iter_{self.debug_counter:06d}.pkl"
-        filepath = os.path.join(self.debug_viz_dir, filename)
-        
-        with open(filepath, "wb") as f:
-            pickle.dump(debug_data, f)
-        
+        pseudo_sparse_features: torch.Tensor,
+        pseudo_sparse_indices: torch.Tensor,
+        pseudo_sparse_spatial_shape: List[int],
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+        refined_features, refined_indices, _ = self.pattern_adaptation(
+            pseudo_sparse_features=pseudo_sparse_features,
+            pseudo_sparse_indices=pseudo_sparse_indices,
+            spatial_shape=pseudo_sparse_spatial_shape,
+            gt_sparse_features=None,
+            gt_sparse_indices=None,
+            return_loss=False,
+        )
+        return refined_features, refined_indices, None
 
- 
-    
-    
     
     
     def forward(
@@ -657,61 +440,77 @@ class SparseRefinement(nn.Module):
         gt_points: Optional[torch.Tensor] = None,
         return_loss: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
-        """
-        Args:
-            pseudo_points: (B, N, C) tensor
-            gt_points: (B, N, C) tensor (optional)
-            return_loss: Whether to compute losses
-        
-        Returns:
-            refined_points: (B, N, C) refined point clouds (currently returns input)
-            losses: Dict of loss values (if return_loss=True)
-        """
+        """Unified forward: run shared ops, then branch to train/test."""
         if pseudo_points.dim() == 2:
             pseudo_points = pseudo_points.unsqueeze(0)
         batch_size = pseudo_points.shape[0]
 
         pseudo_points_xyz = pseudo_points if self.use_color else pseudo_points[:, :, :3]
-        
-        # Voxelize and encode pseudo points
-        pseudo_voxel_features, pseudo_num_points, pseudo_coors = self._voxelize_and_encode(pseudo_points_xyz)
-        
-        # Process through sparse encoder and BEV height occupancy
-        pseudo_occupancy_logits, pseudo_sparse_features = self._generate_occupancy_map(
-            pseudo_voxel_features, pseudo_num_points, pseudo_coors, batch_size
-        )
-        
-        # Compute losses if needed
-        losses = None
-        gt_occupancy_map = None
-        
-        # Generate GT occupancy map if we have GT points (needed for loss and/or visualization)
+        gt_points_xyz = None
         if gt_points is not None:
-            gt_occupancy_map = self._generate_gt_occupancy_map(gt_points)
-            
-            if return_loss:
-                # Calculate occupancy loss (reuse gt_occupancy_map to avoid regenerating)
-                loss_value = self.calculate_loss(pseudo_occupancy_logits, gt_occupancy_map)
-                
+            if gt_points.dim() == 2:
+                gt_points = gt_points.unsqueeze(0)
+            gt_points_xyz = gt_points if self.use_color else gt_points[:, :, :3]
 
-                self.debug_counter += 1
-                # save the debug data here if viz flag is True and debug_counter is divisible by 300
-                if self.debug_viz and self.debug_counter % 10 == 0:
-                    self._save_debug_data(
-                        pseudo_coors=pseudo_coors,
-                        gt_points=gt_points,
-                        pseudo_occupancy_logits=pseudo_occupancy_logits,
-                        gt_occupancy_map=gt_occupancy_map,
-                    )
-                    
-                # Increment debug counter every iteration (to track all iterations, not just saved ones)
-                
-                losses = dict(loss_occupancy=loss_value)
+        # Pseudo branch (shared)
+        pseudo_voxel_features, pseudo_num_points, pseudo_coors = self._voxel_encoder(pseudo_points_xyz)
+        pseudo_sparse_features, pseudo_sparse_indices, pseudo_sparse_spatial_shape = self.middle_encoder(
+            pseudo_voxel_features, pseudo_coors, batch_size
+        )
+
+        if return_loss:
+            refined_features, refined_indices, losses = self.forward_train(
+                pseudo_sparse_features=pseudo_sparse_features,
+                pseudo_sparse_indices=pseudo_sparse_indices,
+                pseudo_sparse_spatial_shape=pseudo_sparse_spatial_shape,
+                gt_points=gt_points,
+                return_loss=return_loss,
+            )
+
+            return refined_features, refined_indices, losses
+        else:
+            refined_features, refined_indices, _ = self.forward_test(
+                pseudo_sparse_features=pseudo_sparse_features,
+                pseudo_sparse_indices=pseudo_sparse_indices,
+                pseudo_sparse_spatial_shape=pseudo_sparse_spatial_shape,
+            )
+
+            return refined_features, refined_indices, None
+
+    
+    def _compute_feature_loss(
+        self,
+        refined_features: torch.Tensor,
+        gt_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute feature alignment loss."""
+        # TODO: Implement proper matching (e.g., Hungarian matching, nearest neighbor)
+        # For now, assume sizes match or truncate
+        if refined_features.shape[0] == gt_features.shape[0]:
+            return self.loss_feature(refined_features, gt_features)
+        else:
+            min_size = min(refined_features.shape[0], gt_features.shape[0])
+            return self.loss_feature(refined_features[:min_size], gt_features[:min_size])
+    
+    def _compute_index_loss(
+        self,
+        refined_indices: torch.Tensor,
+        gt_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute index alignment loss."""
+        if self.loss_index is None:
+            return torch.tensor(0.0, device=refined_indices.device)
+        
+        if refined_indices.shape[0] == gt_indices.shape[0]:
+            return self.loss_index(refined_indices.float(), gt_indices.float())
+        else:
+            min_size = min(refined_indices.shape[0], gt_indices.shape[0])
+            return self.loss_index(refined_indices[:min_size].float(), gt_indices[:min_size].float())
+
         
         
-        # TODO: Implement refined_points generation from occupancy map
-        # For now, return pseudo_points as placeholder
-        refined_points = pseudo_points
         
-        return refined_points, losses
+
+        
+        
 
