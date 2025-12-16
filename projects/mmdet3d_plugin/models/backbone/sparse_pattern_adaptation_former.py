@@ -432,11 +432,17 @@ class SparsePatternAdaptationFormer(nn.Module):
         commitment_cost: float = 0.25,
         grid_shape: List[int] = [64, 64, 64],
         max_seq_length: int = 10000,
-        window_size: int = 512,  # Block-causal sliding window size K
+        coord_window_size: int = 1536,  # Coord transformer window (larger for global structure + END visibility)
+        value_window_size: int = 512,  # Value transformer window (smaller, local context sufficient)
+        run_inference_during_training: bool = False,  # Whether to run AR inference during training (slow!)
+        inference_freq: int = 10,  # Run inference every N training calls (only if run_inference_during_training=True)
     ):
         super().__init__()
         
         self.d_model = d_model
+        self.run_inference_during_training = run_inference_during_training
+        self.inference_freq = inference_freq
+        self._training_call_count = 0  # Counter for inference frequency
         self.codebook_size = codebook_size
         self.codebook_dim = codebook_dim
         self.grid_shape = grid_shape
@@ -469,22 +475,23 @@ class SparsePatternAdaptationFormer(nn.Module):
         self.input_proj = nn.Linear(d_model * 2, d_model)  # coord + value -> d_model
         
         # Coordinate Transformer: predicts next coordinate (block-causal sliding-window attention)
-        # window_size: each token attends to previous K tokens (O(T·K) memory, fast inference)
+        # coord_window_size: larger window for global structure and END token visibility
         self.coord_transformer = BlockCausalTransformer(
             d_model=d_model,
             nhead=nhead,
             num_layers=num_coord_layers,
-            window_size=window_size,
+            window_size=coord_window_size,  # Larger: 1536 for sequences up to 4096
             dim_feedforward=dim_feedforward,
             dropout=dropout,
         )
         
         # Value Transformer: predicts codebook index given coordinate (block-causal sliding-window attention)
+        # value_window_size: smaller window sufficient for local appearance context
         self.value_transformer = BlockCausalTransformer(
             d_model=d_model,
             nhead=nhead,
             num_layers=num_value_layers,
-            window_size=window_size,
+            window_size=value_window_size,  # Smaller: 512 for local context
             dim_feedforward=dim_feedforward,
             dropout=dropout,
         )
@@ -681,83 +688,101 @@ class SparsePatternAdaptationFormer(nn.Module):
                 'loss_vq_gt': vq_loss_gt,
             })
 
-            # === Use free-running inference (forward_test) for refined pattern ===
-            # This matches inference behavior: start from pseudo only and generate
-            # a new sparse pattern. Run under no_grad so it doesn't affect backprop.
-            with torch.no_grad():
-                # mesure the time of the forward_test
-                start_time = time.time()
-                
-                refined_feat_b, refined_idx_b, _ = self.forward_test(
-                    pseudo_sparse_features=pseudo_feat_b,
-                    pseudo_sparse_indices=pseudo_idx_b,
-                    spatial_shape=spatial_shape_model,
-                )
-                
-                end_inference_time = time.time()
-                
-                # === Monitoring loss (no gradients) ===
-                # Compare refined features with GT features for monitoring
-                # Target: refined should match GT count and features
-                gt_count = gt_feat_sorted.shape[0]
-                refined_count = refined_feat_b.shape[0]
-                pseudo_count = pseudo_feat_sorted.shape[0]  # Keep for reference
-                
-                # Count difference: refined vs GT (normalized)
-                count_diff = abs(gt_count - refined_count) / max(gt_count, 1)
-                
-                # Generation length ratio (refined / GT) - target is 1.0
-                gen_ratio = refined_count / max(gt_count, 1)
-                
-                # Feature statistics comparison: refined vs GT (if both non-empty)
-                if gt_count > 0 and refined_count > 0:
-                    # Mean feature distance (simple L2 between mean features)
-                    gt_mean = gt_feat_sorted.mean(dim=0)  # (C,)
-                    refined_mean = refined_feat_b.mean(dim=0)  # (C,)
-                    feature_dist = torch.norm(gt_mean - refined_mean).item()
+            # === Optional AR inference for monitoring (Fix 3: Training vs inference separation) ===
+            # AR inference is slow (20-80s per sample), so we only run it occasionally for monitoring
+            # Training uses teacher forcing, so AR inference is NOT needed for gradients
+            # 
+            # Default: run_inference_during_training=False (disabled for speed)
+            # If enabled: run every inference_freq iterations for monitoring
+            
+            should_run_inference = (
+                self.run_inference_during_training and 
+                (self._training_call_count % self.inference_freq == 0)
+            )
+            
+            if should_run_inference:
+                with torch.no_grad():
+                    # Measure the time of the forward_test
+                    start_time = time.time()
                     
-                    # Chamfer-like distance (sampled, to avoid OOM)
-                    # Sample a subset for comparison
-                    sample_size = min(100, gt_count, refined_count)
-                    gt_sample_idx = torch.randperm(gt_count, device=device)[:sample_size]
-                    refined_sample_idx = torch.randperm(refined_count, device=device)[:sample_size]
-                    gt_sample = gt_feat_sorted[gt_sample_idx]  # (sample_size, C)
-                    refined_sample = refined_feat_b[refined_sample_idx]  # (sample_size, C)
+                    refined_feat_b, refined_idx_b, _ = self.forward_test(
+                        pseudo_sparse_features=pseudo_feat_b,
+                        pseudo_sparse_indices=pseudo_idx_b,
+                        spatial_shape=spatial_shape_model,
+                    )
                     
-                    # Compute pairwise distances (chunked to avoid OOM)
-                    chunk_size = 50
-                    min_dists = []
-                    for i in range(0, sample_size, chunk_size):
-                        chunk_end = min(i + chunk_size, sample_size)
-                        refined_chunk = refined_sample[i:chunk_end]  # (chunk_len, C)
-                        # Distance from refined_chunk to gt_sample
-                        dists = torch.cdist(refined_chunk.unsqueeze(0), gt_sample.unsqueeze(0))  # (1, chunk_len, sample_size)
-                        min_dists.append(dists.min(dim=-1)[0].mean().item())
-                    chamfer_like_dist = sum(min_dists) / len(min_dists) if min_dists else 0.0
-                else:
-                    feature_dist = 0.0
-                    chamfer_like_dist = 0.0
+                    end_inference_time = time.time()
                     
-                end_time = time.time()
-                
-                # Print monitoring metrics as table
-                infer_time = end_inference_time - start_time
-                stats_time = end_time - end_inference_time
-                total_time = end_time - start_time
-                
+                    # === Monitoring metrics (no gradients) ===
+                    # Compare refined features with GT features for monitoring
+                    # Target: refined should match GT count and features
+                    gt_count = gt_feat_sorted.shape[0]
+                    refined_count = refined_feat_b.shape[0]
+                    pseudo_count = pseudo_feat_sorted.shape[0]  # Keep for reference
+                    
+                    # Count difference: refined vs GT (normalized)
+                    count_diff = abs(gt_count - refined_count) / max(gt_count, 1)
+                    
+                    # Generation length ratio (refined / GT) - target is 1.0
+                    gen_ratio = refined_count / max(gt_count, 1)
+                    
+                    # Feature statistics comparison: refined vs GT (if both non-empty)
+                    if gt_count > 0 and refined_count > 0:
+                        # Mean feature distance (simple L2 between mean features)
+                        gt_mean = gt_feat_sorted.mean(dim=0)  # (C,)
+                        refined_mean = refined_feat_b.mean(dim=0)  # (C,)
+                        feature_dist = torch.norm(gt_mean - refined_mean).item()
+                        
+                        # Chamfer-like distance (sampled, to avoid OOM)
+                        # Sample a subset for comparison
+                        sample_size = min(100, gt_count, refined_count)
+                        gt_sample_idx = torch.randperm(gt_count, device=device)[:sample_size]
+                        refined_sample_idx = torch.randperm(refined_count, device=device)[:sample_size]
+                        gt_sample = gt_feat_sorted[gt_sample_idx]  # (sample_size, C)
+                        refined_sample = refined_feat_b[refined_sample_idx]  # (sample_size, C)
+                        
+                        # Compute pairwise distances (chunked to avoid OOM)
+                        chunk_size = 50
+                        min_dists = []
+                        for i in range(0, sample_size, chunk_size):
+                            chunk_end = min(i + chunk_size, sample_size)
+                            refined_chunk = refined_sample[i:chunk_end]  # (chunk_len, C)
+                            # Distance from refined_chunk to gt_sample
+                            dists = torch.cdist(refined_chunk.unsqueeze(0), gt_sample.unsqueeze(0))  # (1, chunk_len, sample_size)
+                            min_dists.append(dists.min(dim=-1)[0].mean().item())
+                        chamfer_like_dist = sum(min_dists) / len(min_dists) if min_dists else 0.0
+                    else:
+                        feature_dist = 0.0
+                        chamfer_like_dist = 0.0
+                        
+                    end_time = time.time()
+                    
+                    # Print monitoring metrics as table
+                    infer_time = end_inference_time - start_time
+                    stats_time = end_time - end_inference_time
+                    total_time = end_time - start_time
+                    
 
-                print(f"{'batch':<6} | {'infer_time':<10} | {'stats_time':<10} | {'total_time':<10} | "
-                        f"{'refined':<8} | {'gt':<6} | {'pseudo':<8} | "
-                        f"{'count_diff':<10} | {'gen_ratio':<10} | {'feat_dist':<10} | {'chamfer':<10}")
-                print("-" * 120)
-                
-                # Print data row
-                print(f"{b_idx:<6} | {infer_time:<10.4f} | {stats_time:<10.4f} | {total_time:<10.4f} | "
-                      f"{refined_count:<8} | {gt_count:<6} | {pseudo_count:<8} | "
-                      f"{count_diff:<10.4f} | {gen_ratio:<10.4f} | {feature_dist:<10.4f} | {chamfer_like_dist:<10.4f}")
+                    print(f"{'batch':<6} | {'infer_time':<10} | {'stats_time':<10} | {'total_time':<10} | "
+                            f"{'refined':<8} | {'gt':<6} | {'pseudo':<8} | "
+                            f"{'count_diff':<10} | {'gen_ratio':<10} | {'feat_dist':<10} | {'chamfer':<10}")
+                    print("-" * 120)
+                    
+                    # Print data row
+                    print(f"{b_idx:<6} | {infer_time:<10.4f} | {stats_time:<10.4f} | {total_time:<10.4f} | "
+                          f"{refined_count:<8} | {gt_count:<6} | {pseudo_count:<8} | "
+                          f"{count_diff:<10.4f} | {gen_ratio:<10.4f} | {feature_dist:<10.4f} | {chamfer_like_dist:<10.4f}")
 
-            refined_features_list.append(refined_feat_b.detach())
-            refined_indices_list.append(refined_idx_b.detach())
+                    refined_features_list.append(refined_feat_b.detach())
+                    refined_indices_list.append(refined_idx_b.detach())
+            else:
+                # Skip AR inference: return empty tensors (not used for training anyway)
+                # Training uses teacher forcing, so refined output is not needed
+                refined_features_list.append(torch.empty((0, self.codebook_dim), device=device))
+                refined_indices_list.append(torch.empty((0, 4), device=device, dtype=torch.long))
+        
+        # Increment training call counter
+        self._training_call_count += 1
 
         refined_features = torch.cat(refined_features_list, dim=0) if refined_features_list else torch.empty((0, self.codebook_dim), device=device)
         refined_indices = torch.cat(refined_indices_list, dim=0) if refined_indices_list else torch.empty((0, 4), device=device, dtype=torch.long)
@@ -846,17 +871,18 @@ class SparsePatternAdaptationFormer(nn.Module):
                 _, value_kv_cache = self.value_transformer.forward_step(value_input_t, value_kv_cache)
             
             # === Autoregressive generation with KV cache (O(T) total) ===
-            # KV cache already contains all pseudo tokens (including END)
-            # Now generate new tokens incrementally, one at a time
+            # CORRECT AR CAUSALITY:
+            # coord_t → coord_transformer → coord_hidden_t → coord_{t+1}
+            # coord_hidden_t → value_transformer → value_t
+            # (coord_{t+1}, value_t) is used for NEXT timestep input
             # 
-            # NOTE: Refined count fluctuation is expected during training because:
-            # 1. Generation uses stochastic sampling (multinomial) - same input can produce different outputs
-            # 2. Model is learning to predict END tokens - early in training it may generate too many/few tokens
-            # 3. The model learns to match GT count through the coord/value loss on GT sequence
-            # As training progresses, gen_ratio should stabilize closer to 1.0
+            # CRITICAL: Never feed value_t back into coord_transformer at timestep t
+            # This breaks causality and causes generation length explosion
+            
             generated_indices = []
             generated_values = []
-            max_gen_length = min(self.max_seq_length, len(pseudo_coord_ids) * 2)
+            # Adaptive max length: use GT count as reference (if available) or pseudo * 1.5
+            max_gen_length = min(self.max_seq_length, int(len(pseudo_coord_ids) * 1.5))
             
             # Start generation from position after pseudo sequence
             current_pos = len(pseudo_seq_coords)
@@ -869,8 +895,10 @@ class SparsePatternAdaptationFormer(nn.Module):
                 if next_coord == self.END_COORD:
                     break
                 
-                # Step 1: Embed coord + END_VALUE placeholder, process through coord transformer
+                # Step 1: Embed ONLY coord (no value yet) and process through coord transformer
+                # This maintains strict causality: coord_t → coord_hidden_t → coord_{t+1}
                 coord_emb_t = self.coord_embed(torch.tensor([next_coord], device=device)).unsqueeze(0)  # (1, 1, d_model)
+                # Use END_VALUE as placeholder for value embedding (needed for input_proj)
                 value_emb_t = self.value_embed(torch.tensor([self.END_VALUE], device=device)).unsqueeze(0)  # (1, 1, d_model)
                 pos_emb_t = self.pos_embed(torch.tensor([current_pos], device=device).clamp(max=self.max_seq_length - 1)).unsqueeze(0)  # (1, 1, d_model)
                 
@@ -878,14 +906,14 @@ class SparsePatternAdaptationFormer(nn.Module):
                 token_emb_t = self.input_proj(combined_t)  # (1, 1, d_model)
                 token_t = token_emb_t + pos_emb_t  # (1, 1, d_model)
                 
-                # Update coord KV cache with coord+END_VALUE token (O(1))
+                # Update coord KV cache: coord_t enters coord transformer
                 coord_hidden_t, coord_kv_cache = self.coord_transformer.forward_step(token_t, coord_kv_cache)
                 
-                # Step 2: Predict value from coord hidden state
+                # Step 2: Predict value from coord_hidden_t (value is conditioned on coord structure)
                 next_coord_emb = self.coord_embed(torch.tensor([next_coord], device=device)).unsqueeze(0)  # (1, 1, d_model)
                 value_input_t = coord_hidden_t + next_coord_emb  # (1, 1, d_model)
                 
-                # Update value KV cache (O(1))
+                # Update value KV cache
                 value_hidden_t, value_kv_cache = self.value_transformer.forward_step(value_input_t, value_kv_cache)
                 value_logits = self.value_head(value_hidden_t)  # (1, 1, vocab_size)
                 value_probs = F.softmax(value_logits, dim=-1)
@@ -894,7 +922,7 @@ class SparsePatternAdaptationFormer(nn.Module):
                 if next_value == self.END_VALUE:
                     break
                 
-                # Store generated output (use the coord that generated this value)
+                # Store generated output
                 coord_3d = self._coord_id_to_3d(next_coord, spatial_shape_model).to(device)
                 coord_4d = torch.cat([
                     torch.tensor([b_idx], device=device).unsqueeze(0),
@@ -903,24 +931,15 @@ class SparsePatternAdaptationFormer(nn.Module):
                 generated_indices.append(coord_4d)
                 generated_values.append(next_value)
                 
-                # Step 3: Update coord KV cache with coord+value token for next coord prediction
-                coord_emb_t2 = self.coord_embed(torch.tensor([next_coord], device=device)).unsqueeze(0)  # (1, 1, d_model)
-                value_emb_t2 = self.value_embed(torch.tensor([next_value], device=device)).unsqueeze(0)  # (1, 1, d_model)
-                combined_t2 = torch.cat([coord_emb_t2, value_emb_t2], dim=-1)  # (1, 1, 2*d_model)
-                token_emb_t2 = self.input_proj(combined_t2)  # (1, 1, d_model)
-                token_t2 = token_emb_t2 + pos_emb_t  # (1, 1, d_model)
-                
-                # Update coord KV cache with complete coord+value token (O(1))
-                coord_hidden_t2, coord_kv_cache = self.coord_transformer.forward_step(token_t2, coord_kv_cache)
-                
-                # Step 4: Predict next coord from updated hidden state
-                coord_logits = self.coord_head(coord_hidden_t2)  # (1, 1, vocab_size)
+                # Step 3: Predict next coord from coord_hidden_t (NOT from coord+value feedback!)
+                # This is the key fix: coord_{t+1} depends only on coord_hidden_t, not on value_t
+                coord_logits = self.coord_head(coord_hidden_t)  # (1, 1, vocab_size)
                 coord_probs = F.softmax(coord_logits, dim=-1)
                 next_coord = torch.multinomial(coord_probs.view(-1), 1)[0].item()
                 
                 # Update for next iteration
                 current_pos += 1
-                last_coord_hidden = coord_hidden_t2
+                last_coord_hidden = coord_hidden_t  # Use coord_hidden_t, not coord_hidden_t2
 
             if len(generated_values) > 0:
                 generated_value_tensor = torch.tensor(generated_values, device=device)

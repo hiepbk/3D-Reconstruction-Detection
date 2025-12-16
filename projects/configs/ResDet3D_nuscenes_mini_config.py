@@ -312,7 +312,10 @@ model = dict(
                 commitment_cost=0.25,  # Weight for VQ commitment loss
                 grid_shape=[1, 64, 64], # [D, H, W] spatial shape
                 max_seq_length=4096,  # Maximum sequence length for generation
-                window_size=512,  # Block-causal sliding window size K (each token attends to previous K tokens)
+                coord_window_size=1536,  # Coord transformer window (larger for global structure + END visibility)
+                value_window_size=512,  # Value transformer window (smaller, local context sufficient)
+                run_inference_during_training=True,  # Disable AR inference during training for speed (Fix 3)
+                inference_freq=10,  # If enabled, run inference every N iterations (for monitoring only)
             ),
             # Losses are handled internally by transformer (loss_coord, loss_value, loss_vq)
             # Optional auxiliary losses (can be None)
