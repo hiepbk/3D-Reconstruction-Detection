@@ -81,32 +81,14 @@ class ReconstructionBackbone(nn.Module):
             baseline_memory = torch.cuda.memory_allocated() / 1024**2
         
         # Create wrapped DepthAnything3 model
-        print(f"[DEBUG] ReconstructionBackbone: Loading DepthAnything3 model from {pretrained}")
-        print(f"[DEBUG] ReconstructionBackbone: cache_dir = {cache_dir}")
         self.da3_model = DepthAnything3.from_pretrained(pretrained, cache_dir=cache_dir)
         self.da3_model.eval()
-        
-        # Measure DA3 memory usage
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            da3_memory = torch.cuda.memory_allocated() / 1024**2
-            da3_net_memory = da3_memory - baseline_memory
-            da3_params = sum(p.numel() for p in self.da3_model.parameters())
-            print(f"[DEBUG] ReconstructionBackbone: DA3 model loaded successfully")
-            print(f"[DEBUG] ReconstructionBackbone: DA3 VRAM usage: {da3_net_memory:.2f} MB (params: {da3_params/1e6:.2f}M)")
         
         # Freeze DA3 model if requested (recommended for training)
         self.freeze_da3 = freeze_da3
         if self.freeze_da3:
             for param in self.da3_model.parameters():
                 param.requires_grad = False
-            print(f"[DEBUG] ReconstructionBackbone: DepthAnything3 model frozen (requires_grad=False)")
-        else:
-            print(f"[DEBUG] ReconstructionBackbone: DepthAnything3 model trainable (requires_grad=True)")
-        
-        # Set to eval mode (but can be switched to train mode for refinement)
-        # self.eval()  # Don't force eval mode, let training script control it
-        print(f"[DEBUG] ReconstructionBackbone: Model initialized")
         
         # Build pipelines from config (don't store config dicts to avoid pickle issues)
         if rescon_pipeline is not None:
@@ -133,25 +115,9 @@ class ReconstructionBackbone(nn.Module):
         
         # Build point cloud refinement module
         if refinement is not None:
-            # Measure memory before refinement
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                before_refinement_memory = torch.cuda.memory_allocated() / 1024**2
-            
-            print(f"[DEBUG] ReconstructionBackbone: Building point cloud refinement module...")
             self.refinement = build_backbone(refinement)
-            
-            # Measure refinement memory usage
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                after_refinement_memory = torch.cuda.memory_allocated() / 1024**2
-                refinement_net_memory = after_refinement_memory - before_refinement_memory
-                refinement_params = sum(p.numel() for p in self.refinement.parameters())
-                print(f"[DEBUG] ReconstructionBackbone: Refinement module built successfully")
-                print(f"[DEBUG] ReconstructionBackbone: Refinement VRAM usage: {refinement_net_memory:.2f} MB (params: {refinement_params/1e6:.2f}M)")
         else:
             self.refinement = None
-            print(f"[DEBUG] ReconstructionBackbone: No refinement module configured")
     
     @property
     def input_processor(self):

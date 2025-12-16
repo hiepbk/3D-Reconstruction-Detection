@@ -197,7 +197,6 @@ def run_renderer_in_chunk_w_trj_mode(
                 dim=0,
             )
         except Exception as e:
-            print(f"[DEBUG] Path smoothing failed with error: {e}.")
             smooth_c2ws = raw_c2ws
         return smooth_c2ws
 

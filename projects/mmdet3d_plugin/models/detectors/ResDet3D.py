@@ -82,13 +82,9 @@ class ResDet3D(MVXTwoStageDetector):
         
         # Build reconstruction backbone
         if reconstruction_backbone is not None:
-            print(f"[DEBUG] ResDet3D: Building reconstruction backbone...")
-            print(f"[DEBUG] ResDet3D: reconstruction_backbone config = {reconstruction_backbone}")
             self.reconstruction_backbone = builder.build_backbone(reconstruction_backbone)
-            print(f"[DEBUG] ResDet3D: Reconstruction backbone built successfully")
         else:
             self.reconstruction_backbone = None
-            print(f"[DEBUG] ResDet3D: No reconstruction backbone configured")
     
     def extract_feat(self, points=None, img=None, img_metas=None, return_loss=False):
         """Extract features using reconstruction backbone.

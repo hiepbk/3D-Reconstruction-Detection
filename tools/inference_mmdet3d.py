@@ -55,7 +55,6 @@ def _patch_scatter_forward():
         return tuple(outputs) if isinstance(outputs, list) else (outputs, )
     
     Scatter.forward = patched_forward
-    print("[DEBUG] Patched mmcv Scatter.forward to handle device indices")
 
 
 def save_point_cloud_pcd(points, output_path, colors=None):
@@ -420,9 +419,6 @@ def main():
 
     # Build model using mmdet3d infrastructure (exactly like test.py)
     print("Building model...")
-    print(f"[DEBUG] Model config keys: {list(cfg.model.keys())}")
-    if 'reconstruction_backbone' in cfg.model:
-        print(f"[DEBUG] Reconstruction backbone config present: {cfg.model['reconstruction_backbone']}")
     cfg.model.train_cfg = None  # Set train_cfg to None like test.py
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
     

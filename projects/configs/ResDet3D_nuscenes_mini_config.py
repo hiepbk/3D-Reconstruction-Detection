@@ -404,13 +404,15 @@ checkpoint_config = dict(interval=1)
 
 log_config = dict(
     interval=1,
-    hooks=[dict(type='TensorboardLoggerHook'),
-        #    dict(type='WandbLoggerHook',
-        #         init_kwargs=dict(
-        #             project='ResDet3D',
-        #             name=f'ResDet3D_nuscenes_mini',
-        #         ))
-           ])
+    hooks=[
+        dict(type='TextLoggerHook'),  # console logging of iter/loss
+        dict(type='TensorboardLoggerHook'),
+        # dict(type='WandbLoggerHook',
+        #      init_kwargs=dict(
+        #          project='ResDet3D',
+        #          name=f'ResDet3D_nuscenes_mini',
+        #      ))
+    ])
 
 custom_hooks = [
 ]

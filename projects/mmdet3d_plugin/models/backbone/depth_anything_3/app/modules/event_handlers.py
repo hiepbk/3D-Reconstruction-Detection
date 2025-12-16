@@ -86,15 +86,6 @@ class EventHandlers:
             return "No processed data available. Please run 'Reconstruct' first."
 
         try:
-            # Add debug information
-            print("[DEBUG] save_current_visualization called with:")
-            print(f"  target_dir: {target_dir}")
-            print(f"  save_percentage: {save_percentage}")
-            print(f"  show_cam: {show_cam}")
-            print(f"  filter_black_bg: {filter_black_bg}")
-            print(f"  filter_white_bg: {filter_white_bg}")
-            print(f"  processed_data: {processed_data is not None}")
-
             # Import the gallery save function
             # Create gallery name with user input or auto-generated
             import datetime
@@ -107,15 +98,12 @@ class EventHandlers:
             else:
                 gallery_name = f"save_{timestamp}_pct{save_percentage:.0f}"
 
-            print(f"[DEBUG] Saving to gallery with name: {gallery_name}")
-
             # Save entire process folder to gallery
             success, message = save_to_gallery_func(
                 target_dir=target_dir, processed_data=processed_data, gallery_name=gallery_name
             )
 
             if success:
-                print(f"[DEBUG] Gallery save completed successfully: {message}")
                 return (
                     "Successfully saved to gallery!\n"
                     f"Gallery name: {gallery_name}\n"
@@ -126,7 +114,6 @@ class EventHandlers:
                     f"{message}"
                 )
             else:
-                print(f"[DEBUG] Gallery save failed: {message}")
                 return f"Failed to save to gallery: {message}"
 
         except Exception as e:

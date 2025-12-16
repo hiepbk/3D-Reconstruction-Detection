@@ -62,7 +62,6 @@ def _patch_scatter_forward():
         return tuple(outputs) if isinstance(outputs, list) else (outputs, )
     
     Scatter.forward = patched_forward
-    print("[DEBUG] Patched mmcv Scatter.forward to handle device indices")
 
 
 def parse_args():
