@@ -136,6 +136,15 @@ def parse_args():
 
 def main():
     args = parse_args()
+    
+    # Set multiprocessing start method to 'fork' to avoid pickling ConfigDict issues
+    # 'fork' doesn't require pickling the model, unlike 'spawn'
+    import torch.multiprocessing as mp
+    try:
+        mp.set_start_method('fork', force=True)
+    except RuntimeError:
+        # Already set, or 'fork' not available (Windows)
+        pass
 
     # Patch mmcv Scatter.forward before building model/data
     _patch_scatter_forward()
@@ -247,12 +256,7 @@ def main():
     meta['seed'] = args.seed
     meta['exp_name'] = osp.basename(args.config)
 
-    # Build model
-    print("Building model...")
-    print(f"[DEBUG] Model config keys: {list(cfg.model.keys())}")
-    if 'reconstruction_backbone' in cfg.model:
-        print(f"[DEBUG] Reconstruction backbone config present: {cfg.model['reconstruction_backbone']}")
-    
+    # Build model (same as official mmdet3d train.py)
     model = build_model(
         cfg.model,
         train_cfg=cfg.get('train_cfg'),

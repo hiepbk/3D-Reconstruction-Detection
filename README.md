@@ -257,7 +257,26 @@ python -m tools.train_mmdet3d \
     --work-dir work_dirs/resdet3d_nuscenes_mini \
     --resume-from work_dirs/resdet3d_nuscenes_mini/latest.pth
 
-# Multi-GPU training (distributed)
+# Multi-GPU training (distributed) - using torchrun script
+bash tools/dist_train_mmdet3d.sh \
+    projects/configs/ResDet3D_nuscenes_mini_config.py \
+    2 \
+    --work-dir work_dirs/resdet3d_nuscenes_mini
+
+# Multi-GPU training with 4 GPUs
+bash tools/dist_train_mmdet3d.sh \
+    projects/configs/ResDet3D_nuscenes_mini_config.py \
+    4 \
+    --work-dir work_dirs/resdet3d_nuscenes_mini
+
+# Multi-GPU training with additional arguments
+bash tools/dist_train_mmdet3d.sh \
+    projects/configs/ResDet3D_nuscenes_mini_config.py \
+    2 \
+    --work-dir work_dirs/resdet3d_nuscenes_mini \
+    --cfg-options optimizer.lr=0.001
+
+# Alternative: Multi-GPU training using python directly
 python -m tools.train_mmdet3d \
     projects/configs/ResDet3D_nuscenes_mini_config.py \
     --work-dir work_dirs/resdet3d_nuscenes_mini \

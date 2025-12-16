@@ -404,8 +404,7 @@ checkpoint_config = dict(interval=1)
 
 log_config = dict(
     interval=1,
-    hooks=[dict(type='ComponentMemoryLoggerHook'),  # Custom hook with component memory breakdown (extends TextLoggerHook)
-           dict(type='TensorboardLoggerHook'),
+    hooks=[dict(type='TensorboardLoggerHook'),
         #    dict(type='WandbLoggerHook',
         #         init_kwargs=dict(
         #             project='ResDet3D',

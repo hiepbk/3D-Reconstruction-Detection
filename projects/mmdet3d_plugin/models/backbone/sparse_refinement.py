@@ -326,7 +326,9 @@ class SparseRefinement(nn.Module):
             self.loss_index = None
         
         # Get sparse_shape from middle_encoder config
-        self.sparse_shape = pts_middle_encoder.get('sparse_shape', [41, 1440, 1440])  # [Z, Y, X]
+        # Convert to list to avoid dict_keys pickle issues
+        sparse_shape_val = pts_middle_encoder.get('sparse_shape', [41, 1440, 1440])
+        self.sparse_shape = list(sparse_shape_val) if isinstance(sparse_shape_val, (list, tuple)) else sparse_shape_val  # [Z, Y, X]
 
         # Visualization caching flag
         self.enable_visual_debug = False

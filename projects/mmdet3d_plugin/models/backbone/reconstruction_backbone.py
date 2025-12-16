@@ -108,24 +108,28 @@ class ReconstructionBackbone(nn.Module):
         # self.eval()  # Don't force eval mode, let training script control it
         print(f"[DEBUG] ReconstructionBackbone: Model initialized")
         
-        # Store ReconstructionBackbone-specific config
-        self.rescon_pipeline_cfg = rescon_pipeline
+        # Build pipelines from config (don't store config dicts to avoid pickle issues)
+        if rescon_pipeline is not None:
+            da3_pipeline_cfg = [cfg for cfg in rescon_pipeline if cfg.get('type') == 'DepthAnything3Filter']
+            refinement_pipeline_cfg = [cfg for cfg in rescon_pipeline if cfg.get('type') == 'RefinementProcessor']
+            self.da3_pipeline = Compose(da3_pipeline_cfg) if da3_pipeline_cfg else None
+            self.refinement_pipeline = Compose(refinement_pipeline_cfg) if refinement_pipeline_cfg else None
+        else:
+            self.da3_pipeline = None
+            self.refinement_pipeline = None
         
-        self.da3_pipeline_cfg = [cfg for cfg in rescon_pipeline if cfg['type'] == 'DepthAnything3Filter']
-        self.refinement_pipeline_cfg = [cfg for cfg in rescon_pipeline if cfg['type'] == 'RefinementProcessor']
+        # Extract values from glb_config (don't store the dict itself)
+        if glb_config is not None:
+            self.max_depth = max_depth or glb_config.get('max_depth', None)
+            self.conf_thresh_percentile = conf_thresh_percentile or glb_config.get('conf_thresh_percentile', None)
+        else:
+            self.max_depth = max_depth
+            self.conf_thresh_percentile = conf_thresh_percentile
         
-        self.da3_pipeline = Compose(self.da3_pipeline_cfg) if self.da3_pipeline_cfg else None
-        self.refinement_pipeline = Compose(self.refinement_pipeline_cfg) if self.refinement_pipeline_cfg else None
-
-
-        
-        self.glb_config = glb_config or {}
         self.ref_view_strategy = ref_view_strategy
         self.use_ray_pose = use_ray_pose
         self.max_points = max_points
         self.filter_sky = filter_sky
-        self.max_depth = max_depth or self.glb_config.get('max_depth', None)
-        self.conf_thresh_percentile = conf_thresh_percentile or self.glb_config.get('conf_thresh_percentile', None)
         
         # Build point cloud refinement module
         if refinement is not None:
