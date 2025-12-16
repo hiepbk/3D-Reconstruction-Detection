@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from typing import Tuple, List, Optional, Dict
 from mmdet3d.models.builder import MIDDLE_ENCODERS
 from .vector_quantizer import VectorQuantizer
+import time
 
 
 def row_major_key(indices: torch.Tensor, spatial_shape: List[int]) -> torch.Tensor:
@@ -58,23 +59,184 @@ def sort_by_row_major(
     return features[sort_idx], indices[sort_idx], coord_ids[sort_idx]
 
 
-class SparseSwin3D(nn.Module):
-    """Window-based local self-attention on a 3D grid (Swin-style, with optional shift).
+class BlockCausalAttention(nn.Module):
+    """KV-cached block-causal attention for efficient autoregressive decoding.
     
-    Operates on sparse tokens laid out on a regular grid. For each window,
-    self-attention is computed only among tokens inside that window, so the
-    attention matrix is at most (Wh*Ww)^2 instead of T^2.
+    Supports both:
+    - Training: full sequence with explicit mask
+    - Inference: incremental decoding with KV cache
+    """
     
-    A simple shifted-window variant is implemented: odd layers use a cyclic
-    shift of (Sh, Sw) before windowing, even layers use no shift. Given our
-    grid is effectively 2D with D=1, only Y/X are shifted.
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        self.d_model = d_model
+        self.nhead = nhead
+        self.d_head = d_model // nhead
+        
+        # Q, K, V projections
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.scale = self.d_head ** -0.5
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        window_size: int = 512,
+        attn_mask: Optional[torch.Tensor] = None,  # Deprecated: kept for API compatibility, not used
+    ) -> torch.Tensor:
+        """Training forward: chunked sliding-window attention (O(T·K) memory).
+        
+        Processes sequence in chunks, computing attention only within sliding window.
+        NEVER allocates full (T × T) attention matrix.
+        
+        Args:
+            x: (B, T, d_model) input tokens
+            window_size: Sliding window size K (each token attends to previous K tokens)
+            attn_mask: Unused (kept for API compatibility)
+        
+        Returns:
+            out: (B, T, d_model) output tokens
+        """
+        B, T, C = x.shape
+        
+        # Project Q, K, V
+        q = self.q_proj(x).view(B, T, self.nhead, self.d_head).transpose(1, 2)  # (B, H, T, d_head)
+        k = self.k_proj(x).view(B, T, self.nhead, self.d_head).transpose(1, 2)  # (B, H, T, d_head)
+        v = self.v_proj(x).view(B, T, self.nhead, self.d_head).transpose(1, 2)  # (B, H, T, d_head)
+        
+        # Chunked sliding-window attention
+        # Process sequence in chunks to avoid T×T allocation
+        chunk_size = window_size  # Process chunks of size K
+        out_chunks = []
+        
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            chunk_len = end - start
+            
+            # Query chunk: tokens [start, end)
+            q_chunk = q[:, :, start:end, :]  # (B, H, chunk_len, d_head)
+            
+            # Key/Value chunk: tokens [max(0, start-window_size), end)
+            # This ensures each token in q_chunk can attend to previous K tokens
+            kv_start = max(0, start - window_size)
+            k_chunk = k[:, :, kv_start:end, :]  # (B, H, ≤(window_size+chunk_len), d_head)
+            v_chunk = v[:, :, kv_start:end, :]  # (B, H, ≤(window_size+chunk_len), d_head)
+            
+            # Compute attention scores: (B, H, chunk_len, kv_len)
+            kv_len = k_chunk.shape[2]
+            scores = torch.matmul(q_chunk, k_chunk.transpose(-2, -1)) * self.scale  # (B, H, chunk_len, kv_len)
+            
+            # Create block-causal sliding-window mask (vectorized)
+            # For query token at position i_rel in q_chunk (full position = start + i_rel),
+            # it can attend to key positions j_rel in k_chunk (full position = kv_start + j_rel)
+            # where: max(0, start + i_rel - window_size) <= kv_start + j_rel <= start + i_rel
+            offset = start - kv_start  # Offset between q_chunk and k_chunk start positions
+            
+            # Create position indices
+            i_rel = torch.arange(chunk_len, device=scores.device).unsqueeze(1)  # (chunk_len, 1)
+            j_rel = torch.arange(kv_len, device=scores.device).unsqueeze(0)  # (1, kv_len)
+            
+            # Full positions
+            full_i = start + i_rel  # (chunk_len, 1)
+            full_j = kv_start + j_rel  # (1, kv_len)
+            
+            # Causal: j <= i
+            causal_mask = (full_j <= full_i)  # (chunk_len, kv_len)
+            
+            # Sliding window: j >= max(0, i - window_size)
+            window_start = torch.clamp(full_i - window_size, min=0)  # (chunk_len, 1)
+            window_mask = (full_j >= window_start)  # (chunk_len, kv_len)
+            
+            # Combine: can attend if both causal AND within window
+            mask = causal_mask & window_mask  # (chunk_len, kv_len)
+            
+            scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            
+            # Compute attention
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            
+            # Apply attention to values
+            out_chunk = torch.matmul(attn_weights, v_chunk)  # (B, H, chunk_len, d_head)
+            out_chunks.append(out_chunk)
+        
+        # Concatenate all chunks
+        out = torch.cat(out_chunks, dim=2)  # (B, H, T, d_head)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, d_model)
+        out = self.out_proj(out)
+        
+        return out
+    
+    def forward_step(
+        self,
+        x_t: torch.Tensor,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        window_size: int = 512,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Inference forward: incremental decoding with KV cache.
+        
+        Args:
+            x_t: (B, 1, d_model) current token
+            past_kv: Optional tuple of (past_k, past_v), each (B, H, K, d_head)
+            window_size: Sliding window size K
+        
+        Returns:
+            out_t: (B, 1, d_model) output for current token
+            new_kv: Tuple of (new_k, new_v), each (B, H, min(K+1, window_size), d_head)
+        """
+        B, _, C = x_t.shape
+        q_t = self.q_proj(x_t).view(B, 1, self.nhead, self.d_head).transpose(1, 2)  # (B, H, 1, d_head)
+        k_t = self.k_proj(x_t).view(B, 1, self.nhead, self.d_head).transpose(1, 2)  # (B, H, 1, d_head)
+        v_t = self.v_proj(x_t).view(B, 1, self.nhead, self.d_head).transpose(1, 2)  # (B, H, 1, d_head)
+        
+        if past_kv is None:
+            # First token: no past
+            k_cache = k_t  # (B, H, 1, d_head)
+            v_cache = v_t  # (B, H, 1, d_head)
+        else:
+            past_k, past_v = past_kv
+            # Append new k/v to cache
+            k_cache = torch.cat([past_k, k_t], dim=2)  # (B, H, K+1, d_head)
+            v_cache = torch.cat([past_v, v_t], dim=2)  # (B, H, K+1, d_head)
+            
+            # Truncate to window_size (keep only last K tokens)
+            if k_cache.shape[2] > window_size:
+                k_cache = k_cache[:, :, -window_size:, :]
+                v_cache = v_cache[:, :, -window_size:, :]
+        
+        # Attention: q_t attends to all cached k/v
+        scores = torch.matmul(q_t, k_cache.transpose(-2, -1)) * self.scale  # (B, H, 1, K)
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        out = torch.matmul(attn_weights, v_cache)  # (B, H, 1, d_head)
+        out = out.transpose(1, 2).contiguous().view(B, 1, C)  # (B, 1, d_model)
+        out = self.out_proj(out)
+        
+        return out, (k_cache, v_cache)
+
+
+class BlockCausalTransformer(nn.Module):
+    """Block-causal sliding-window attention for autoregressive decoding.
+    
+    Each token attends only to the previous K tokens (sliding window), enabling:
+    - Training memory: O(T·K) instead of O(T²)
+    - Fast inference: O(T) with KV cache support
+    - Consistent train/inference behavior
+    
+    This is the correct architecture for autoregressive generation at long sequence
+    lengths (1k-4k tokens), unlike Swin which is incompatible with AR decoding.
     
     Args:
         d_model: Feature dimension.
         nhead: Number of attention heads.
-        num_layers: Number of stacked Swin blocks.
-        window_size: (Wh, Ww) window size in grid cells (D dimension is assumed 1).
-        shift_size: (Sh, Sw) shift size; if None, defaults to half window.
+        num_layers: Number of transformer layers.
+        window_size: Sliding window size K (each token attends to previous K tokens).
         dropout: Dropout rate.
         dim_feedforward: FFN hidden dimension.
     """
@@ -83,19 +245,14 @@ class SparseSwin3D(nn.Module):
         self,
         d_model: int = 512,
         nhead: int = 8,
-        num_layers: int = 2,
-        window_size: Tuple[int, int] = (8, 8),
-        shift_size: Optional[Tuple[int, int]] = None,
+        num_layers: int = 6,
+        window_size: int = 512,
         dropout: float = 0.1,
         dim_feedforward: int = 2048,
     ):
         super().__init__()
         self.d_model = d_model
-        self.window_h, self.window_w = window_size
-        if shift_size is None:
-            self.shift_h, self.shift_w = self.window_h // 2, self.window_w // 2
-        else:
-            self.shift_h, self.shift_w = shift_size
+        self.window_size = window_size
         self.num_layers = num_layers
 
         self.attn_blocks = nn.ModuleList()
@@ -105,12 +262,7 @@ class SparseSwin3D(nn.Module):
 
         for _ in range(num_layers):
             self.attn_blocks.append(
-                nn.MultiheadAttention(
-                    embed_dim=d_model,
-                    num_heads=nhead,
-                    dropout=dropout,
-                    batch_first=True,
-                )
+                BlockCausalAttention(d_model, nhead, dropout)
             )
             self.ffn_blocks.append(
                 nn.Sequential(
@@ -124,54 +276,57 @@ class SparseSwin3D(nn.Module):
             self.norm1.append(nn.LayerNorm(d_model))
             self.norm2.append(nn.LayerNorm(d_model))
 
-    def _compute_window_ids(
-        self,
-        coord_ids: torch.Tensor,
-        grid_shape: List[int],
-        shift: bool = False,
-    ) -> torch.Tensor:
-        """Compute window id for each token based on its 3D grid coordinate."""
-        D, H, W = grid_shape
-        # coord_ids are flattened; convert back to (z,y,x)
-        z = coord_ids // (H * W)
-        rem = coord_ids % (H * W)
-        y = rem // W
-        x = rem % W
-
-        if shift:
-            # cyclic shift on Y/X (D is 1 so we skip Z)
-            y = (y + self.shift_h) % H
-            x = (x + self.shift_w) % W
-
-        win_y = y // self.window_h
-        win_x = x // self.window_w
-        num_win_y = (H + self.window_h - 1) // self.window_h
-        window_id = win_y * num_win_y + win_x  # (T,)
-        return window_id
+    def _create_block_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Create block-causal sliding-window attention mask.
+        
+        Each token at position i can attend to tokens in [max(0, i-K), i].
+        This creates a lower-triangular band mask with width K.
+        
+        Args:
+            seq_len: Sequence length T.
+            device: Device for mask tensor.
+        
+        Returns:
+            mask: (T, T) boolean mask where True = can attend, False = masked out.
+        """
+        # Create position indices: (T, 1) and (1, T)
+        i = torch.arange(seq_len, device=device).unsqueeze(1)  # (T, 1)
+        j = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, T)
+        
+        # Standard causal: j <= i
+        causal_mask = (j <= i)
+        
+        # Sliding window: j >= max(0, i - window_size)
+        window_start = torch.clamp(i - self.window_size, min=0)
+        window_mask = (j >= window_start)
+        
+        # Combine: can attend if both causal AND within window
+        mask = causal_mask & window_mask
+        
+        return mask
 
     def forward(
         self,
         x: torch.Tensor,
-        coord_ids: torch.Tensor,
-        grid_shape: List[int],
+        coord_ids: Optional[torch.Tensor] = None,
+        grid_shape: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        """Windowed self-attention.
+        """Training forward: chunked sliding-window attention (O(T·K) memory).
+        
+        Uses chunked attention to avoid allocating full (T × T) matrices.
+        Each token attends to previous K tokens within sliding window.
         
         Args:
             x: (B, T, d_model) token features.
-            coord_ids: (T,) flattened coordinate IDs for each token.
-            grid_shape: [D, H, W] grid shape.
+            coord_ids: Unused (kept for API compatibility).
+            grid_shape: Unused (kept for API compatibility).
         
         Returns:
             x_out: (B, T, d_model) refined features.
         """
         assert x.dim() == 3, "Expected (B, T, C)"
-        B, T, C = x.shape
-        assert B == 1, "SparseSwin3D currently assumes batch size = 1 (handled per batch outside)."
-
+        
         for layer_idx in range(self.num_layers):
-            apply_shift = (layer_idx % 2 == 1) and (self.shift_h > 0 or self.shift_w > 0)
-            window_id = self._compute_window_ids(coord_ids, grid_shape, shift=apply_shift)  # (T,)
             attn = self.attn_blocks[layer_idx]
             ffn = self.ffn_blocks[layer_idx]
             norm1 = self.norm1[layer_idx]
@@ -179,28 +334,61 @@ class SparseSwin3D(nn.Module):
 
             # Pre-norm
             x_ln = norm1(x)
-            x_new = x.clone()
-
-            # Process each window independently
-            unique_windows = torch.unique(window_id)
-            for wid in unique_windows:
-                mask = window_id == wid
-                if not mask.any():
-                    continue
-                idx = mask.nonzero(as_tuple=False).squeeze(-1)  # (Tw,)
-                if idx.numel() == 0:
-                    continue
-
-                tokens = x_ln[:, idx, :]  # (1, Tw, C)
-                # MultiheadAttention expects (B, Tw, C) when batch_first=True
-                attn_out, _ = attn(tokens, tokens, tokens, need_weights=False)
-                x_new[:, idx, :] = x_new[:, idx, :] + attn_out
+            
+            # Chunked block-causal attention: O(T·K) memory, never allocates T×T
+            attn_out = attn(x_ln, window_size=self.window_size)
+            x = x + attn_out
 
             # FFN with residual
-            x_ffn_ln = norm2(x_new)
-            x = x_new + ffn(x_ffn_ln)
+            x_ffn_ln = norm2(x)
+            x = x + ffn(x_ffn_ln)
 
         return x
+    
+    def forward_step(
+        self,
+        x_t: torch.Tensor,
+        past_kv_list: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Inference forward: incremental decoding with KV cache.
+        
+        Args:
+            x_t: (B, 1, d_model) current token
+            past_kv_list: Optional list of (past_k, past_v) tuples, one per layer
+        
+        Returns:
+            out_t: (B, 1, d_model) output for current token
+            new_kv_list: List of (new_k, new_v) tuples, one per layer
+        """
+        if past_kv_list is None:
+            past_kv_list = [None] * self.num_layers
+        
+        new_kv_list = []
+        x = x_t
+        
+        for layer_idx in range(self.num_layers):
+            attn = self.attn_blocks[layer_idx]
+            ffn = self.ffn_blocks[layer_idx]
+            norm1 = self.norm1[layer_idx]
+            norm2 = self.norm2[layer_idx]
+            
+            # Pre-norm
+            x_ln = norm1(x)
+            
+            # Incremental attention with KV cache
+            attn_out, new_kv = attn.forward_step(
+                x_ln,
+                past_kv=past_kv_list[layer_idx],
+                window_size=self.window_size,
+            )
+            x = x + attn_out
+            new_kv_list.append(new_kv)
+            
+            # FFN with residual
+            x_ffn_ln = norm2(x)
+            x = x + ffn(x_ffn_ln)
+        
+        return x, new_kv_list
 
 
 @MIDDLE_ENCODERS.register_module()
@@ -244,6 +432,7 @@ class SparsePatternAdaptationFormer(nn.Module):
         commitment_cost: float = 0.25,
         grid_shape: List[int] = [64, 64, 64],
         max_seq_length: int = 10000,
+        window_size: int = 512,  # Block-causal sliding window size K
     ):
         super().__init__()
         
@@ -279,24 +468,25 @@ class SparsePatternAdaptationFormer(nn.Module):
         # Input projection: combine coord and value embeddings
         self.input_proj = nn.Linear(d_model * 2, d_model)  # coord + value -> d_model
         
-        # Coordinate Transformer: predicts next coordinate (windowed attention)
-        self.coord_transformer = SparseSwin3D(
+        # Coordinate Transformer: predicts next coordinate (block-causal sliding-window attention)
+        # window_size: each token attends to previous K tokens (O(T·K) memory, fast inference)
+        self.coord_transformer = BlockCausalTransformer(
             d_model=d_model,
             nhead=nhead,
             num_layers=num_coord_layers,
+            window_size=window_size,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            window_size=(8, 8),
         )
         
-        # Value Transformer: predicts codebook index given coordinate (windowed attention)
-        self.value_transformer = SparseSwin3D(
+        # Value Transformer: predicts codebook index given coordinate (block-causal sliding-window attention)
+        self.value_transformer = BlockCausalTransformer(
             d_model=d_model,
             nhead=nhead,
             num_layers=num_value_layers,
+            window_size=window_size,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            window_size=(8, 8),
         )
         
         # Output heads
@@ -460,12 +650,12 @@ class SparsePatternAdaptationFormer(nn.Module):
             seq_pos_ids = torch.arange(len(seq_coords), device=device).clamp(max=self.max_seq_length - 1)
 
             seq_embedded = self._embed_tokens(seq_coords, seq_values, seq_pos_ids).unsqueeze(0)
-            coord_hidden = self.coord_transformer(seq_embedded, seq_coords, spatial_shape_model)
+            coord_hidden = self.coord_transformer(seq_embedded)  # Block-causal attention
             coord_logits = self.coord_head(coord_hidden)
 
             coord_emb_for_value = self.coord_embed(seq_coords).unsqueeze(0)
             value_input = coord_hidden + coord_emb_for_value
-            value_hidden = self.value_transformer(value_input, seq_coords, spatial_shape_model)
+            value_hidden = self.value_transformer(value_input)  # Block-causal attention
             value_logits = self.value_head(value_hidden)
 
             pseudo_len = len(pseudo_coord_ids) + 1  # include END
@@ -495,11 +685,76 @@ class SparsePatternAdaptationFormer(nn.Module):
             # This matches inference behavior: start from pseudo only and generate
             # a new sparse pattern. Run under no_grad so it doesn't affect backprop.
             with torch.no_grad():
+                # mesure the time of the forward_test
+                start_time = time.time()
+                
                 refined_feat_b, refined_idx_b, _ = self.forward_test(
                     pseudo_sparse_features=pseudo_feat_b,
                     pseudo_sparse_indices=pseudo_idx_b,
                     spatial_shape=spatial_shape_model,
                 )
+                
+                end_inference_time = time.time()
+                
+                # === Monitoring loss (no gradients) ===
+                # Compare refined features with GT features for monitoring
+                # Target: refined should match GT count and features
+                gt_count = gt_feat_sorted.shape[0]
+                refined_count = refined_feat_b.shape[0]
+                pseudo_count = pseudo_feat_sorted.shape[0]  # Keep for reference
+                
+                # Count difference: refined vs GT (normalized)
+                count_diff = abs(gt_count - refined_count) / max(gt_count, 1)
+                
+                # Generation length ratio (refined / GT) - target is 1.0
+                gen_ratio = refined_count / max(gt_count, 1)
+                
+                # Feature statistics comparison: refined vs GT (if both non-empty)
+                if gt_count > 0 and refined_count > 0:
+                    # Mean feature distance (simple L2 between mean features)
+                    gt_mean = gt_feat_sorted.mean(dim=0)  # (C,)
+                    refined_mean = refined_feat_b.mean(dim=0)  # (C,)
+                    feature_dist = torch.norm(gt_mean - refined_mean).item()
+                    
+                    # Chamfer-like distance (sampled, to avoid OOM)
+                    # Sample a subset for comparison
+                    sample_size = min(100, gt_count, refined_count)
+                    gt_sample_idx = torch.randperm(gt_count, device=device)[:sample_size]
+                    refined_sample_idx = torch.randperm(refined_count, device=device)[:sample_size]
+                    gt_sample = gt_feat_sorted[gt_sample_idx]  # (sample_size, C)
+                    refined_sample = refined_feat_b[refined_sample_idx]  # (sample_size, C)
+                    
+                    # Compute pairwise distances (chunked to avoid OOM)
+                    chunk_size = 50
+                    min_dists = []
+                    for i in range(0, sample_size, chunk_size):
+                        chunk_end = min(i + chunk_size, sample_size)
+                        refined_chunk = refined_sample[i:chunk_end]  # (chunk_len, C)
+                        # Distance from refined_chunk to gt_sample
+                        dists = torch.cdist(refined_chunk.unsqueeze(0), gt_sample.unsqueeze(0))  # (1, chunk_len, sample_size)
+                        min_dists.append(dists.min(dim=-1)[0].mean().item())
+                    chamfer_like_dist = sum(min_dists) / len(min_dists) if min_dists else 0.0
+                else:
+                    feature_dist = 0.0
+                    chamfer_like_dist = 0.0
+                    
+                end_time = time.time()
+                
+                # Print monitoring metrics as table
+                infer_time = end_inference_time - start_time
+                stats_time = end_time - end_inference_time
+                total_time = end_time - start_time
+                
+
+                print(f"{'batch':<6} | {'infer_time':<10} | {'stats_time':<10} | {'total_time':<10} | "
+                        f"{'refined':<8} | {'gt':<6} | {'pseudo':<8} | "
+                        f"{'count_diff':<10} | {'gen_ratio':<10} | {'feat_dist':<10} | {'chamfer':<10}")
+                print("-" * 120)
+                
+                # Print data row
+                print(f"{b_idx:<6} | {infer_time:<10.4f} | {stats_time:<10.4f} | {total_time:<10.4f} | "
+                      f"{refined_count:<8} | {gt_count:<6} | {pseudo_count:<8} | "
+                      f"{count_diff:<10.4f} | {gen_ratio:<10.4f} | {feature_dist:<10.4f} | {chamfer_like_dist:<10.4f}")
 
             refined_features_list.append(refined_feat_b.detach())
             refined_indices_list.append(refined_idx_b.detach())
@@ -550,44 +805,96 @@ class SparsePatternAdaptationFormer(nn.Module):
             _, _, pseudo_value_ids = self.vq(pseudo_feat_sorted)
             pseudo_coord_ids = pseudo_coords.long().clamp(0, self.END_COORD)
         
-            # Test branch per batch
-            seq_coords = torch.cat([
+            # === Initialize KV cache by processing pseudo tokens incrementally ===
+            # Process all pseudo tokens incrementally to build KV cache (O(T_pseudo) done once)
+            pseudo_seq_coords = torch.cat([
                 pseudo_coord_ids,
                 torch.tensor([self.END_COORD], device=device),
             ])
-            seq_values = torch.cat([
+            pseudo_seq_values = torch.cat([
                 pseudo_value_ids,
                 torch.tensor([self.END_VALUE], device=device),
             ])
-
+            
+            # Initialize KV caches
+            coord_kv_cache = None
+            value_kv_cache = None
+            last_coord_hidden = None
+            
+            # Process pseudo tokens incrementally to build KV cache
+            for t in range(len(pseudo_seq_coords)):
+                coord_id_t = pseudo_seq_coords[t].item()
+                value_id_t = pseudo_seq_values[t].item()
+                pos_id_t = t
+                
+                # Embed token
+                coord_emb_t = self.coord_embed(torch.tensor([coord_id_t], device=device)).unsqueeze(0)  # (1, 1, d_model)
+                value_emb_t = self.value_embed(torch.tensor([value_id_t], device=device)).unsqueeze(0)  # (1, 1, d_model)
+                pos_emb_t = self.pos_embed(torch.tensor([pos_id_t], device=device).clamp(max=self.max_seq_length - 1)).unsqueeze(0)  # (1, 1, d_model)
+                
+                combined_t = torch.cat([coord_emb_t, value_emb_t], dim=-1)  # (1, 1, 2*d_model)
+                token_emb_t = self.input_proj(combined_t)  # (1, 1, d_model)
+                token_t = token_emb_t + pos_emb_t  # (1, 1, d_model)
+                
+                # Update coord KV cache
+                coord_hidden_t, coord_kv_cache = self.coord_transformer.forward_step(token_t, coord_kv_cache)
+                last_coord_hidden = coord_hidden_t
+                
+                # Update value KV cache
+                coord_emb_for_value = self.coord_embed(torch.tensor([coord_id_t], device=device)).unsqueeze(0)  # (1, 1, d_model)
+                value_input_t = coord_hidden_t + coord_emb_for_value  # (1, 1, d_model)
+                _, value_kv_cache = self.value_transformer.forward_step(value_input_t, value_kv_cache)
+            
+            # === Autoregressive generation with KV cache (O(T) total) ===
+            # KV cache already contains all pseudo tokens (including END)
+            # Now generate new tokens incrementally, one at a time
+            # 
+            # NOTE: Refined count fluctuation is expected during training because:
+            # 1. Generation uses stochastic sampling (multinomial) - same input can produce different outputs
+            # 2. Model is learning to predict END tokens - early in training it may generate too many/few tokens
+            # 3. The model learns to match GT count through the coord/value loss on GT sequence
+            # As training progresses, gen_ratio should stabilize closer to 1.0
             generated_indices = []
             generated_values = []
             max_gen_length = min(self.max_seq_length, len(pseudo_coord_ids) * 2)
+            
+            # Start generation from position after pseudo sequence
+            current_pos = len(pseudo_seq_coords)
+            # Use last coord hidden state to predict first new coord
+            coord_logits = self.coord_head(last_coord_hidden)  # (1, 1, vocab_size)
+            coord_probs = F.softmax(coord_logits, dim=-1)
+            next_coord = torch.multinomial(coord_probs.view(-1), 1)[0].item()  # Stochastic sampling
 
-            for _ in range(max_gen_length):
-                # Clamp pos ids to embedding range
-                seq_pos_ids = torch.arange(len(seq_coords), device=device).clamp(max=self.max_seq_length - 1)
-                seq_embedded = self._embed_tokens(seq_coords, seq_values, seq_pos_ids).unsqueeze(0)
-
-                coord_hidden = self.coord_transformer(seq_embedded, seq_coords, spatial_shape_model)
-                coord_logits = self.coord_head(coord_hidden[:, -1:, :])
-                coord_probs = F.softmax(coord_logits, dim=-1)
-                next_coord = torch.multinomial(coord_probs.view(-1), 1)[0].item()
+            for step in range(max_gen_length):
                 if next_coord == self.END_COORD:
                     break
-
-                coord_emb = self.coord_embed(torch.tensor([next_coord], device=device)).unsqueeze(0)
-                value_input_seq = coord_hidden[:, -1:, :] + coord_emb
-                value_hidden = self.value_transformer(value_input_seq, torch.tensor([next_coord], device=device), spatial_shape_model)
-                value_logits = self.value_head(value_hidden)
+                
+                # Step 1: Embed coord + END_VALUE placeholder, process through coord transformer
+                coord_emb_t = self.coord_embed(torch.tensor([next_coord], device=device)).unsqueeze(0)  # (1, 1, d_model)
+                value_emb_t = self.value_embed(torch.tensor([self.END_VALUE], device=device)).unsqueeze(0)  # (1, 1, d_model)
+                pos_emb_t = self.pos_embed(torch.tensor([current_pos], device=device).clamp(max=self.max_seq_length - 1)).unsqueeze(0)  # (1, 1, d_model)
+                
+                combined_t = torch.cat([coord_emb_t, value_emb_t], dim=-1)  # (1, 1, 2*d_model)
+                token_emb_t = self.input_proj(combined_t)  # (1, 1, d_model)
+                token_t = token_emb_t + pos_emb_t  # (1, 1, d_model)
+                
+                # Update coord KV cache with coord+END_VALUE token (O(1))
+                coord_hidden_t, coord_kv_cache = self.coord_transformer.forward_step(token_t, coord_kv_cache)
+                
+                # Step 2: Predict value from coord hidden state
+                next_coord_emb = self.coord_embed(torch.tensor([next_coord], device=device)).unsqueeze(0)  # (1, 1, d_model)
+                value_input_t = coord_hidden_t + next_coord_emb  # (1, 1, d_model)
+                
+                # Update value KV cache (O(1))
+                value_hidden_t, value_kv_cache = self.value_transformer.forward_step(value_input_t, value_kv_cache)
+                value_logits = self.value_head(value_hidden_t)  # (1, 1, vocab_size)
                 value_probs = F.softmax(value_logits, dim=-1)
                 next_value = torch.multinomial(value_probs.view(-1), 1)[0].item()
+                
                 if next_value == self.END_VALUE:
                     break
-
-                seq_coords = torch.cat([seq_coords, torch.tensor([next_coord], device=device)])
-                seq_values = torch.cat([seq_values, torch.tensor([next_value], device=device)])
-
+                
+                # Store generated output (use the coord that generated this value)
                 coord_3d = self._coord_id_to_3d(next_coord, spatial_shape_model).to(device)
                 coord_4d = torch.cat([
                     torch.tensor([b_idx], device=device).unsqueeze(0),
@@ -595,6 +902,25 @@ class SparsePatternAdaptationFormer(nn.Module):
                 ], dim=1)
                 generated_indices.append(coord_4d)
                 generated_values.append(next_value)
+                
+                # Step 3: Update coord KV cache with coord+value token for next coord prediction
+                coord_emb_t2 = self.coord_embed(torch.tensor([next_coord], device=device)).unsqueeze(0)  # (1, 1, d_model)
+                value_emb_t2 = self.value_embed(torch.tensor([next_value], device=device)).unsqueeze(0)  # (1, 1, d_model)
+                combined_t2 = torch.cat([coord_emb_t2, value_emb_t2], dim=-1)  # (1, 1, 2*d_model)
+                token_emb_t2 = self.input_proj(combined_t2)  # (1, 1, d_model)
+                token_t2 = token_emb_t2 + pos_emb_t  # (1, 1, d_model)
+                
+                # Update coord KV cache with complete coord+value token (O(1))
+                coord_hidden_t2, coord_kv_cache = self.coord_transformer.forward_step(token_t2, coord_kv_cache)
+                
+                # Step 4: Predict next coord from updated hidden state
+                coord_logits = self.coord_head(coord_hidden_t2)  # (1, 1, vocab_size)
+                coord_probs = F.softmax(coord_logits, dim=-1)
+                next_coord = torch.multinomial(coord_probs.view(-1), 1)[0].item()
+                
+                # Update for next iteration
+                current_pos += 1
+                last_coord_hidden = coord_hidden_t2
 
             if len(generated_values) > 0:
                 generated_value_tensor = torch.tensor(generated_values, device=device)

@@ -467,8 +467,8 @@ class SparseRefinement(nn.Module):
                 gt_points=gt_points,
                 return_loss=return_loss,
             )
-            print("pseudo_sparse_features.shape",pseudo_sparse_features.shape)
-            print("refined_features.shape",refined_features.shape)
+            # print("pseudo_sparse_features.shape",pseudo_sparse_features.shape)
+            # print("refined_features.shape",refined_features.shape)
 
 
             return refined_features, refined_indices, losses

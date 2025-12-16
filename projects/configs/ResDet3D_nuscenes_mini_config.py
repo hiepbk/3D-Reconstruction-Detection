@@ -312,6 +312,7 @@ model = dict(
                 commitment_cost=0.25,  # Weight for VQ commitment loss
                 grid_shape=[1, 64, 64], # [D, H, W] spatial shape
                 max_seq_length=4096,  # Maximum sequence length for generation
+                window_size=512,  # Block-causal sliding window size K (each token attends to previous K tokens)
             ),
             # Losses are handled internally by transformer (loss_coord, loss_value, loss_vq)
             # Optional auxiliary losses (can be None)
