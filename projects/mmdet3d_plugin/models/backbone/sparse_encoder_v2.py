@@ -133,19 +133,19 @@ class SparseEncoderV2(nn.Module):
         encode_features = []
         for encoder_layer in self.encoder_layers:
             x = encoder_layer(x)
-            print("features shape",x.features.shape)
-            print("indices shape",x.indices.shape)
-            print("spatial shape",x.spatial_shape)
-            print("--------------------------------")
+            # print("features shape",x.features.shape)
+            # print("indices shape",x.indices.shape)
+            # print("spatial shape",x.spatial_shape)
+            # print("--------------------------------")
             encode_features.append(x)
 
         # for detection head
         # [200, 176, 5] -> [200, 176, 2]
         out = self.conv_out(encode_features[-1])
-        print("out features shape",out.features.shape)
-        print("out indices shape",out.indices.shape)
-        print("out spatial shape",out.spatial_shape)
-        print("--------------------------------")
+        # print("out features shape",out.features.shape)
+        # print("out indices shape",out.indices.shape)
+        # print("out spatial shape",out.spatial_shape)
+        # print("--------------------------------")
         spatial_features = out.dense()
 
         N, C, D, H, W = spatial_features.shape

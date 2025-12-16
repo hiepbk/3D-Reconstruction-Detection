@@ -311,7 +311,7 @@ model = dict(
                 codebook_dim=256,  # Feature dimension (matches sparse encoder output)
                 commitment_cost=0.25,  # Weight for VQ commitment loss
                 grid_shape=[1, 64, 64], # [D, H, W] spatial shape
-                max_seq_length=2048,  # Maximum sequence length for generation
+                max_seq_length=4096,  # Maximum sequence length for generation
             ),
             # Losses are handled internally by transformer (loss_coord, loss_value, loss_vq)
             # Optional auxiliary losses (can be None)

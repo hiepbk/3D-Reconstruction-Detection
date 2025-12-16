@@ -252,6 +252,10 @@ class SparsePatternAdaptationFormer(nn.Module):
         self.codebook_dim = codebook_dim
         self.grid_shape = grid_shape
         self.max_seq_length = max_seq_length
+        # Max tokens for each stream (pseudo / gt) before concatenation,
+        # following ShapeFormer-style block_size//2 logic.
+        # Reserve 1 slot in each stream for its END token.
+        self.max_stream_len = max(1, self.max_seq_length // 2 - 1)
         
         D, H, W = grid_shape
         self.max_coord_id = D * H * W  # Maximum coordinate ID (for coordinate vocabulary)
@@ -400,7 +404,7 @@ class SparsePatternAdaptationFormer(nn.Module):
             )
             _, vq_loss_pseudo, pseudo_value_ids = self.vq(pseudo_feat_sorted)
             pseudo_coord_ids = pseudo_coords.long().clamp(0, self.END_COORD)
-
+        
             # Train branch per batch
             gt_batch_mask = gt_sparse_indices[:, 0] == b_idx
             gt_feat_b = gt_sparse_features[gt_batch_mask]
@@ -416,14 +420,29 @@ class SparsePatternAdaptationFormer(nn.Module):
             )
             _, vq_loss_gt, gt_value_ids = self.vq(gt_feat_sorted)
             gt_coord_ids = gt_coords.long().clamp(0, self.END_COORD)
-        
-            # Build sequence with max length handling: keep full pseudo, truncate GT tail if needed
-            pseudo_len = len(pseudo_coord_ids) + 1  # include END
-            # Reserve 1 slot for final END
-            available_gt_slots = max(0, self.max_seq_length - pseudo_len - 1)
-            if available_gt_slots < len(gt_coord_ids):
-                gt_coord_ids = gt_coord_ids[:available_gt_slots]
-                gt_value_ids = gt_value_ids[:available_gt_slots]
+
+            # === Symmetric max-length handling for pseudo and GT (ShapeFormer-style) ===
+            # Each stream is capped to self.max_stream_len tokens before adding END.
+            if len(pseudo_coord_ids) > self.max_stream_len:
+                # Uniform subsample to max_stream_len
+                keep_idx = torch.linspace(
+                    0,
+                    len(pseudo_coord_ids) - 1,
+                    steps=self.max_stream_len,
+                    device=device,
+                ).long()
+                pseudo_coord_ids = pseudo_coord_ids[keep_idx]
+                pseudo_value_ids = pseudo_value_ids[keep_idx]
+
+            if len(gt_coord_ids) > self.max_stream_len:
+                keep_idx = torch.linspace(
+                    0,
+                    len(gt_coord_ids) - 1,
+                    steps=self.max_stream_len,
+                    device=device,
+                ).long()
+                gt_coord_ids = gt_coord_ids[keep_idx]
+                gt_value_ids = gt_value_ids[keep_idx]
 
             seq_coords = torch.cat([
                 pseudo_coord_ids,
@@ -472,8 +491,18 @@ class SparsePatternAdaptationFormer(nn.Module):
                 'loss_vq_gt': vq_loss_gt,
             })
 
-            refined_features_list.append(gt_feat_sorted)
-            refined_indices_list.append(gt_idx_sorted)
+            # === Use free-running inference (forward_test) for refined pattern ===
+            # This matches inference behavior: start from pseudo only and generate
+            # a new sparse pattern. Run under no_grad so it doesn't affect backprop.
+            with torch.no_grad():
+                refined_feat_b, refined_idx_b, _ = self.forward_test(
+                    pseudo_sparse_features=pseudo_feat_b,
+                    pseudo_sparse_indices=pseudo_idx_b,
+                    spatial_shape=spatial_shape_model,
+                )
+
+            refined_features_list.append(refined_feat_b.detach())
+            refined_indices_list.append(refined_idx_b.detach())
 
         refined_features = torch.cat(refined_features_list, dim=0) if refined_features_list else torch.empty((0, self.codebook_dim), device=device)
         refined_indices = torch.cat(refined_indices_list, dim=0) if refined_indices_list else torch.empty((0, 4), device=device, dtype=torch.long)
@@ -559,7 +588,7 @@ class SparsePatternAdaptationFormer(nn.Module):
                 seq_coords = torch.cat([seq_coords, torch.tensor([next_coord], device=device)])
                 seq_values = torch.cat([seq_values, torch.tensor([next_value], device=device)])
 
-                coord_3d = self._coord_id_to_3d(next_coord, spatial_shape_model)
+                coord_3d = self._coord_id_to_3d(next_coord, spatial_shape_model).to(device)
                 coord_4d = torch.cat([
                     torch.tensor([b_idx], device=device).unsqueeze(0),
                     coord_3d.unsqueeze(0)
