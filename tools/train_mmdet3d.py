@@ -261,6 +261,8 @@ def main():
         train_cfg=cfg.get('train_cfg'),
         test_cfg=cfg.get('test_cfg'))
     model.init_weights()
+    # Expose cfg to hooks that may need it (e.g., custom eval hook)
+    model.cfg = cfg
 
     logger.info(f'Model:\n{model}')
     

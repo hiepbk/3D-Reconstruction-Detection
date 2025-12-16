@@ -139,7 +139,7 @@ rescon_pipeline = [
             # )
             
             
-            dict(
+    dict(
                 type='FilterPointByRange', 
                 point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 6.0]),
             
@@ -314,8 +314,6 @@ model = dict(
                 max_seq_length=4096,  # Maximum sequence length for generation
                 coord_window_size=1536,  # Coord transformer window (larger for global structure + END visibility)
                 value_window_size=512,  # Value transformer window (smaller, local context sufficient)
-                run_inference_during_training=True,  # Disable AR inference during training for speed (Fix 3)
-                inference_freq=10,  # If enabled, run inference every N iterations (for monitoring only)
             ),
             # Losses are handled internally by transformer (loss_coord, loss_value, loss_vq)
             # Optional auxiliary losses (can be None)
@@ -415,6 +413,13 @@ log_config = dict(
     ])
 
 custom_hooks = [
+    dict(
+        type='PseudoEvalHook',
+        eval_interval=1,   # run every iteration
+        eval_batches=1,    # number of val batches to run each time (for better statistics)
+        save_ckpt=True,    # save checkpoint after evaluation
+        ckpt_interval=None  # save checkpoint every 100 iterations (None = same as eval_interval)
+    ),
 ]
 
 

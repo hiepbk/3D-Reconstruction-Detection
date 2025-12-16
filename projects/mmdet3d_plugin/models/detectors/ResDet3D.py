@@ -106,16 +106,21 @@ class ResDet3D(MVXTwoStageDetector):
             # Forward through reconstruction backbone
             result = self.reconstruction_backbone(img, img_metas, return_loss=return_loss, points=points)
             
-            # Handle new return format: (batch_point_clouds, losses)
+            # Handle return format: (batch_point_clouds, losses/metrics)
             if isinstance(result, tuple) and len(result) == 2:
-                pseudo_points, losses = result
-                # Store losses for later use in loss computation
-                if losses is not None:
-                    self._reconstruction_losses = losses
+                pseudo_points, extra = result
+                if return_loss:
+                    # Training: extra is losses dict
+                    if extra is not None:
+                        self._reconstruction_losses = extra
+                else:
+                    # Test: extra is metrics dict (store for hook to access)
+                    if extra is not None:
+                        self._reconstruction_metrics = extra
             else:
                 # Backward compatibility: just point clouds
                 pseudo_points = result
-                losses = None
+                extra = None
             
             # Return format matching parent class: (img_feats, pts_feats)
             # For now, img_feats is None since we're only using reconstruction
@@ -185,10 +190,11 @@ class ResDet3D(MVXTwoStageDetector):
         """
         if self.reconstruction_backbone is not None:
             # Extract features (generates point cloud)
-            img_feats, pts_feats = self.extract_feat(points, img=img, img_metas=img_metas)
+            # Pass points explicitly to extract_feat so GT points are available for metrics
+            img_feats, pts_feats = self.extract_feat(points=points, img=img, img_metas=img_metas, return_loss=False)
             
             # Handle tuple return (backward compatibility)
-            if isinstance(pseudo_points, tuple):
+            if isinstance(pts_feats, tuple):
                 pts_feats, _ = pts_feats
             
             # For now, return empty results since we don't have head/neck

@@ -424,16 +424,18 @@ class SparseRefinement(nn.Module):
         pseudo_sparse_features: torch.Tensor,
         pseudo_sparse_indices: torch.Tensor,
         pseudo_sparse_spatial_shape: List[int],
+        gt_sparse_features: Optional[torch.Tensor] = None,
+        gt_sparse_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
-        refined_features, refined_indices, _ = self.pattern_adaptation(
+        refined_features, refined_indices, metrics = self.pattern_adaptation(
             pseudo_sparse_features=pseudo_sparse_features,
             pseudo_sparse_indices=pseudo_sparse_indices,
             spatial_shape=pseudo_sparse_spatial_shape,
-            gt_sparse_features=None,
-            gt_sparse_indices=None,
+            gt_sparse_features=gt_sparse_features,
+            gt_sparse_indices=gt_sparse_indices,
             return_loss=False,
         )
-        return refined_features, refined_indices, None
+        return refined_features, refined_indices, metrics
 
     
     
@@ -475,13 +477,24 @@ class SparseRefinement(nn.Module):
 
             return refined_features, refined_indices, losses
         else:
-            refined_features, refined_indices, _ = self.forward_test(
+            # GT branch for metrics computation (if available)
+            gt_sparse_features = None
+            gt_sparse_indices = None
+            if gt_points_xyz is not None:
+                gt_voxel_features, gt_num_points, gt_coors = self._voxel_encoder(gt_points_xyz)
+                gt_sparse_features, gt_sparse_indices, _ = self.middle_encoder(
+                    gt_voxel_features, gt_coors, batch_size
+                )
+            
+            refined_features, refined_indices, metrics = self.forward_test(
                 pseudo_sparse_features=pseudo_sparse_features,
                 pseudo_sparse_indices=pseudo_sparse_indices,
                 pseudo_sparse_spatial_shape=pseudo_sparse_spatial_shape,
+                gt_sparse_features=gt_sparse_features,
+                gt_sparse_indices=gt_sparse_indices,
             )
 
-            return refined_features, refined_indices, None
+            return refined_features, refined_indices, metrics
 
     
     def _compute_feature_loss(

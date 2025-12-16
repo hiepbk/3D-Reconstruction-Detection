@@ -434,15 +434,10 @@ class SparsePatternAdaptationFormer(nn.Module):
         max_seq_length: int = 10000,
         coord_window_size: int = 1536,  # Coord transformer window (larger for global structure + END visibility)
         value_window_size: int = 512,  # Value transformer window (smaller, local context sufficient)
-        run_inference_during_training: bool = False,  # Whether to run AR inference during training (slow!)
-        inference_freq: int = 10,  # Run inference every N training calls (only if run_inference_during_training=True)
     ):
         super().__init__()
         
         self.d_model = d_model
-        self.run_inference_during_training = run_inference_during_training
-        self.inference_freq = inference_freq
-        self._training_call_count = 0  # Counter for inference frequency
         self.codebook_size = codebook_size
         self.codebook_dim = codebook_dim
         self.grid_shape = grid_shape
@@ -563,6 +558,8 @@ class SparsePatternAdaptationFormer(nn.Module):
             pseudo_sparse_features=pseudo_sparse_features,
             pseudo_sparse_indices=pseudo_sparse_indices,
             spatial_shape=spatial_shape,
+            gt_sparse_features=gt_sparse_features if gt_sparse_features is not None else None,
+            gt_sparse_indices=gt_sparse_indices if gt_sparse_indices is not None else None,
         )
 
     def forward_train(
@@ -688,104 +685,10 @@ class SparsePatternAdaptationFormer(nn.Module):
                 'loss_vq_gt': vq_loss_gt,
             })
 
-            # === Optional AR inference for monitoring (Fix 3: Training vs inference separation) ===
-            # AR inference is slow (20-80s per sample), so we only run it occasionally for monitoring
-            # Training uses teacher forcing, so AR inference is NOT needed for gradients
-            # 
-            # Default: run_inference_during_training=False (disabled for speed)
-            # If enabled: run every inference_freq iterations for monitoring
-            
-            should_run_inference = (
-                self.run_inference_during_training and 
-                (self._training_call_count % self.inference_freq == 0)
-            )
-            
-            if should_run_inference:
-                with torch.no_grad():
-                    # Measure the time of the forward_test
-                    start_time = time.time()
-                    
-                    refined_feat_b, refined_idx_b, _ = self.forward_test(
-                        pseudo_sparse_features=pseudo_feat_b,
-                        pseudo_sparse_indices=pseudo_idx_b,
-                        spatial_shape=spatial_shape_model,
-                    )
-                    
-                    end_inference_time = time.time()
-                    
-                    # === Monitoring metrics (no gradients) ===
-                    # Compare refined features with GT features for monitoring
-                    # Target: refined should match GT count and features
-                    gt_count = gt_feat_sorted.shape[0]
-                    refined_count = refined_feat_b.shape[0]
-                    pseudo_count = pseudo_feat_sorted.shape[0]  # Keep for reference
-                    
-                    # Count difference: refined vs GT (normalized)
-                    count_diff = abs(gt_count - refined_count) / max(gt_count, 1)
-                    
-                    # Generation length ratio (refined / GT) - target is 1.0
-                    gen_ratio = refined_count / max(gt_count, 1)
-                    
-                    # Feature statistics comparison: refined vs GT (if both non-empty)
-                    if gt_count > 0 and refined_count > 0:
-                        # Mean feature distance (simple L2 between mean features)
-                        gt_mean = gt_feat_sorted.mean(dim=0)  # (C,)
-                        refined_mean = refined_feat_b.mean(dim=0)  # (C,)
-                        feature_dist = torch.norm(gt_mean - refined_mean).item()
-                        
-                        # Chamfer-like distance (sampled, to avoid OOM)
-                        # Sample a subset for comparison
-                        sample_size = min(100, gt_count, refined_count)
-                        gt_sample_idx = torch.randperm(gt_count, device=device)[:sample_size]
-                        refined_sample_idx = torch.randperm(refined_count, device=device)[:sample_size]
-                        gt_sample = gt_feat_sorted[gt_sample_idx]  # (sample_size, C)
-                        refined_sample = refined_feat_b[refined_sample_idx]  # (sample_size, C)
-                        
-                        # Compute pairwise distances (chunked to avoid OOM)
-                        chunk_size = 50
-                        min_dists = []
-                        for i in range(0, sample_size, chunk_size):
-                            chunk_end = min(i + chunk_size, sample_size)
-                            refined_chunk = refined_sample[i:chunk_end]  # (chunk_len, C)
-                            # Distance from refined_chunk to gt_sample
-                            dists = torch.cdist(refined_chunk.unsqueeze(0), gt_sample.unsqueeze(0))  # (1, chunk_len, sample_size)
-                            min_dists.append(dists.min(dim=-1)[0].mean().item())
-                        chamfer_like_dist = sum(min_dists) / len(min_dists) if min_dists else 0.0
-                    else:
-                        feature_dist = 0.0
-                        chamfer_like_dist = 0.0
-                        
-                    end_time = time.time()
-                    
-                    # Print monitoring metrics as table
-                    infer_time = end_inference_time - start_time
-                    stats_time = end_time - end_inference_time
-                    total_time = end_time - start_time
-                    
-
-                    print(f"{'batch':<6} | {'infer_time':<10} | {'stats_time':<10} | {'total_time':<10} | "
-                            f"{'refined':<8} | {'gt':<6} | {'pseudo':<8} | "
-                            f"{'count_diff':<10} | {'gen_ratio':<10} | {'feat_dist':<10} | {'chamfer':<10}")
-                    print("-" * 120)
-                    
-                    # Print data row
-                    print(f"{b_idx:<6} | {infer_time:<10.4f} | {stats_time:<10.4f} | {total_time:<10.4f} | "
-                          f"{refined_count:<8} | {gt_count:<6} | {pseudo_count:<8} | "
-                          f"{count_diff:<10.4f} | {gen_ratio:<10.4f} | {feature_dist:<10.4f} | {chamfer_like_dist:<10.4f}")
-
-                    refined_features_list.append(refined_feat_b.detach())
-                    refined_indices_list.append(refined_idx_b.detach())
-            else:
-                # Skip AR inference: return empty tensors (not used for training anyway)
-                # Training uses teacher forcing, so refined output is not needed
-                refined_features_list.append(torch.empty((0, self.codebook_dim), device=device))
-                refined_indices_list.append(torch.empty((0, 4), device=device, dtype=torch.long))
-        
-        # Increment training call counter
-        self._training_call_count += 1
-
-        refined_features = torch.cat(refined_features_list, dim=0) if refined_features_list else torch.empty((0, self.codebook_dim), device=device)
-        refined_indices = torch.cat(refined_indices_list, dim=0) if refined_indices_list else torch.empty((0, 4), device=device, dtype=torch.long)
+        # in the training force teacher, we will return the gt features and indices
+        if gt_sparse_features is not None and gt_sparse_indices is not None:
+            refined_features = gt_sparse_features
+            refined_indices = gt_sparse_indices
 
         losses = None
         if losses_list:
@@ -803,7 +706,9 @@ class SparsePatternAdaptationFormer(nn.Module):
         pseudo_sparse_features: torch.Tensor,
         pseudo_sparse_indices: torch.Tensor,
         spatial_shape: List[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+        gt_sparse_features: Optional[torch.Tensor] = None,
+        gt_sparse_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, float]]]:
         """Inference forward: shared pseudo ops + per-batch test."""
         device = pseudo_sparse_features.device
         spatial_shape_model = self.grid_shape
@@ -813,6 +718,7 @@ class SparsePatternAdaptationFormer(nn.Module):
 
         refined_features_list: List[torch.Tensor] = []
         refined_indices_list: List[torch.Tensor] = []
+        metrics_list: List[Dict[str, float]] = []
 
         for b_idx in unique_batches:
             batch_mask = batch_indices == b_idx
@@ -829,6 +735,17 @@ class SparsePatternAdaptationFormer(nn.Module):
             )
             _, _, pseudo_value_ids = self.vq(pseudo_feat_sorted)
             pseudo_coord_ids = pseudo_coords.long().clamp(0, self.END_COORD)
+            
+            # Get GT features for this batch if available
+            gt_feat_sorted = None
+            if gt_sparse_features is not None and gt_sparse_indices is not None:
+                gt_batch_mask = gt_sparse_indices[:, 0] == b_idx
+                if gt_batch_mask.any():
+                    gt_feat_b = gt_sparse_features[gt_batch_mask]
+                    gt_idx_b = gt_sparse_indices[gt_batch_mask]
+                    gt_feat_sorted, _, _ = sort_by_row_major(
+                        gt_feat_b, gt_idx_b, spatial_shape_model
+                    )
         
             # === Initialize KV cache by processing pseudo tokens incrementally ===
             # Process all pseudo tokens incrementally to build KV cache (O(T_pseudo) done once)
@@ -947,14 +864,92 @@ class SparsePatternAdaptationFormer(nn.Module):
                 generated_indices_tensor = torch.cat(generated_indices, dim=0)
                 refined_features_list.append(generated_features)
                 refined_indices_list.append(generated_indices_tensor)
+                
+                # Compute metrics if GT is available
+                if gt_feat_sorted is not None and gt_feat_sorted.numel() > 0:
+                    refined_count = generated_features.shape[0]
+                    gt_count = gt_feat_sorted.shape[0]
+                    pseudo_count = pseudo_feat_sorted.shape[0]
+                    
+                    count_diff = abs(gt_count - refined_count) / max(gt_count, 1)
+                    gen_ratio = refined_count / max(gt_count, 1)
+                    
+                    if refined_count > 0 and gt_count > 0:
+                        gt_mean = gt_feat_sorted.mean(dim=0)
+                        refined_mean = generated_features.mean(dim=0)
+                        feature_dist = torch.norm(gt_mean - refined_mean).item()
+                        
+                        # Chamfer-like distance (sampled)
+                        sample_size = min(100, gt_count, refined_count)
+                        gt_sample_idx = torch.randperm(gt_count, device=device)[:sample_size]
+                        refined_sample_idx = torch.randperm(refined_count, device=device)[:sample_size]
+                        gt_sample = gt_feat_sorted[gt_sample_idx]
+                        refined_sample = generated_features[refined_sample_idx]
+                        
+                        chunk_size = 50
+                        min_dists = []
+                        for i in range(0, sample_size, chunk_size):
+                            chunk_end = min(i + chunk_size, sample_size)
+                            refined_chunk = refined_sample[i:chunk_end]
+                            dists = torch.cdist(refined_chunk.unsqueeze(0), gt_sample.unsqueeze(0))
+                            min_dists.append(dists.min(dim=-1)[0].mean().item())
+                        chamfer_like_dist = sum(min_dists) / len(min_dists) if min_dists else 0.0
+                    else:
+                        feature_dist = 0.0
+                        chamfer_like_dist = 0.0
+                    
+                    metrics_list.append({
+                        'refined_count': refined_count,
+                        'gt_count': gt_count,
+                        'pseudo_count': pseudo_count,
+                        'count_diff': count_diff,
+                        'gen_ratio': gen_ratio,
+                        'feat_dist': feature_dist,
+                        'chamfer_like_dist': chamfer_like_dist,
+                    })
+                else:
+                    # No GT available, return basic counts
+                    refined_count = generated_features.shape[0]
+                    pseudo_count = pseudo_feat_sorted.shape[0]
+                    metrics_list.append({
+                        'refined_count': refined_count,
+                        'gt_count': 0,
+                        'pseudo_count': pseudo_count,
+                        'count_diff': 0.0,
+                        'gen_ratio': 0.0,
+                        'feat_dist': 0.0,
+                        'chamfer_like_dist': 0.0,
+                    })
             else:
                 refined_features_list.append(torch.empty((0, self.codebook_dim), device=device))
                 refined_indices_list.append(torch.empty((0, 4), device=device, dtype=torch.long))
+                metrics_list.append({
+                    'refined_count': 0,
+                    'gt_count': gt_feat_sorted.shape[0] if gt_feat_sorted is not None else 0,
+                    'pseudo_count': pseudo_feat_sorted.shape[0],
+                    'count_diff': 0.0,
+                    'gen_ratio': 0.0,
+                    'feat_dist': 0.0,
+                    'chamfer_like_dist': 0.0,
+                })
 
         refined_features = torch.cat(refined_features_list, dim=0) if refined_features_list else torch.empty((0, self.codebook_dim), device=device)
         refined_indices = torch.cat(refined_indices_list, dim=0) if refined_indices_list else torch.empty((0, 4), device=device, dtype=torch.long)
+        
+        # Aggregate metrics across batches (average)
+        metrics = None
+        if metrics_list:
+            metrics = {
+                'refined_count': sum(m['refined_count'] for m in metrics_list),
+                'gt_count': sum(m['gt_count'] for m in metrics_list),
+                'pseudo_count': sum(m['pseudo_count'] for m in metrics_list),
+                'count_diff': sum(m['count_diff'] for m in metrics_list) / len(metrics_list),
+                'gen_ratio': sum(m['gen_ratio'] for m in metrics_list) / len(metrics_list),
+                'feat_dist': sum(m['feat_dist'] for m in metrics_list) / len(metrics_list),
+                'chamfer_like_dist': sum(m['chamfer_like_dist'] for m in metrics_list) / len(metrics_list),
+            }
 
-        return refined_features, refined_indices, None
+        return refined_features, refined_indices, metrics
 
     
     def _coord_id_to_3d(self, coord_id: int, spatial_shape: List[int]) -> torch.Tensor:

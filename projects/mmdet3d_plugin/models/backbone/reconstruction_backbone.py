@@ -493,7 +493,7 @@ class ReconstructionBackbone(nn.Module):
         if return_loss:
             return self.forward_train(img, img_metas, points)
         else:
-            return self.forward_test(img, img_metas)
+            return self.forward_test(img, img_metas, points)
     
     def forward_train(
         self,
@@ -669,7 +669,8 @@ class ReconstructionBackbone(nn.Module):
         self,
         img: torch.Tensor,
         img_metas: List[Dict],
-    ) -> Tuple[dict, None]:
+        points: Optional[torch.Tensor] = None,
+    ) -> Tuple[dict, Optional[Dict[str, float]]]:
         """Forward pass for test/inference mode.
         
         Args:
@@ -764,10 +765,23 @@ class ReconstructionBackbone(nn.Module):
             
 
             padded_pseudo, _ = self._padding_samples(pseudo_points_list, None)
-            # Refine entire batch at once (no GT in test mode)
-            refined_features, refined_indices, _ = self.refinement(
+            
+            # Prepare GT points if available (for metrics computation)
+            padded_gt = None
+            if points is not None:
+                # Handle GT points format (could be list or tensor)
+                if isinstance(points, list):
+                    gt_points_list = points
+                elif points.dim() == 3:  # (B, N, C)
+                    gt_points_list = [points[i] for i in range(points.shape[0])]
+                else:
+                    gt_points_list = [points]
+                padded_gt, _ = self._padding_samples(gt_points_list, None)
+            
+            # Refine entire batch at once (with GT if available for metrics)
+            refined_features, refined_indices, metrics = self.refinement(
                 pseudo_points=padded_pseudo,  # (B, N, C) tensor
-                gt_points=None,  # No GT in test mode
+                gt_points=padded_gt,  # GT points if available
                 return_loss=False,  # No loss computation in test
             )
             
@@ -776,7 +790,7 @@ class ReconstructionBackbone(nn.Module):
             pts_feat['indices'] = [refined_indices[i] for i in range(refined_indices.shape[0])]
 
         
-        return pts_feat, None
+        return pts_feat, metrics
         
 
 
