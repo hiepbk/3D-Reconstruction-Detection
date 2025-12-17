@@ -415,8 +415,8 @@ log_config = dict(
 custom_hooks = [
     dict(
         type='PseudoEvalHook',
-        eval_interval=1,   # run every iteration
-        eval_batches=1,    # number of val batches to run each time (for better statistics)
+        eval_interval=200,   # run every iteration
+        eval_batches=10,    # number of val batches to run each time (for better statistics)
         save_ckpt=True,    # save checkpoint after evaluation
         ckpt_interval=None  # save checkpoint every 100 iterations (None = same as eval_interval)
     ),
