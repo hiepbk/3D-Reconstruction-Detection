@@ -19,6 +19,8 @@ from projects.mmdet3d_plugin.models.backbone.depth_anything_3.api import DepthAn
 from projects.mmdet3d_plugin.models.backbone.depth_anything_3.specs import Prediction
 from projects.mmdet3d_plugin.datasets.pipelines.respoint_post_processing import DepthAnything3Filter
 from projects.mmdet3d_plugin.models.backbone.depth_anything_3.utils.export.glb import export_to_glb
+# import Lidainsatance box from mmdet3d
+from mmdet3d.core.bbox.structures import LiDARInstance3DBoxes
 
 
 
@@ -621,7 +623,9 @@ class ReconstructionBackbone(nn.Module):
         # Prepare extrinsics and intrinsics for DA3 input processor
         # Since image is a torch.Tensor, input processor expects torch.Tensors for extrinsics/intrinsics too
         # Comment out extrinsics - let DA3 predict them
-        extrinsics_for_da3 = multi_batch_extrinsics_gt if multi_batch_extrinsics_gt is not None else None
+        # extrinsics_for_da3 = multi_batch_extrinsics_gt if multi_batch_extrinsics_gt is not None else None
+        
+        extrinsics_for_da3 = None
         # extrinsics_for_da3 = None  # Let DA3 predict extrinsics
         intrinsics_for_da3 = multi_batch_intrinsics_gt if multi_batch_intrinsics_gt is not None else None
         
@@ -856,6 +860,59 @@ class ReconstructionBackbone(nn.Module):
             for b_idx in range(B):
                 print(img_metas[b_idx]['filename'])
                 
+                # Extract GT bboxes from img_metas for visualization
+                gt_bboxes_3d_batch = None
+                if 'gt_bboxes_3d' in img_metas[b_idx]:
+                    gt_bboxes_3d_batch = img_metas[b_idx]['gt_bboxes_3d']
+                    # Handle DataContainer wrapper
+                    if isinstance(gt_bboxes_3d_batch, DC):
+                        gt_bboxes_3d_batch = gt_bboxes_3d_batch.data
+                    # Handle list/tuple wrapping (DataContainer.data might be a list)
+                    if isinstance(gt_bboxes_3d_batch, (list, tuple)) and len(gt_bboxes_3d_batch) > 0:
+                        # If it's a list, take the first element (batch item)
+                        gt_bboxes_3d_batch = gt_bboxes_3d_batch[0] if len(gt_bboxes_3d_batch) == 1 else gt_bboxes_3d_batch[b_idx]
+                    
+                    if gt_bboxes_3d_batch is not None:
+                        # Convert to LiDARInstance3DBoxes and convert to original gravity
+                        from mmdet3d.core.bbox.structures.box_3d_mode import Box3DMode
+                        
+                        # Get tensor from various formats
+                        if isinstance(gt_bboxes_3d_batch, LiDARInstance3DBoxes):
+                            bbox_tensor = gt_bboxes_3d_batch.tensor
+                        elif isinstance(gt_bboxes_3d_batch, torch.Tensor):
+                            bbox_tensor = gt_bboxes_3d_batch
+                        elif isinstance(gt_bboxes_3d_batch, np.ndarray):
+                            bbox_tensor = torch.from_numpy(gt_bboxes_3d_batch)
+                        elif hasattr(gt_bboxes_3d_batch, 'tensor'):
+                            bbox_tensor = gt_bboxes_3d_batch.tensor
+                        else:
+                            print(f"[WARNING] Unknown bbox format: {type(gt_bboxes_3d_batch)}, skipping visualization")
+                            gt_bboxes_3d_batch = None
+                            continue
+                        
+                        # Create LiDARInstance3DBoxes with origin (0.5, 0.5, 0.5) and convert to LIDAR
+                        gt_bboxes_3d_ori = LiDARInstance3DBoxes(
+                            bbox_tensor,
+                            box_dim=bbox_tensor.shape[-1],
+                            origin=(0.5, 0.5, -0.5)
+                        ).convert_to(Box3DMode.LIDAR)
+                        
+                        # Extract tensor and apply transformations
+                        gt_boxes_3d_ori = gt_bboxes_3d_ori.tensor.cpu().numpy()
+                        
+                        # Apply transformations for visualization
+                        # Flip yaw angle
+                        gt_boxes_3d_ori[:, 6] = -gt_boxes_3d_ori[:, 6] - np.pi / 2
+                        
+                        # Swap width and length for visualization
+                        gt_boxes_3d_ori[..., [3, 4]] = gt_boxes_3d_ori[..., [4, 3]]
+                        
+                        # Replace the original with transformed version
+                        gt_bboxes_3d_batch = gt_boxes_3d_ori
+                        
+                        bbox_count = len(gt_bboxes_3d_batch)
+                        print(f"[DEBUG] Found {bbox_count} GT bounding boxes for batch {b_idx} (converted to original gravity)")
+                
                 # Only visualize if GT points are available
                 if gt_points_list is not None and len(gt_points_list) > b_idx:
                     gt_points_np = gt_points_list[b_idx].cpu().numpy()
@@ -874,13 +931,13 @@ class ReconstructionBackbone(nn.Module):
                     else:
                         print(f"[DEBUG] GT point cloud: {len(gt_points_np)} points without colors (will use gray)")
                     
-                    display_point_cloud(gt_points_np, colors=gt_colors, gt_bboxes_3d=None, window_name=f"GT Point Cloud ({len(gt_points_np):,} points)")
+                    display_point_cloud(gt_points_np, colors=gt_colors, gt_bboxes_3d=gt_bboxes_3d_batch, window_name=f"GT Point Cloud ({len(gt_points_np):,} points)")
                 
                 # Always visualize pseudo points (they should always be available)
                 if len(pseudo_points_list) > b_idx:
                     pseudo_points_np = pseudo_points_list[b_idx].cpu().numpy()
                     pseudo_colors = pseudo_points_np[:, 3:] if pseudo_points_np.shape[1] > 3 else None
-                    display_point_cloud(pseudo_points_np, colors=pseudo_colors, gt_bboxes_3d=None, window_name=f"Pseudo Point Cloud ({len(pseudo_points_np):,} points)")
+                    display_point_cloud(pseudo_points_np, colors=pseudo_colors, gt_bboxes_3d=gt_bboxes_3d_batch, window_name=f"Pseudo Point Cloud ({len(pseudo_points_np):,} points)")
                 
                 # Display GLB point cloud if available (3rd visualization)
                 if glb_points_np is not None:
@@ -888,7 +945,7 @@ class ReconstructionBackbone(nn.Module):
                         print(f"[DEBUG] GLB point cloud: {len(glb_points_np)} points with colors shape {glb_colors_np.shape}, dtype={glb_colors_np.dtype}, range=[{glb_colors_np.min():.1f}, {glb_colors_np.max():.1f}]")
                     else:
                         print(f"[DEBUG] GLB point cloud: {len(glb_points_np)} points without colors (will use gray)")
-                    display_point_cloud(glb_points_np, colors=glb_colors_np, gt_bboxes_3d=None, window_name=f"GLB Point Cloud ({len(glb_points_np):,} points)")
+                    display_point_cloud(glb_points_np, colors=glb_colors_np, gt_bboxes_3d=gt_bboxes_3d_batch, window_name=f"GLB Point Cloud ({len(glb_points_np):,} points)")
                 
             # Apply refinement in batch mode (if enabled)
 
@@ -1288,61 +1345,75 @@ def display_point_cloud(points, colors=None, gt_bboxes_3d=None, window_name="Poi
     vis.add_geometry(axis)
     
     # Draw the gt_bboxes_3d on the point cloud
-    if gt_bboxes_3d is not None and len(gt_bboxes_3d) > 0:
-        print(f"  Adding {len(gt_bboxes_3d)} bounding boxes to visualization")
-        for gt_bbox_3d in gt_bboxes_3d:
-            # Extract bbox information
-            # gt_bboxes_3d from mmdet3d are typically in LiDARBox3D format
-            if hasattr(gt_bbox_3d, 'tensor'):
-                # mmdet3d LiDARBox3D format: [x, y, z, w, l, h, yaw]
-                bbox_tensor = gt_bbox_3d.tensor.cpu().numpy()
-                if len(bbox_tensor.shape) == 2:
-                    bbox_tensor = bbox_tensor[0]  # Take first box if batched
+    if gt_bboxes_3d is not None:
+        # Handle DataContainer wrapper
+        if isinstance(gt_bboxes_3d, DC):
+            gt_bboxes_3d = gt_bboxes_3d.data
+        
+        # Convert to numpy array if needed
+        if isinstance(gt_bboxes_3d, np.ndarray) and len(gt_bboxes_3d.shape) == 2:
+            bboxes_array = gt_bboxes_3d  # (N, 7)
+        elif hasattr(gt_bboxes_3d, '__len__') and len(gt_bboxes_3d) > 0:
+            # Try to extract as list of tensors/arrays
+            bboxes_list = []
+            for bbox in gt_bboxes_3d:
+                if isinstance(bbox, torch.Tensor):
+                    bboxes_list.append(bbox.cpu().numpy())
+                elif isinstance(bbox, np.ndarray):
+                    bboxes_list.append(bbox)
+                elif hasattr(bbox, 'tensor'):
+                    bboxes_list.append(bbox.tensor.cpu().numpy())
+                else:
+                    continue
+            if bboxes_list:
+                bboxes_array = np.array(bboxes_list)  # (N, 7)
+            else:
+                bboxes_array = None
+        else:
+            bboxes_array = None
+        
+        # Draw all boxes
+        if bboxes_array is not None and len(bboxes_array) > 0:
+            print(f"  Adding {len(bboxes_array)} bounding boxes to visualization")
+            for bbox in bboxes_array:
+                if len(bbox) < 7:
+                    continue
                 
-                center = bbox_tensor[:3]  # x, y, z
-                size = bbox_tensor[3:6]  # w, l, h
-                yaw = bbox_tensor[6]  # yaw angle
+                center = bbox[:3]  # x, y, z
+                size = bbox[3:6]  # w, l, h
+                yaw = bbox[6]  # yaw angle
                 
                 # Create rotation matrix from yaw
-                cos_yaw = np.cos(yaw)
-                sin_yaw = np.sin(yaw)
+                cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
                 rotation_matrix = np.array([
                     [cos_yaw, -sin_yaw, 0],
                     [sin_yaw, cos_yaw, 0],
                     [0, 0, 1]
                 ])
-            else:
-                # Fallback: assume dict or other format
-                center = np.array(gt_bbox_3d.get('center', [0, 0, 0]), dtype=np.float64)
-                size = np.array(gt_bbox_3d.get('size', [1, 1, 1]), dtype=np.float64)
-                rotation_matrix = gt_bbox_3d.get('rotation_matrix', np.eye(3))
-            
-            # Create OrientedBoundingBox
-            obb = o3d.geometry.OrientedBoundingBox(center, rotation_matrix, size)
-            obb.color = [1, 0, 0]  # Red color for boxes
-            vis.add_geometry(obb)
-            
-            # Change the color of points which are in this box
-            indices = obb.get_point_indices_within_bounding_box(pcd.points)
-            if len(indices) > 0:
-                # Convert colors to numpy array, modify, then assign back
-                colors_array = np.asarray(pcd.colors)
-                colors_array[indices] = [1, 0, 0]  # Red color for points in box
-                pcd.colors = o3d.utility.Vector3dVector(colors_array)
-                vis.update_geometry(pcd)
-            
-            # Find the center of front face (heading direction)
-            heading_dir = rotation_matrix[:2, 0]  # x, y components of heading
-            yaw = np.arctan2(heading_dir[1], heading_dir[0])
-            
-            # Connect the bbox center with the front center -> heading direction
-            front_center = center + size[0] * np.array([np.cos(yaw), np.sin(yaw), 0])
-            # Append geometry line set from center to front center
-            line_set = o3d.geometry.LineSet()
-            line_set.points = o3d.utility.Vector3dVector([center, front_center])
-            line_set.lines = o3d.utility.Vector2iVector([[0, 1]])
-            line_set.colors = o3d.utility.Vector3dVector([[1, 0, 0], [1, 0, 0]])  # Red color for heading line
-            vis.add_geometry(line_set)
+                
+                # Create OrientedBoundingBox
+                obb = o3d.geometry.OrientedBoundingBox(center, rotation_matrix, size)
+                obb.color = [1, 0, 0]
+                vis.add_geometry(obb)
+                
+                # Color points inside box
+                indices = obb.get_point_indices_within_bounding_box(pcd.points)
+                if len(indices) > 0:
+                    colors_array = np.asarray(pcd.colors)
+                    colors_array[indices] = [1, 0, 0]
+                    pcd.colors = o3d.utility.Vector3dVector(colors_array)
+                    vis.update_geometry(pcd)
+                
+                # Draw heading direction
+                heading_dir = rotation_matrix[:2, 0]
+                yaw_vis = np.arctan2(heading_dir[1], heading_dir[0])
+                front_center = center + size[0] * np.array([np.cos(yaw_vis), np.sin(yaw_vis), 0])
+                line_set = o3d.geometry.LineSet()
+                line_set.points = o3d.utility.Vector3dVector([center, front_center])
+                line_set.lines = o3d.utility.Vector2iVector([[0, 1]])
+                line_set.colors = o3d.utility.Vector3dVector([[1, 0, 0], [1, 0, 0]])
+                vis.add_geometry(line_set)
     
+    # Block until window is closed
     vis.run()
     vis.destroy_window()
