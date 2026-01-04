@@ -86,7 +86,7 @@ def export_to_glb(
         export_depth_vis: Whether to export raster depth visualisations alongside the glTF.
 
     Returns:
-        Path to the exported ``scene.glb`` file.
+        Tuple of (path to the exported ``scene.glb`` file, points array (N, 3), colors array (N, 3)).
     """
     # 1) Use prediction.processed_images, which is already processed image data
     assert (
@@ -181,7 +181,9 @@ def export_to_glb(
     if export_depth_vis:
         export_to_depth_vis(prediction, export_dir)
         os.system(f"cp -r {export_dir}/depth_vis/0000.jpg {export_dir}/scene.jpg")
-    return out_path
+    
+    # Return path, points, and colors
+    return out_path, points, colors
 
 
 # =========================

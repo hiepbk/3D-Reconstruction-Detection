@@ -18,7 +18,8 @@
 
 from mmdet3d.models import builder
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
-from mmdet.models import DETECTORS
+from mmdet3d.core import (Box3DMode, Coord3DMode, bbox3d2result, show_result)
+from mmdet.models import DETECTORS, build_loss
 # from projects.mmdet3d_plugin.models.utils.time_utils import T
 # from projects.mmdet3d_plugin.core.post_processing.merge_augs import merge_aug_bboxes_3d
 
@@ -52,82 +53,118 @@ class ResDet3D(MVXTwoStageDetector):
                  use_grid_mask=False,
                  input_pts=True,
                  init_cfg=None):
-        super(ResDet3D, self).__init__(pts_voxel_layer, pts_voxel_encoder,
-                             pts_middle_encoder, pts_fusion_layer,
-                             img_backbone, pts_backbone, img_neck, pts_neck,
-                             pts_bbox_head, img_roi_head, img_rpn_head,
-                             train_cfg, test_cfg, pretrained, init_cfg)
-        # if pts_pillar_layer:
-        #     self.pts_pillar_layer = Voxelization(**pts_pillar_layer)
-        # self.freeze_img_level = freeze_img_level
-        # self.freeze_camlss = freeze_camlss
-        # self.imgpts_neck = builder.build_neck(imgpts_neck)
-        
-        # self.freeze_img = freeze_img
-        # self.freeze_pts = freeze_pts
-        # self.trainneck_ms = trainneck_ms
-        # self.train_middle_encoder = train_middle_encoder
+        # Follow CenterPoint architecture:
+        # reconstruction_backbone (SparseEncoder) = pts_middle_encoder
+        # Then: pts_backbone (SECOND) → pts_neck (SECONDFPN) → pts_bbox_head (CenterHead)
+        super(ResDet3D, self).__init__(
+            pts_voxel_layer=pts_voxel_layer,
+            pts_voxel_encoder=pts_voxel_encoder,
+            pts_middle_encoder=pts_middle_encoder,  # Not used (we use reconstruction_backbone)
+            pts_fusion_layer=pts_fusion_layer,
+            img_backbone=img_backbone,
+            pts_backbone=pts_backbone,  # SECOND backbone (required, like CenterPoint)
+            img_neck=img_neck,
+            pts_neck=pts_neck,  # SECONDFPN neck
+            pts_bbox_head=pts_bbox_head,  # CenterHead
+            img_roi_head=img_roi_head,
+            img_rpn_head=img_rpn_head,
+            train_cfg=train_cfg,
+            test_cfg=test_cfg,
+            pretrained=pretrained,
+            init_cfg=init_cfg
+        )
 
-        # self.input_img = input_img
-        # self.input_pts = input_pts
 
-        # self.use_grid_mask = use_grid_mask
-        # if self.use_grid_mask:
-        #     from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
-        #     self.grid_mask = GridMask(
-        #         True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
+        self.input_img = input_img
+        self.input_pts = input_pts
         
-        # self.apply_dynamic_voxelize = 'Dynamic' in pts_voxel_encoder['type']
-        
-        
-        # Build reconstruction backbone
         if reconstruction_backbone is not None:
             self.reconstruction_backbone = builder.build_backbone(reconstruction_backbone)
         else:
             self.reconstruction_backbone = None
+            
+        if self.with_reconstruction_backbone:
+            self.reconstruction_backbone.init_cfg = dict(
+                type='Pretrained', checkpoint=reconstruction_backbone['pretrained'])
+        
+    @property
+    def with_reconstruction_backbone(self):
+        """bool: Whether the detector has a reconstruction backbone."""
+        return hasattr(self, 'reconstruction_backbone') and self.reconstruction_backbone is not None
+        
+
+     
+            
+    def extract_img_feat(self, img, img_metas):
+        """Extract features of images."""
+        # if self.with_img_backbone and img is not None:
+        #     input_shape = img.shape[-2:]
+        #     # update real input shape of each single img
+        #     for img_meta in img_metas:
+        #         img_meta.update(input_shape=input_shape)
+
+        #     if img.dim() == 5 and img.size(0) == 1:
+        #         img = img.squeeze(0)
+        #     elif img.dim() == 5 and img.size(0) > 1:
+        #         B, N, C, H, W = img.size()
+        #         img = img.view(B * N, C, H, W)
+        #     if self.use_grid_mask and self.training:
+        #         img = self.grid_mask(img)
+        #     img_feats = self.img_backbone(img.float())
+        # else:
+        #     return None
+        # if self.with_img_neck:
+        #     img_feats = self.img_neck(img_feats)
+        
+        # For now, we don't use image features extraction
+        
+        raise NotImplementedError("Image features extraction is not implemented yet")
     
-    def extract_feat(self, points=None, img=None, img_metas=None, return_loss=False):
-        """Extract features using reconstruction backbone.
-        
-        This generates point clouds from multi-view images using DepthAnything3.
-        The point cloud can then be used by the detection head.
-        
-        Args:
-            points: Ground truth point cloud (optional, for training with refinement)
-            img: Multi-view images (B, N, 3, H, W) or DataContainer
-            img_metas: Image metadata list
-            return_loss: Whether to return losses (for training)
-        
-        Returns:
-            tuple: (img_feats, pts_feats) where pts_feats is the generated point cloud
-            If return_loss=True and refinement enabled, also returns losses dict
-        """
-        if self.reconstruction_backbone is not None:
-            # Forward through reconstruction backbone
-            result = self.reconstruction_backbone(img, img_metas, return_loss=return_loss, points=points)
-            
-            # Handle return format: (batch_point_clouds, losses/metrics)
-            if isinstance(result, tuple) and len(result) == 2:
-                pseudo_points, extra = result
-                if return_loss:
-                    # Training: extra is losses dict
-                    if extra is not None:
-                        self._reconstruction_losses = extra
-                else:
-                    # Test: extra is metrics dict (store for hook to access)
-                    if extra is not None:
-                        self._reconstruction_metrics = extra
-            else:
-                # Backward compatibility: just point clouds
-                pseudo_points = result
-                extra = None
-            
-            # Return format matching parent class: (img_feats, pts_feats)
-            # For now, img_feats is None since we're only using reconstruction
-            return (None, pseudo_points)
+    def extract_pts_feat(self, points, img_feats, img_metas, return_loss=False):
+        # extra can be losses or the metrics depending on the return_loss
+        pts_con_feat_dict, extra = self.reconstruction_backbone(
+            img=img_feats, 
+            img_metas=img_metas, 
+            return_loss=return_loss, 
+            points=points
+        )
+    
+        # Extract dense features for detection pipeline
+        # Training mode: use GT dense features (for oracle baseline)
+        # Test mode: use pseudo dense features (camera-only inference)
+        if return_loss:
+            x = pts_con_feat_dict['rescon_features']['gt']['dense_features']
         else:
-            # No reconstruction backbone, fall back to parent behavior
-            return super().extract_feat(points, img, img_metas)
+            x = pts_con_feat_dict['rescon_features']['pseudo']['dense_features']
+            
+        # Follow CenterPoint: dense_features → SECOND backbone → SECONDFPN neck
+        if self.with_pts_backbone:
+            x = self.pts_backbone(x)  # Returns tuple of tensors
+            # Convert tuple to list for SECONDFPN
+            if isinstance(x, tuple):
+                x = list(x)
+        if self.with_pts_neck:
+            x = self.pts_neck(x)  # Returns [out] (list with one tensor)
+        
+        # Return features from neck (not bbox head output)
+        # bbox head will be called in forward_pts_train
+        return x, extra
+    
+    def extract_feat(self, points, img, img_metas, return_loss=False):
+        # For now, it will be not used
+        if self.input_img:
+            img_feats = self.extract_img_feat(img, img_metas)
+        else:
+            img_feats = None
+        if self.input_pts:
+            pts_feats, extra = self.extract_pts_feat(points, img, img_metas, return_loss=return_loss)
+        else:
+            pts_feats = None
+            
+        # we will implement this later
+        # new_img_feat, new_pts_feat = self.imgpts_neck(img_feats[0], pts_feats[0], img_metas)
+        return (img_feats, pts_feats, extra)
+    
     
     def forward_train(self,
                       points=None,
@@ -144,43 +181,87 @@ class ResDet3D(MVXTwoStageDetector):
         Override to handle refinement losses from reconstruction backbone.
         """
         losses = dict()
-        
-        if self.reconstruction_backbone is not None:
-            # Extract features (generates point cloud with refinement)
-            img_feats, pts_feats = self.extract_feat(
-                points=points,  # GT points for refinement loss
-                img=img,
-                img_metas=img_metas,
-                return_loss=True
-            )
-            
-            # Add refinement losses if available
-            if hasattr(self, '_reconstruction_losses') and self._reconstruction_losses is not None:
-                # Prefix losses with 'reconstruction_' to avoid conflicts
-                for key, value in self._reconstruction_losses.items():
-                    losses[f'reconstruction_{key}'] = value
-                # Clear stored losses
-                delattr(self, '_reconstruction_losses')
-        
-        # Call parent forward_train for detection losses (if head/neck exist)
-        has_pts_bbox_head = hasattr(self, 'pts_bbox_head') and self.pts_bbox_head is not None
-        has_img_backbone = hasattr(self, 'img_backbone') and self.img_backbone is not None
-        
-        if has_pts_bbox_head or has_img_backbone:
-            parent_losses = super().forward_train(
-                points=pts_feats if self.reconstruction_backbone is not None else points,
-                img_metas=img_metas,
-                gt_bboxes_3d=gt_bboxes_3d,
-                gt_labels_3d=gt_labels_3d,
-                gt_labels=gt_labels,
-                gt_bboxes=gt_bboxes,
-                img=img,
-                proposals=proposals,
-                gt_bboxes_ignore=gt_bboxes_ignore
-            )
-            losses.update(parent_losses)
-        
+
+        # Extract features (generates point cloud with refinement)
+        img_feats, pts_feats, extra = self.extract_feat(
+            points=points,  # GT points for refinement loss
+            img=img,
+            img_metas=img_metas,
+            return_loss=True
+        )
+        # Extract losses from extra dict (from reconstruction_backbone)
+        if isinstance(extra, dict):
+            losses.update(extra)
+
+        losses_pts = self.forward_pts_train(pts_feats, img_feats, gt_bboxes_3d,
+                                    gt_labels_3d, img_metas,
+                                    gt_bboxes_ignore)
+        # update the feature losses of detector here
+        losses.update(losses_pts)
         return losses
+    
+    def forward_pts_train(self,
+                          pts_feats,
+                          img_feats,
+                          gt_bboxes_3d,
+                          gt_labels_3d,
+                          img_metas,
+                          gt_bboxes_ignore=None):
+        """Forward function for point cloud branch.
+
+        Args:
+            pts_feats (list[torch.Tensor]): Features of point cloud branch
+            gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`]): Ground truth
+                boxes for each sample.
+            gt_labels_3d (list[torch.Tensor]): Ground truth labels for
+                boxes of each sampole
+            img_metas (list[dict]): Meta information of samples.
+            gt_bboxes_ignore (list[torch.Tensor], optional): Ground truth
+                boxes to be ignored. Defaults to None.
+
+        Returns:
+            dict: Losses of each branch.
+        """
+        # Ensure pts_feats is a list of tensors (not nested list or tuple)
+        # SECONDFPN returns [out] which is correct format for CenterHead
+        if isinstance(pts_feats, tuple):
+            pts_feats = list(pts_feats)
+        elif isinstance(pts_feats, list) and len(pts_feats) > 0:
+            # Check if first element is also a list (double-wrapped)
+            if isinstance(pts_feats[0], (list, tuple)):
+                # Unwrap: [[tensor]] -> [tensor]
+                pts_feats = list(pts_feats[0]) if isinstance(pts_feats[0], tuple) else pts_feats[0]
+        
+        outs = self.pts_bbox_head(pts_feats)
+        loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
+        losses = self.pts_bbox_head.loss(*loss_inputs)
+        return losses
+
+    def simple_test_pts(self, x, x_img, img_metas, rescale=False, gt_bboxes_3d=None, gt_labels_3d=None, **kwargs):
+        """Test function of point cloud branch."""
+        # Ensure x is a list of tensors (not nested list or tuple)
+        # SECONDFPN returns [out] which is correct format for CenterHead
+        if isinstance(x, tuple):
+            x = list(x)
+        elif isinstance(x, list) and len(x) > 0:
+            # Check if first element is also a list (double-wrapped)
+            if isinstance(x[0], (list, tuple)):
+                # Unwrap: [[tensor]] -> [tensor]
+                x = list(x[0]) if isinstance(x[0], tuple) else x[0]
+        elif not isinstance(x, list):
+            # If x is a single tensor, wrap it in a list
+            x = [x]
+        
+        outs = self.pts_bbox_head(x)
+
+        bbox_list = self.pts_bbox_head.get_bboxes(
+            outs, img_metas, rescale=rescale)
+        bbox_results = [
+            bbox3d2result(bboxes, scores, labels)
+            for bboxes, scores, labels in bbox_list
+        ]
+        return bbox_results
+
     
     def simple_test(self, points, img_metas, img=None, rescale=False):
         """Test function without augmentation.
@@ -188,34 +269,17 @@ class ResDet3D(MVXTwoStageDetector):
         Override to handle case where we don't have detection head/neck yet.
         Just pass through the point cloud for now.
         """
-        if self.reconstruction_backbone is not None:
-            # Extract features (generates point cloud)
-            # Pass points explicitly to extract_feat so GT points are available for metrics
-            img_feats, pts_feats = self.extract_feat(points=points, img=img, img_metas=img_metas, return_loss=False)
-            
-            # Handle tuple return (backward compatibility)
-            if isinstance(pts_feats, tuple):
-                pts_feats, _ = pts_feats
-            
-            # For now, return empty results since we don't have head/neck
-            # Later, when head/neck are added, this will call simple_test_pts
-            bbox_list = [dict() for i in range(len(img_metas))]
-            
-            # Store pseudo points and colors in result for potential use
-            if pts_feats is not None:
-                # Handle list of point clouds (one per batch item)
-                if isinstance(pts_feats, list):
-                    for i, result_dict in enumerate(bbox_list):
-                        if i < len(pts_feats):
-                            result_dict['pseudo_points'] = pts_feats[i]
-                else:
-                    # Single point cloud for all
-                    for i, result_dict in enumerate(bbox_list):
-                        result_dict['pseudo_points'] = pts_feats
-            
-            return bbox_list
-        else:
-            # Fall back to parent behavior
-            return super().simple_test(points, img_metas, img=img, rescale=rescale)
+        # in the test mode, it will return the feature metrics of reconstruction backbone
+        img_feats, pts_feats, feat_metrics = self.extract_feat(
+            points=points,
+            img=img,
+            img_metas=img_metas,
+            return_loss=False
+        )
+        
+        bbox_results = self.simple_test_pts(pts_feats, img_feats, img_metas, rescale=rescale)
+        return bbox_results
+
+
         
         

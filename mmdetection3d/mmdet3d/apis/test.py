@@ -24,7 +24,7 @@ def single_gpu_test(model,
                     data_loader,
                     show=False,
                     out_dir=None,
-                    show_score_thr=0.3, UI_result=False, score_threshold=0.1):
+                    show_score_thr=0.3, UI_result=True, score_threshold=0.1):
     """Test model with single gpu.
 
     This method tests model with single gpu and gives the 'show' option.
@@ -79,7 +79,7 @@ def single_gpu_test(model,
             os.makedirs(out_dir, exist_ok=True)
             
             for batch_id in range(len(result)):
-                result_batch = result[batch_id]['pts_bbox']
+                result_batch = result[batch_id]
                 
                 
                 imgs = []
@@ -103,18 +103,11 @@ def single_gpu_test(model,
 
                 
                 if isinstance(data['img_metas'][0], DC):
-                    pts_filename = data['img_metas'][0]._data[0][batch_id][
-                        'pts_filename']
                     box_mode_3d = data['img_metas'][0]._data[0][batch_id][
                         'box_mode_3d']
                 elif mmcv.is_list_of(data['img_metas'][0], dict):
-                    pts_filename = data['img_metas'][0][batch_id]['pts_filename']
                     box_mode_3d = data['img_metas'][0][batch_id]['box_mode_3d']
-                else:
-                    ValueError(
-                        f"Unsupported data type {type(data['img_metas'][0])} "
-                        f'for visualization!')
-                file_name = osp.split(pts_filename)[-1].split('.')[0]
+
                 
                 # filter out low score boxes
                 mask_inds = result_batch['scores_3d'] > score_threshold
@@ -148,7 +141,6 @@ def single_gpu_test(model,
                 frame_prediction = {
                     'frame_id': f'{i:06d}',
                     'timestamp': datetime.datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f")[:-3],
-                    'pts_filename': pts_filename,
                     'predictions': []
                 }
                 

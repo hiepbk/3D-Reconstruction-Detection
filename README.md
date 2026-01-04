@@ -237,12 +237,9 @@ python -m tools.inference_mmdet3d \
 - `--launcher`: Job launcher for distributed training (default: "none")
 - `--cfg-options`: Override config options in key=value format (optional)
 
-### Training with mmdet3d (ResDet3D with Point Cloud Refinement)
+### Training with mmdet3d (ResDet3D with Feature Distillation)
 
-Train the ResDet3D model with point cloud refinement. The training process will:
-1. Generate pseudo point clouds from multi-view images using DepthAnything3
-2. Refine the pseudo point clouds to match ground-truth LiDAR point clouds
-3. Learn the refinement network using Chamfer Distance, EMD, and smoothness losses
+Train the ResDet3D model using a two-branch feature distillation approach. See `FEATURE_DOMAIN_ADAPTATION_DESIGN.md` for detailed architecture and training strategy documentation.
 
 **Basic usage:**
 ```bash
@@ -288,12 +285,16 @@ python -m tools.train_mmdet3d \
     projects/configs/ResDet3D_nuscenes_mini_config.py \
     --work-dir work_dirs/resdet3d_nuscenes_mini \
     --gpu-ids 0 1
-
+python -m tools.test_mmdet3d projects/configs/ResDet3D_nuscenes_mini_config.py work_dirs/resdet3d_nuscenes_mini/epoch_8.pth --eval mAP
 # Override config options
 python -m tools.train_mmdet3d \
     projects/configs/ResDet3D_nuscenes_mini_config.py \
     --work-dir work_dirs/resdet3d_nuscenes_mini \
     --cfg-options optimizer.lr=0.001
+
+
+
+    
 ```
 
 **Training Arguments:**
@@ -316,6 +317,6 @@ python -m tools.train_mmdet3d \
 - Validation (if enabled)
 - Logging and tensorboard support
 
-The refinement losses (Chamfer Distance, EMD, Smoothness) will be logged and can be monitored during training.
+For detailed information about the two-branch feature distillation architecture, training procedure, and implementation details, please refer to `FEATURE_DOMAIN_ADAPTATION_DESIGN.md`.
 
 

@@ -272,29 +272,42 @@ class SparseRefinement(nn.Module):
         pts_voxel_layer: Dict,
         pts_voxel_encoder: Dict,
         pts_middle_encoder: Dict,
-        sparse_refinement_transformer: Dict,
-        loss_feature: Dict = None,
-        loss_index: Dict = None,
+        loss_occupancy: Dict,
+        loss_feature: Dict,
+        loss_bev: Optional[Dict] = None,
         loss_weight: float = 1.0,
+        loss_occupancy_weight: float = 1.0,
+        loss_feature_weight: float = 0.2,
+        loss_bev_weight: float = 0.1,
         use_color: bool = False,
         debug_viz: bool = False,
         debug_viz_dir: str = "debug_viz",
     ):
         """
+        Feature-space domain adaptation for sparse voxel features.
+        
+        No transformer, no AR generation, just direct feature alignment.
+        
         Args:
             pts_voxel_layer: Config for voxelization layer
             pts_voxel_encoder: Config for voxel encoder (e.g., HardSimpleVFE)
             pts_middle_encoder: Config for sparse middle encoder (e.g., SparseEncoderV2 with return_type='sparse')
-            sparse_refinement_transformer: Config for ShapeFormer-style transformer
-            loss_feature: Config for feature alignment loss (optional, transformer has its own losses)
-            loss_index: Config for index alignment loss (optional)
-            loss_weight: Weight for the losses
+            loss_occupancy: Config for voxel occupancy alignment loss (Dice loss recommended)
+            loss_feature: Config for sparse feature alignment loss (L2 or cosine)
+            loss_bev: Config for dense BEV feature alignment loss (cosine similarity, optional)
+            loss_weight: Global weight multiplier for all losses
+            loss_occupancy_weight: Weight for occupancy loss (default: 1.0)
+            loss_feature_weight: Weight for feature loss (default: 0.2)
+            loss_bev_weight: Weight for dense BEV loss (default: 0.1, auxiliary loss)
             use_color: If True, use RGB colors in addition to XYZ
         """
         super().__init__()
         
         self.use_color = use_color
         self.loss_weight = loss_weight
+        self.loss_occupancy_weight = loss_occupancy_weight
+        self.loss_feature_weight = loss_feature_weight
+        self.loss_bev_weight = loss_bev_weight
         self.debug_viz = debug_viz
         self.debug_viz_dir = debug_viz_dir
 
@@ -308,22 +321,22 @@ class SparseRefinement(nn.Module):
         # Build voxel encoder
         self.voxel_encoder = builder.build_voxel_encoder(pts_voxel_encoder)
         
-        # Build sparse middle encoder (should return sparse features + indices when return_type='sparse')
-        self.middle_encoder = builder.build_middle_encoder(pts_middle_encoder)
+        # Build SEPARATE sparse middle encoders for GT and Pseudo (NOT shared)
+        # This prevents trivial identity mapping and enables proper feature distillation
+        # GT branch (teacher)
+        self.middle_encoder_gt = builder.build_middle_encoder(pts_middle_encoder)
+        # Pseudo branch (student)
+        self.middle_encoder_pseudo = builder.build_middle_encoder(pts_middle_encoder)
         
-        # Build pattern adaptation transformer (using builder pattern)
-        self.pattern_adaptation = builder.build_middle_encoder(sparse_refinement_transformer)
+        # Build losses (direct feature alignment, no transformer)
+        self.loss_occupancy = build_loss(loss_occupancy)
+        self.loss_feature = build_loss(loss_feature)
         
-        # Build losses (optional, transformer has its own losses)
-        if loss_feature is not None:
-            self.loss_feature = build_loss(loss_feature)
+        # Build dense BEV feature loss (optional, auxiliary loss)
+        if loss_bev is not None:
+            self.loss_bev = build_loss(loss_bev)
         else:
-            self.loss_feature = None
-        
-        if loss_index is not None:
-            self.loss_index = build_loss(loss_index)
-        else:
-            self.loss_index = None
+            self.loss_bev = None
         
         # Get sparse_shape from middle_encoder config
         # Convert to list to avoid dict_keys pickle issues
@@ -386,56 +399,178 @@ class SparseRefinement(nn.Module):
     
     def forward_train(
         self,
+        pseudo_dense_features: torch.Tensor,
         pseudo_sparse_features: torch.Tensor,
         pseudo_sparse_indices: torch.Tensor,
         pseudo_sparse_spatial_shape: List[int],
         gt_points: Optional[torch.Tensor] = None,
-        
         return_loss: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+    ) -> Tuple[Dict, Optional[Dict[str, torch.Tensor]]]:
+        """
+        Training forward: compute feature alignment losses.
         
+        No generation, no transformer, just direct loss computation.
+        """
         assert gt_points is not None, "GT points are required for training"
         
         batch_size = gt_points.shape[0]
-        gt_voxel_features, gt_num_points, gt_coors = self._voxel_encoder(gt_points)
-        gt_sparse_features, gt_sparse_indices, gt_sparse_spatial_shape = self.middle_encoder(
-            gt_voxel_features, gt_coors, batch_size
-        )
         
+        # GT branch: voxelize and encode through GT SparseEncoder (separate from pseudo)
+        # CRITICAL: Freeze GT encoder to prevent trivial solution
+        # Use torch.no_grad() to stop gradients, but keep features for loss computation
+        with torch.no_grad():
+            gt_voxel_features, gt_num_points, gt_coors = self._voxel_encoder(gt_points)
+            gt_dense_features, gt_sparse_features, gt_sparse_indices, gt_sparse_spatial_shape = self.middle_encoder_gt(
+                gt_voxel_features, gt_coors, batch_size
+            )
         
-        refined_features, refined_indices, transformer_losses = self.pattern_adaptation(
-            pseudo_sparse_features=pseudo_sparse_features,
-            pseudo_sparse_indices=pseudo_sparse_indices,
+        # Detach GT features to prevent gradient flow into GT branch
+        # But keep them as targets for pseudo branch to learn from
+        gt_sparse_features = gt_sparse_features.detach()
+        gt_sparse_indices = gt_sparse_indices.detach()
+        
+        # Compute losses directly from sparse features
+        losses = {}
+        
+        # Loss 1: Voxel Occupancy Alignment (MOST IMPORTANT)
+        loss_occupancy = self.loss_occupancy(
+            pseudo_indices=pseudo_sparse_indices,
+            gt_indices=gt_sparse_indices,
             spatial_shape=pseudo_sparse_spatial_shape,
-            gt_sparse_features=gt_sparse_features,
-            gt_sparse_indices=gt_sparse_indices,
-            return_loss=True,
         )
-        losses = None
-        if transformer_losses:
-            losses = transformer_losses.copy()
-            for k, v in losses.items():
-                losses[k] = v * self.loss_weight
-        return refined_features, refined_indices, losses
+        losses['loss_occupancy'] = loss_occupancy * self.loss_occupancy_weight
+        
+        # Loss 2: Sparse Feature Alignment (only at overlapping voxels)
+        loss_feature = self.loss_feature(
+            pseudo_features=pseudo_sparse_features,
+            pseudo_indices=pseudo_sparse_indices,
+            gt_features=gt_sparse_features,
+            gt_indices=gt_sparse_indices,
+        )
+        losses['loss_feature'] = loss_feature * self.loss_feature_weight
+        
+        # Loss 3: Dense BEV Feature Alignment (auxiliary loss)
+        # Aligns dense BEV features [B, C*D, H, W] using cosine similarity with foreground masking
+        if self.loss_bev is not None:
+            loss_bev = self.loss_bev(
+                pseudo_bev=pseudo_dense_features,  # [B, C*D, H, W]
+                gt_bev=gt_dense_features,          # [B, C*D, H, W]
+            )
+            losses['loss_bev'] = loss_bev * self.loss_bev_weight
+        
+        # Apply global weight multiplier
+        for k in losses:
+            losses[k] = losses[k] * self.loss_weight
+        
+        # Return sparse features and dense features for both branches (for detection)
+        # Store in a dict format that ResDet3D can use
+        sparse_feat_dict = {
+            'pseudo': {
+                'dense_features': pseudo_dense_features,  # [B, C*D, H, W] dense BEV for detection
+                'features': pseudo_sparse_features,       # [N, C] sparse features for loss
+                'indices': pseudo_sparse_indices,         # [N, 4] sparse indices
+                'spatial_shape': pseudo_sparse_spatial_shape,
+            },
+            'gt': {
+                'dense_features': gt_dense_features,     # [B, C*D, H, W] dense BEV (for reference)
+                'features': gt_sparse_features,           # [N, C] sparse features for loss
+                'indices': gt_sparse_indices,             # [N, 4] sparse indices
+                'spatial_shape': gt_sparse_spatial_shape,
+            }
+        }
+        
+        return sparse_feat_dict, losses
 
     
     def forward_test(
         self,
+        pseudo_dense_features: torch.Tensor,
         pseudo_sparse_features: torch.Tensor,
         pseudo_sparse_indices: torch.Tensor,
         pseudo_sparse_spatial_shape: List[int],
-        gt_sparse_features: Optional[torch.Tensor] = None,
-        gt_sparse_indices: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
-        refined_features, refined_indices, metrics = self.pattern_adaptation(
-            pseudo_sparse_features=pseudo_sparse_features,
-            pseudo_sparse_indices=pseudo_sparse_indices,
-            spatial_shape=pseudo_sparse_spatial_shape,
-            gt_sparse_features=gt_sparse_features,
-            gt_sparse_indices=gt_sparse_indices,
-            return_loss=False,
-        )
-        return refined_features, refined_indices, metrics
+        gt_points: Optional[torch.Tensor] = None,
+    ) -> Tuple[Dict, Optional[Dict[str, float]]]:
+        """
+        Test forward: return pseudo features directly, compute metrics if GT available.
+        
+        No refinement needed - pseudo features are already aligned during training.
+        """
+        batch_size = pseudo_dense_features.shape[0]
+        
+        # In inference, return sparse features and dense features for both branches
+        sparse_feat_dict = {
+            'pseudo': {
+                'dense_features': pseudo_dense_features,  # [B, C*D, H, W] dense BEV for detection
+                'features': pseudo_sparse_features,        # [N, C] sparse features
+                'indices': pseudo_sparse_indices,          # [N, 4] sparse indices
+                'spatial_shape': pseudo_sparse_spatial_shape,
+            }
+        }
+        
+        metrics = None
+        if gt_points is not None:
+            # GT branch for metrics computation (if available)
+            gt_voxel_features, gt_num_points, gt_coors = self._voxel_encoder(gt_points)
+            gt_dense_features, gt_sparse_features, gt_sparse_indices, _ = self.middle_encoder_gt(
+                gt_voxel_features, gt_coors, batch_size
+            )
+            # Add GT features to dict
+            sparse_feat_dict['gt'] = {
+                'dense_features': gt_dense_features,       # [B, C*D, H, W] dense BEV (for reference)
+                'features': gt_sparse_features,             # [N, C] sparse features
+                'indices': gt_sparse_indices,               # [N, 4] sparse indices
+                'spatial_shape': pseudo_sparse_spatial_shape,
+            }
+            # Compute metrics for monitoring (optional, for eval hook)
+            metrics = self._compute_metrics(
+                pseudo_sparse_features, pseudo_sparse_indices,
+                gt_sparse_features, gt_sparse_indices
+            )
+        
+        return sparse_feat_dict, metrics
+    
+    def _compute_metrics(
+        self,
+        pseudo_features: torch.Tensor,
+        pseudo_indices: torch.Tensor,
+        gt_features: torch.Tensor,
+        gt_indices: torch.Tensor,
+    ) -> Dict[str, float]:
+        """Compute evaluation metrics (for monitoring, not used in loss)."""
+        metrics = {}
+        
+        # Count metrics
+        pseudo_count = pseudo_indices.shape[0]
+        gt_count = gt_indices.shape[0]
+        metrics['pseudo_count'] = float(pseudo_count)
+        metrics['gt_count'] = float(gt_count)
+        metrics['refined_count'] = float(pseudo_count)  # No refinement, same as pseudo
+        metrics['count_diff'] = abs(pseudo_count - gt_count) / max(gt_count, 1)
+        metrics['gen_ratio'] = pseudo_count / max(gt_count, 1)
+        
+        # Feature distance (if overlapping voxels exist)
+        if pseudo_count > 0 and gt_count > 0:
+            # Find overlapping voxels
+            pseudo_voxels = set(tuple(idx.cpu().numpy()) for idx in pseudo_indices)
+            gt_voxels = set(tuple(idx.cpu().numpy()) for idx in gt_indices)
+            common_voxels = pseudo_voxels & gt_voxels
+            
+            if len(common_voxels) > 0:
+                # Extract features at common voxels (simplified, for metrics only)
+                # This is approximate - full matching done in loss
+                feat_dist = torch.norm(
+                    pseudo_features.mean(dim=0) - gt_features.mean(dim=0)
+                ).item()
+                metrics['feat_dist'] = feat_dist
+            else:
+                metrics['feat_dist'] = 0.0
+        else:
+            metrics['feat_dist'] = 0.0
+        
+        # Chamfer-like distance (simplified)
+        metrics['chamfer_like_dist'] = 0.0  # Not computed for sparse features
+        
+        return metrics
 
     
     
@@ -457,74 +592,34 @@ class SparseRefinement(nn.Module):
                 gt_points = gt_points.unsqueeze(0)
             gt_points_xyz = gt_points if self.use_color else gt_points[:, :, :3]
 
-        # Pseudo branch (shared)
+        # Pseudo branch: voxelize and encode through Pseudo SparseEncoder (separate from GT)
         pseudo_voxel_features, pseudo_num_points, pseudo_coors = self._voxel_encoder(pseudo_points_xyz)
-        pseudo_sparse_features, pseudo_sparse_indices, pseudo_sparse_spatial_shape = self.middle_encoder(
+        pseudo_dense_features, pseudo_sparse_features, pseudo_sparse_indices, pseudo_sparse_spatial_shape = self.middle_encoder_pseudo(
             pseudo_voxel_features, pseudo_coors, batch_size
         )
 
         if return_loss:
-            refined_features, refined_indices, losses = self.forward_train(
+            sparse_feat_dict, losses = self.forward_train(
+                pseudo_dense_features=pseudo_dense_features,
                 pseudo_sparse_features=pseudo_sparse_features,
                 pseudo_sparse_indices=pseudo_sparse_indices,
                 pseudo_sparse_spatial_shape=pseudo_sparse_spatial_shape,
-                gt_points=gt_points,
+                gt_points=gt_points_xyz,  # Use xyz only
                 return_loss=return_loss,
             )
-            # print("pseudo_sparse_features.shape",pseudo_sparse_features.shape)
-            # print("refined_features.shape",refined_features.shape)
-
-
-            return refined_features, refined_indices, losses
+            return sparse_feat_dict, losses
         else:
-            # GT branch for metrics computation (if available)
-            gt_sparse_features = None
-            gt_sparse_indices = None
-            if gt_points_xyz is not None:
-                gt_voxel_features, gt_num_points, gt_coors = self._voxel_encoder(gt_points_xyz)
-                gt_sparse_features, gt_sparse_indices, _ = self.middle_encoder(
-                    gt_voxel_features, gt_coors, batch_size
-                )
-            
-            refined_features, refined_indices, metrics = self.forward_test(
+            # Test mode: return pseudo features, compute metrics if GT available
+            sparse_feat_dict, metrics = self.forward_test(
+                pseudo_dense_features=pseudo_dense_features,
                 pseudo_sparse_features=pseudo_sparse_features,
                 pseudo_sparse_indices=pseudo_sparse_indices,
                 pseudo_sparse_spatial_shape=pseudo_sparse_spatial_shape,
-                gt_sparse_features=gt_sparse_features,
-                gt_sparse_indices=gt_sparse_indices,
+                gt_points=gt_points_xyz,  # Pass GT points for metrics computation
             )
 
-            return refined_features, refined_indices, metrics
+            return sparse_feat_dict, metrics
 
-    
-    def _compute_feature_loss(
-        self,
-        refined_features: torch.Tensor,
-        gt_features: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute feature alignment loss."""
-        # TODO: Implement proper matching (e.g., Hungarian matching, nearest neighbor)
-        # For now, assume sizes match or truncate
-        if refined_features.shape[0] == gt_features.shape[0]:
-            return self.loss_feature(refined_features, gt_features)
-        else:
-            min_size = min(refined_features.shape[0], gt_features.shape[0])
-            return self.loss_feature(refined_features[:min_size], gt_features[:min_size])
-    
-    def _compute_index_loss(
-        self,
-        refined_indices: torch.Tensor,
-        gt_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute index alignment loss."""
-        if self.loss_index is None:
-            return torch.tensor(0.0, device=refined_indices.device)
-        
-        if refined_indices.shape[0] == gt_indices.shape[0]:
-            return self.loss_index(refined_indices.float(), gt_indices.float())
-        else:
-            min_size = min(refined_indices.shape[0], gt_indices.shape[0])
-            return self.loss_index(refined_indices[:min_size].float(), gt_indices[:min_size].float())
 
         
         

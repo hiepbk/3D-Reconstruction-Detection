@@ -253,6 +253,8 @@ class NuScenesDataset(Custom3DDataset):
             
             # this is for the depth anthing pseudo point cloud
             cam2lidar_rts = []
+            # Add intrinsics for DA3
+            cam_intrinsics = []
             
             for cam_type, cam_info in info['cams'].items():
                 image_paths.append(cam_info['data_path'])
@@ -278,6 +280,9 @@ class NuScenesDataset(Custom3DDataset):
                 cam2lidar_rt[3, :3] = -cam2lidar_t
                 cam2lidar_rts.append(cam2lidar_rt)
                 
+                # Store intrinsics for DA3 (3x3 matrix)
+                cam_intrinsics.append(intrinsic)
+                
                 
 
             input_dict.update(
@@ -286,6 +291,8 @@ class NuScenesDataset(Custom3DDataset):
                     lidar2img=lidar2img_rts,
                     # this is for the depth anthing pseudo point cloud
                     cam2lidar_rts=cam2lidar_rts,
+                    # Add intrinsics for DA3
+                    cam_intrinsic=cam_intrinsics,
 
                 ))
 

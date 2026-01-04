@@ -17,7 +17,6 @@ from .datasets.pipelines import (
 
 # Import losses to register EMDLoss, SmoothnessLoss, ColorLoss
 from .models.losses import EMDLoss, SmoothnessLoss, ColorLoss
-from .utils import PseudoEvalHook
 
 __all__ = [
     'ResDet3D',
@@ -29,6 +28,5 @@ __all__ = [
     'EMDLoss',
     'SmoothnessLoss',
     'ColorLoss',
-    'PseudoEvalHook',
 ]
 

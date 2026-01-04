@@ -87,27 +87,27 @@ class SparseEncoderV2(nn.Module):
             self.base_channels,
             block_type=block_type)
 
-        # self.conv_out = make_sparse_convmodule(
-        #     encoder_out_channels,
-        #     self.output_channels,
-        #     kernel_size=(3, 1, 1),
-        #     stride=(2, 1, 1),
-        #     norm_cfg=norm_cfg,
-        #     padding=0,
-        #     indice_key='spconv_down2',
-        #     conv_type='SparseConv3d')
-        
-        
-        
         self.conv_out = make_sparse_convmodule(
             encoder_out_channels,
             self.output_channels,
-            kernel_size=(2, 1, 1),
-            stride=(1, 1, 1),
+            kernel_size=(3, 1, 1),
+            stride=(2, 1, 1),
             norm_cfg=norm_cfg,
             padding=0,
             indice_key='spconv_down2',
             conv_type='SparseConv3d')
+        
+        
+        
+        # self.conv_out = make_sparse_convmodule(
+        #     encoder_out_channels,
+        #     self.output_channels,
+        #     kernel_size=(2, 1, 1),
+        #     stride=(1, 1, 1),
+        #     norm_cfg=norm_cfg,
+        #     padding=0,
+        #     indice_key='spconv_down2',
+        #     conv_type='SparseConv3d')
         
         
 
@@ -142,21 +142,24 @@ class SparseEncoderV2(nn.Module):
         # for detection head
         # [200, 176, 5] -> [200, 176, 2]
         out = self.conv_out(encode_features[-1])
-        # print("out features shape",out.features.shape)
-        # print("out indices shape",out.indices.shape)
-        # print("out spatial shape",out.spatial_shape)
-        # print("--------------------------------")
         spatial_features = out.dense()
 
         N, C, D, H, W = spatial_features.shape
-        spatial_features = spatial_features.view(N, C * D, H, W)
+        dense_features = spatial_features.view(N, C * D, H, W) # it is dense feature map, fed to 2D BEV backbone
+        
+        sparse_features = out.features
+        sparse_indices = out.indices
+        sparse_spatial_shape = out.spatial_shape
+        
+        # print("dense_features shape",dense_features.shape)
+        # print("sparse_features shape",sparse_features.shape)
+        # print("sparse_indices shape",sparse_indices.shape)
+        # print("sparse_spatial shape",sparse_spatial_shape)
+        # print("--------------------------------")
         
     
         
-        if self.return_type == 'dense':
-            return spatial_features, out.indices, out.spatial_shape
-        elif self.return_type == 'sparse':
-            return out.features, out.indices, out.spatial_shape
+        return dense_features, sparse_features, sparse_indices, sparse_spatial_shape
 
 
     def make_encoder_layers(self,

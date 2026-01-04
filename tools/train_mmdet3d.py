@@ -64,6 +64,43 @@ def _patch_scatter_forward():
     Scatter.forward = patched_forward
 
 
+# Patch MMDistributedDataParallel to handle missing _use_replicated_tensor_module attribute
+# This fixes a version compatibility issue between mmcv and mmdet
+def _patch_mm_distributed_data_parallel():
+    """Patch MMDistributedDataParallel to handle missing _use_replicated_tensor_module attribute."""
+    try:
+        from mmcv.parallel import MMDistributedDataParallel
+        
+        # Patch _run_ddp_forward to use getattr with default value
+        # The original code at line 160 does: self._use_replicated_tensor_module else self.module
+        # This fails if _use_replicated_tensor_module doesn't exist
+        original_run_ddp_forward = MMDistributedDataParallel._run_ddp_forward
+        
+        def patched_run_ddp_forward(self, *inputs, **kwargs):
+            """Patched _run_ddp_forward that handles missing _use_replicated_tensor_module."""
+            # Use getattr with default False instead of direct attribute access
+            use_replicated = getattr(self, '_use_replicated_tensor_module', False)
+            # Also safely get _replicated_tensor_module, fallback to self.module if missing
+            if use_replicated:
+                module_to_run = getattr(self, '_replicated_tensor_module', self.module)
+            else:
+                module_to_run = self.module
+            
+            if self.device_ids:
+                inputs, kwargs = self.to_kwargs(  # type: ignore
+                    inputs, kwargs, self.device_ids[0])
+                return module_to_run(*inputs[0], **kwargs[0])  # type: ignore
+            else:
+                return module_to_run(*inputs, **kwargs)
+        
+        MMDistributedDataParallel._run_ddp_forward = patched_run_ddp_forward
+        
+    except Exception as e:
+        # If patching fails, log a warning but continue
+        import warnings
+        warnings.warn(f"Could not patch MMDistributedDataParallel: {e}. Evaluation may fail.")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train ResDet3D with DepthAnything3 reconstruction')
     parser.add_argument('config', help='train config file path')
@@ -147,6 +184,7 @@ def main():
 
     # Patch mmcv Scatter.forward before building model/data
     _patch_scatter_forward()
+    _patch_mm_distributed_data_parallel()
 
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
@@ -311,8 +349,8 @@ def main():
         datasets,
         cfg,
         distributed=distributed,
-        # validate=(not args.no_validate),
-        validate=False, #temporary disable validation
+        validate=(not args.no_validate),
+        # validate=False, #temporary disable validation
         
         timestamp=timestamp,
         meta=meta)
