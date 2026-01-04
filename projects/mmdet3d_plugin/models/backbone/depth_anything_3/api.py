@@ -218,7 +218,24 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         imgs, ex_t, in_t = self._prepare_model_inputs(imgs_cpu, extrinsics, intrinsics)
 
         # Normalize extrinsics
-        ex_t_norm = self._normalize_extrinsics(ex_t.clone() if ex_t is not None else None)
+        # SKIP normalization if extrinsics are already normalized (e.g., from reconstruction_backbone)
+        # The reconstruction_backbone already normalizes to DA3's format (camera 0 = identity, others relative)
+        # DA3's _normalize_extrinsics does ANOTHER normalization (scales by median distance), which breaks the scale
+        # So we skip it when extrinsics are already in the correct format
+        # Check if extrinsics are already normalized (camera 0 is identity)
+        if ex_t is not None:
+            # Check if first camera is already identity (already normalized)
+            ex_t_first = ex_t[0, 0]  # First batch, first camera
+            is_identity = torch.allclose(ex_t_first[:3, :3], torch.eye(3, device=ex_t.device), atol=1e-4) and \
+                         torch.allclose(ex_t_first[:3, 3], torch.zeros(3, device=ex_t.device), atol=1e-4)
+            if is_identity:
+                # Already normalized, skip DA3's normalization
+                ex_t_norm = ex_t
+            else:
+                # Not normalized, apply DA3's normalization
+                ex_t_norm = self._normalize_extrinsics(ex_t.clone())
+        else:
+            ex_t_norm = None
 
         # Run model forward pass
         export_feat_layers = list(export_feat_layers) if export_feat_layers is not None else []
@@ -231,9 +248,24 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         prediction = self._convert_to_prediction(raw_output, return_torch=True)
 
         # Align prediction to extrinsincs
-        prediction = self._align_to_input_extrinsics_intrinsics(
-            extrinsics, intrinsics, prediction, align_to_input_ext_scale
-        )
+        # SKIPPED: When GT extrinsics are provided, the alignment causes scale mismatch
+        # because DA3's depth is in learned scale but GT extrinsics are in normalized metric scale.
+        # The Umeyama alignment computes wrong scale factor, making depth too small -> gaps appear.
+        # Skip alignment to avoid scale issues, but still set GT extrinsics/intrinsics if provided.
+        if extrinsics is not None:
+            # Still set GT extrinsics and intrinsics without scaling depth
+            prediction.intrinsics = intrinsics.numpy() if intrinsics is not None else prediction.intrinsics
+            # Use the normalized extrinsics that were passed to the model (already normalized)
+            if ex_t_norm is not None:
+                if isinstance(ex_t_norm, torch.Tensor):
+                    prediction.extrinsics = ex_t_norm.cpu().numpy()
+                else:
+                    prediction.extrinsics = ex_t_norm
+        else:
+            # No GT extrinsics provided, use alignment as normal
+            prediction = self._align_to_input_extrinsics_intrinsics(
+                extrinsics, intrinsics, prediction, align_to_input_ext_scale
+            )
 
         # Add processed images for visualization
         prediction = self._add_processed_images(prediction, imgs_cpu)
@@ -366,17 +398,28 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         """Align depth map to input extrinsics"""
         if extrinsics is None:
             return prediction
-        prediction.intrinsics = intrinsics.numpy()
+        # Convert to numpy, handling CUDA tensors by moving to CPU first
+        if isinstance(intrinsics, torch.Tensor):
+            intrinsics_np = intrinsics.cpu().numpy()
+        else:
+            intrinsics_np = intrinsics
+        if isinstance(extrinsics, torch.Tensor):
+            extrinsics_np = extrinsics.cpu().numpy()
+        else:
+            extrinsics_np = extrinsics
+        
+        prediction.intrinsics = intrinsics_np
         _, _, scale, aligned_extrinsics = align_poses_umeyama(
             prediction.extrinsics,
-            extrinsics.numpy(),
-            ransac=len(extrinsics) >= ransac_view_thresh,
+            extrinsics_np,
+            ransac=len(extrinsics_np) >= ransac_view_thresh,
             return_aligned=True,
             random_state=42,
         )
         if align_to_input_ext_scale:
-            prediction.extrinsics = extrinsics[..., :3, :].numpy()
-            prediction.depth /= scale
+            prediction.extrinsics = extrinsics_np[..., :3, :]
+            # Use non-in-place division (prediction.depth might be an inference tensor)
+            prediction.depth = prediction.depth / scale
         else:
             prediction.extrinsics = aligned_extrinsics
         return prediction

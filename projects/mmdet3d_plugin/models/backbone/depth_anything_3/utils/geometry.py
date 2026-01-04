@@ -61,10 +61,15 @@ def affine_inverse(A: torch.Tensor):
 
 def transpose_last_two_axes(arr):
     """
-    for np < 2
+    Transpose the last two axes of an array.
+    Handles both numpy arrays and torch tensors.
     """
     if arr.ndim < 2:
         return arr
+    # Handle torch tensors
+    if hasattr(arr, 'transpose') and hasattr(arr, 'device'):  # torch.Tensor
+        return arr.transpose(-2, -1)
+    # Handle numpy arrays
     axes = list(range(arr.ndim))
     # swap the last two
     axes[-2], axes[-1] = axes[-1], axes[-2]

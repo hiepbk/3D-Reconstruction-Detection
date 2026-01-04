@@ -98,6 +98,7 @@ test_pipeline = [
         load_dim=load_dim,
         use_dim=use_dim,
     ),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
     dict(
         type='MultiScaleFlipAug3D',
@@ -117,10 +118,18 @@ test_pipeline = [
             dict(
                 type='DefaultFormatBundle3D',
                 class_names=class_names,
-                with_label=False),
+                with_label=True),
             dict(
                 type='Collect3D',
-                keys=['points', 'img'],
+                # keys=['points', 'img'],
+                # meta_keys=(
+                #     'filename', 'ori_shape', 'img_shape',
+                #     'lidar2img', 'cam2lidar_rts', 'lidar2cam_rts', 'cam_intrinsic',
+                #     'pad_shape', 'scale_factor',
+                #     'flip', 'pcd_horizontal_flip', 'pcd_vertical_flip',
+                #     'box_mode_3d', 'box_type_3d', 'img_norm_cfg',
+                #     'gt_bboxes_3d', 'gt_labels_3d',  # Add GT bboxes and labels to meta for visualization
+                keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'],
                 meta_keys=(
                     'filename', 'ori_shape', 'img_shape',
                     'lidar2img', 'cam2lidar_rts', 'lidar2cam_rts', 'cam_intrinsic',
@@ -128,6 +137,7 @@ test_pipeline = [
                     'flip', 'pcd_horizontal_flip', 'pcd_vertical_flip',
                     'box_mode_3d', 'box_type_3d', 'img_norm_cfg',
                     'gt_bboxes_3d', 'gt_labels_3d',  # Add GT bboxes and labels to meta for visualization
+                
                 ),
             )
         ])
@@ -153,7 +163,7 @@ rescon_pipeline = [
     # Density-aware ball query (optional)
     dict(
                 type='BallQueryDownsample',
-        enabled=True,
+        enabled=False,
         min_radius=0.0,
         max_radius=0.5,
         sample_num=16,
@@ -162,7 +172,7 @@ rescon_pipeline = [
     # Uniform cap with FPS (optional)
     dict(
                 type='FPSDownsample',
-        enabled=True,
+        enabled=False,
                 num_points=40000,  # 40k points for convergence to real LiDAR point clouds
     ),
             
@@ -199,7 +209,7 @@ data = dict(
         pipeline=test_pipeline,
         classes=class_names,
         modality=input_modality,
-        test_mode=True,
+        test_mode=False,
         box_type_3d='LiDAR'),
     test=dict(
         type=dataset_type,
@@ -223,17 +233,19 @@ model = dict(
         rescon_pipeline=rescon_pipeline,
         glb_config=dict(
             sky_depth_def=98.0,
-            conf_thresh_percentile=30.0,
+            conf_thresh_percentile=38.0,
             filter_black_bg=False,
             filter_white_bg=False,
             max_depth=100.0,
         ),
         ref_view_strategy="saddle_balanced",
-        use_ray_pose=False,
+        use_ray_pose=True,
         max_points=1_000_000,
         filter_sky=True,
         max_depth=100.0,
-        conf_thresh_percentile=30.0,
+        conf_thresh_percentile=20.0,  # Lower = more points kept (was 30.0)
+        ensure_thresh_percentile=90.0,  # Upper bound for threshold
+        base_conf_thresh=0.9,  # Lower = more points kept (was 1.05)
         freeze_da3=True,  # Freeze DepthAnything3 model (recommended)
         export_glb=True,  # Enable GLB export for debugging (set to True to test)
         glb_export_dir="output",  # Directory for GLB export

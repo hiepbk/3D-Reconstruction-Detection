@@ -58,6 +58,8 @@ class ReconstructionBackbone(nn.Module):
         filter_sky: bool = True,
         max_depth: Optional[float] = None,
         conf_thresh_percentile: Optional[float] = None,
+        ensure_thresh_percentile: Optional[float] = None,
+        base_conf_thresh: Optional[float] = None,
         freeze_da3: bool = True,  # Freeze DepthAnything3 model (recommended)
         refinement: Optional[Dict] = None,  # Point cloud refinement config
         export_glb: bool = False,  # Enable GLB export for debugging
@@ -75,7 +77,9 @@ class ReconstructionBackbone(nn.Module):
             max_points: Maximum number of points
             filter_sky: Filter sky regions
             max_depth: Maximum depth threshold
-            conf_thresh_percentile: Confidence threshold percentile
+            conf_thresh_percentile: Confidence threshold percentile (lower bound)
+            ensure_thresh_percentile: Upper percentile clamp for confidence threshold
+            base_conf_thresh: Base confidence threshold value
         """
         super(ReconstructionBackbone, self).__init__()
         
@@ -109,9 +113,13 @@ class ReconstructionBackbone(nn.Module):
         if glb_config is not None:
             self.max_depth = max_depth or glb_config.get('max_depth', None)
             self.conf_thresh_percentile = conf_thresh_percentile or glb_config.get('conf_thresh_percentile', None)
+            self.ensure_thresh_percentile = ensure_thresh_percentile or glb_config.get('ensure_thresh_percentile', 90.0)
+            self.base_conf_thresh = base_conf_thresh or glb_config.get('base_conf_thresh', 1.05)
         else:
             self.max_depth = max_depth
             self.conf_thresh_percentile = conf_thresh_percentile
+            self.ensure_thresh_percentile = ensure_thresh_percentile if ensure_thresh_percentile is not None else 90.0
+            self.base_conf_thresh = base_conf_thresh if base_conf_thresh is not None else 1.05
         
         self.ref_view_strategy = ref_view_strategy
         self.use_ray_pose = use_ray_pose
@@ -344,7 +352,8 @@ class ReconstructionBackbone(nn.Module):
         multi_batch_intrinsics: torch.Tensor,       # (B, N, 3, 3)
         multi_batch_ori_imgs: Optional[torch.Tensor] = None,  # (B, N, 3, H, W)
         multi_batch_cam2lidar_rts: Optional[torch.Tensor] = None, # (B, N, 4, 4)
-        
+        multi_batch_confs: Optional[torch.Tensor] = None,  # (B, N, H, W)
+        conf_thr: Optional[float] = None,  # Confidence threshold
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         
@@ -360,7 +369,7 @@ class ReconstructionBackbone(nn.Module):
         """
         device = multi_batch_depths.device
         B, N, H, W = multi_batch_depths.shape
-
+        print('depth shape of _backproject_depth_to_points: H and W: ', H, W)
         # points_batch = []
         # colors_batch = []
 
@@ -382,26 +391,42 @@ class ReconstructionBackbone(nn.Module):
                 depth = multi_batch_depths[batch_idx, cam_idx]  # (H,W)
                 intr = multi_batch_intrinsics[batch_idx, cam_idx]  # (3,3)
 
-                fx, fy = intr[0, 0], intr[1, 1]
-                cx, cy = intr[0, 2], intr[1, 2]
-
-                z = depth
-                x = (uu - cx) * z / fx
-                y = (vv - cy) * z / fy
-
-                pts = torch.stack([x.reshape(-1), y.reshape(-1), z.reshape(-1)], dim=1)
-
-                valid = (z.reshape(-1) > 0) & torch.isfinite(z.reshape(-1))
+                # Use ray-based method similar to _depths_to_world_points_with_colors
+                # Create pixel coordinates (u, v, 1) for all pixels
+                pix = torch.stack([uu.reshape(-1), vv.reshape(-1), torch.ones_like(uu).reshape(-1)], dim=1)  # (H*W, 3)
+                
+                # Get valid depth mask
+                d_flat = depth.reshape(-1)  # (H*W,)
+                valid = (d_flat > 0) & torch.isfinite(d_flat)
                 if self.max_depth is not None:
-                    valid = valid & (z.reshape(-1) <= self.max_depth)
-                # if self.conf_thresh_percentile is not None and self.conf_thresh_percentile > 0:
-                #     conf_flat = multi_batch_confs[batch_idx, cam_idx].reshape(-1)
-                #     valid = valid & (conf_flat >= self.conf_thresh_percentile)
-                # if self.filter_sky and multi_batch_sky_masks is not None:
-                #     sky_flat = multi_batch_sky_masks[batch_idx, cam_idx].reshape(-1)
-                #     valid = valid & (~sky_flat)
+                    valid = valid & (d_flat <= self.max_depth)
+                
+                # Filter by confidence threshold (same as GLB export)
+                if multi_batch_confs is not None and conf_thr is not None:
+                    conf = multi_batch_confs[batch_idx, cam_idx]  # (H, W)
+                    conf_flat = conf.reshape(-1)  # (H*W,)
+                    valid = valid & (conf_flat >= conf_thr)
+                
+                if not torch.any(valid):
+                    continue
+                
+                # Get valid pixel indices
+                vidx = torch.nonzero(valid, as_tuple=False).squeeze(-1)  # (M,)
+                
+                # Compute inverse intrinsics
+                K_inv = torch.inverse(intr)  # (3, 3)
+                
+                # Transform pixels to rays: rays = K_inv @ pix[valid].T
+                pix_valid = pix[vidx].T  # (3, M)
+                rays = K_inv @ pix_valid  # (3, M)
+                
+                # Scale rays by depth to get points in camera coordinates
+                d_valid = d_flat[vidx]  # (M,)
+                Xc = rays * d_valid[None, :]  # (3, M)
+                pts = Xc.T  # (M, 3) - points in camera coordinates
+                
 
-                pts = pts[valid]
+                
 
                 cols = None
                 if multi_batch_ori_imgs is not None:
@@ -416,17 +441,20 @@ class ReconstructionBackbone(nn.Module):
                             align_corners=False,
                         ).squeeze(0)
                     img_flat = img.permute(1, 2, 0).reshape(-1, 3)
-                    cols = img_flat[valid]
+                    cols = img_flat[vidx]
                     if cols.numel() > 0 and cols.max() > 1.5:
                         cols = cols / 255.0
-
+                        
                 
+
                 # Convert pts in camera coordinates to lidar coordinates
                 if pts.numel() > 0:
                     pts = pts @ multi_batch_cam2lidar_rts[batch_idx, cam_idx][:3, :3].T + multi_batch_cam2lidar_rts[batch_idx, cam_idx][3, :3]
                     points_list.append(pts)
                     if cols is not None and cols.numel() > 0:
                         colors_list.append(cols)
+                        
+
             
             # Concatenate all points/colors once at the end (much more memory efficient)
             if points_list:
@@ -438,6 +466,24 @@ class ReconstructionBackbone(nn.Module):
             
             all_points_batch.append(points_batch)
             all_colors_batch.append(colors_batch)
+            
+        # # Visualize points from first batch item (for debugging - same as GLB export visualization)
+        # # Note: This visualizes points in camera coordinates before lidar transformation
+        # if len(all_points_batch) > 0 and all_points_batch[0].numel() > 0:
+        #     import open3d as o3d
+        #     pcd = o3d.geometry.PointCloud()
+        #     # Visualize first batch item only
+        #     points_vis = all_points_batch[0].cpu().numpy()
+        #     pcd.points = o3d.utility.Vector3dVector(points_vis)
+        #     if all_colors_batch[0] is not None and all_colors_batch[0].numel() > 0:
+        #         colors_vis = all_colors_batch[0].cpu().numpy()
+        #         # Normalize colors to [0, 1] if needed
+        #         if colors_vis.max() > 1.0:
+        #             colors_vis = colors_vis / 255.0
+        #         pcd.colors = o3d.utility.Vector3dVector(colors_vis)
+        #     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
+        #     geometries = [pcd, axis]
+        #     o3d.visualization.draw_geometries(geometries, window_name="Pseudo Point Cloud (Camera Coords)")
 
         return all_points_batch, all_colors_batch
 
@@ -622,11 +668,9 @@ class ReconstructionBackbone(nn.Module):
         
         # Prepare extrinsics and intrinsics for DA3 input processor
         # Since image is a torch.Tensor, input processor expects torch.Tensors for extrinsics/intrinsics too
-        # Comment out extrinsics - let DA3 predict them
-        # extrinsics_for_da3 = multi_batch_extrinsics_gt if multi_batch_extrinsics_gt is not None else None
-        
-        extrinsics_for_da3 = None
-        # extrinsics_for_da3 = None  # Let DA3 predict extrinsics
+        # ALWAYS let DA3 predict extrinsics first (for consistent depth scale)
+        # Then align depth to GT extrinsics using Umeyama alignment
+        extrinsics_for_da3 = None  # Let DA3 predict extrinsics for consistent depth scale
         intrinsics_for_da3 = multi_batch_intrinsics_gt if multi_batch_intrinsics_gt is not None else None
         
         imgs_processed, extrinsics_processed, intrinsics_processed = self.input_processor(
@@ -667,6 +711,13 @@ class ReconstructionBackbone(nn.Module):
             )
         prediction = self._convert_to_prediction(da3_output, return_torch=True)
         
+        # Skip alignment - DA3's predicted depth and extrinsics are already self-consistent and close to metric
+        # When DA3 predicts extrinsics (extrinsics_for_da3=None), the depth is already in a scale that's close to metric
+        # Aligning to GT extrinsics causes incorrect scaling and rotation issues (too small, sloped ground, wrong alignment)
+        # Instead, we use DA3's predicted extrinsics and depth as-is for backprojection
+        # The backprojection will use metric cam2lidar_rts from the dataset, which should work correctly
+        # with DA3's learned depth scale (which is already close to metric, as observed when extrinsics=None)
+        
         # GLB Export (for debugging) - add processed images and export
         if self.export_glb and prediction is not None:
             # Create a copy of prediction for GLB export to avoid modifying the original
@@ -675,19 +726,27 @@ class ReconstructionBackbone(nn.Module):
             
             
             # Use original RGB images (not normalized) for GLB export
-            # Resize original images to match processed resolution
+            # Resize original images to match depth map resolution (same as _backproject_depth_to_points does)
             # multi_batch_ori_imgs is (B, N, 3, H_orig, W_orig) in RGB format
-            # imgs_processed is (B, N, 3, H_proc, W_proc) normalized
-            # We need (N, H_proc, W_proc, 3) uint8 RGB for GLB export
+            # prediction.depth is (N, H, W) or (B, N, H, W) at processed resolution
+            # We need (N, H, W, 3) uint8 RGB for GLB export, matching depth map size
             
             import torch.nn.functional as F
             
-            # Get processed image size from first processed image
-            _, _, H_proc, W_proc = imgs_processed.shape[1:]  # (N, 3, H, W) after batch dim
+            # Get depth map size (processed resolution)
+            if isinstance(prediction_glb.depth, torch.Tensor):
+                depth_shape = prediction_glb.depth.shape
+            else:
+                depth_shape = np.array(prediction_glb.depth).shape
             
-            # Resize original images to processed resolution
+            # Remove batch dimension if present: (B, N, H, W) -> (N, H, W)
+            if len(depth_shape) == 4:  # (B, N, H, W)
+                H_proc, W_proc = depth_shape[2], depth_shape[3]
+            else:  # (N, H, W)
+                H_proc, W_proc = depth_shape[1], depth_shape[2]
+            
+            # Resize original images to depth map resolution (same approach as _backproject_depth_to_points)
             # multi_batch_ori_imgs[0] is (N, 3, H_orig, W_orig)
-            # F.interpolate expects (B, C, H, W), so we reshape to (N, 3, H_orig, W_orig) which is already correct
             ori_imgs_resized = F.interpolate(
                 multi_batch_ori_imgs[0],  # (N, 3, H_orig, W_orig)
                 size=(H_proc, W_proc),
@@ -754,10 +813,25 @@ class ReconstructionBackbone(nn.Module):
             # Create export directory
             os.makedirs(self.glb_export_dir, exist_ok=True)
             
+            # Prepare GT extrinsics for GLB export (if available)
+            # Use GT extrinsics to fix wrong camera poses, but keep prediction.intrinsics for metric scale
+            gt_extrinsics_for_glb = None
+            if multi_batch_extrinsics_gt is not None:
+                if isinstance(multi_batch_extrinsics_gt, torch.Tensor):
+                    gt_extrinsics_np = multi_batch_extrinsics_gt.cpu().numpy()
+                else:
+                    gt_extrinsics_np = multi_batch_extrinsics_gt
+                # Remove batch dimension if present: (B, N, 4, 4) -> (N, 4, 4)
+                if gt_extrinsics_np.ndim == 4:  # (B, N, 4, 4)
+                    gt_extrinsics_for_glb = gt_extrinsics_np[0]  # (N, 4, 4)
+                else:
+                    gt_extrinsics_for_glb = gt_extrinsics_np  # (N, 4, 4)
+            
             # Export GLB and get points/colors directly
             glb_path, glb_points_np, glb_colors_np = export_to_glb(
                 prediction=prediction_glb,
                 export_dir=self.glb_export_dir,
+                gt_extrinsics=gt_extrinsics_for_glb,  # Use GT extrinsics if available
                 num_max_points=self.max_points,
                 conf_thresh_percentile=self.conf_thresh_percentile or 40.0,
                 show_cameras=True,
@@ -790,9 +864,64 @@ class ReconstructionBackbone(nn.Module):
         
         if prediction is not None:
             # Back-project depth maps to point clouds (batched)
-            multi_batch_depths = prediction.depth
-            multi_batch_intrinsics = prediction.intrinsics
+            # Convert depth to torch tensor if needed and ensure correct shape (B, N, H, W)
+            if isinstance(prediction.depth, np.ndarray):
+                depth_torch = torch.from_numpy(prediction.depth).to(device=device, dtype=torch.float32)
+            elif isinstance(prediction.depth, torch.Tensor):
+                depth_torch = prediction.depth.to(device=device, dtype=torch.float32)
+            else:
+                depth_torch = prediction.depth
+            
+            # Add batch dimension if needed: (N, H, W) -> (1, N, H, W)
+            if depth_torch.ndim == 3:  # (N, H, W)
+                depth_torch = depth_torch.unsqueeze(0)  # (1, N, H, W)
+            
+            multi_batch_depths = depth_torch
+            B, N, H, W = multi_batch_depths.shape  # Get actual batch size
+            
+            # Convert intrinsics to torch tensor if needed and ensure correct shape (B, N, 3, 3)
+            if isinstance(prediction.intrinsics, np.ndarray):
+                intrinsics_torch = torch.from_numpy(prediction.intrinsics).to(device=device, dtype=torch.float32)
+            elif isinstance(prediction.intrinsics, torch.Tensor):
+                intrinsics_torch = prediction.intrinsics.to(device=device, dtype=torch.float32)
+            else:
+                intrinsics_torch = prediction.intrinsics
+            
+            # Add batch dimension if needed: (N, 3, 3) -> (B, N, 3, 3)
+            if intrinsics_torch.ndim == 3:  # (N, 3, 3)
+                intrinsics_torch = intrinsics_torch.unsqueeze(0).expand(B, -1, -1, -1)  # (B, N, 3, 3)
+            elif intrinsics_torch.ndim == 4 and intrinsics_torch.shape[0] == 1:  # (1, N, 3, 3) but B > 1
+                intrinsics_torch = intrinsics_torch.expand(B, -1, -1, -1)  # (B, N, 3, 3)
+            
+            multi_batch_intrinsics = intrinsics_torch
             multi_batch_cam2lidar_rts = self._extract_cam2lidar_rts_from_meta(img_metas, device=device)
+
+            # Extract confidence maps and calculate threshold (same as GLB export)
+            multi_batch_confs = None
+            conf_thr = None
+            if prediction.conf is not None and self.conf_thresh_percentile is not None:
+                # Convert confidence to torch tensor if needed
+                if isinstance(prediction.conf, np.ndarray):
+                    conf_torch = torch.from_numpy(prediction.conf).to(device=device, dtype=torch.float32)
+                elif isinstance(prediction.conf, torch.Tensor):
+                    conf_torch = prediction.conf.to(device=device, dtype=torch.float32)
+                else:
+                    conf_torch = prediction.conf
+                
+                # Add batch dimension if needed: (N, H, W) -> (B, N, H, W)
+                if conf_torch.ndim == 3:  # (N, H, W)
+                    conf_torch = conf_torch.unsqueeze(0).expand(B, -1, -1, -1)  # (B, N, H, W)
+                elif conf_torch.ndim == 4 and conf_torch.shape[0] == 1:  # (1, N, H, W) but B > 1
+                    conf_torch = conf_torch.expand(B, -1, -1, -1)  # (B, N, H, W)
+                
+                multi_batch_confs = conf_torch
+                
+                # Calculate confidence threshold using percentile (same as GLB export)
+                conf_flat = conf_torch.reshape(-1).cpu().numpy()
+                lower = np.percentile(conf_flat, self.conf_thresh_percentile)
+                upper = np.percentile(conf_flat, self.ensure_thresh_percentile)
+                conf_thr = float(min(max(self.base_conf_thresh, lower), upper))
+                print(f"[DEBUG] Confidence threshold: {conf_thr:.4f} (percentile: {self.conf_thresh_percentile}%, ensure: {self.ensure_thresh_percentile}%, base: {self.base_conf_thresh})")
 
             # Back-project all batch items at once (returns lists of length B)
             all_points_batch, all_colors_batch = self._backproject_depth_to_points(
@@ -800,6 +929,8 @@ class ReconstructionBackbone(nn.Module):
                 multi_batch_intrinsics,
                 multi_batch_ori_imgs,
                 multi_batch_cam2lidar_rts,
+                multi_batch_confs,
+                conf_thr,
             )
             
             # Process each batch item separately through the post-processing pipeline
@@ -1034,6 +1165,17 @@ class ReconstructionBackbone(nn.Module):
             )
         prediction = self._convert_to_prediction(da3_output, return_torch=True)
         
+        # Skip alignment - DA3's predicted depth and extrinsics are already self-consistent and close to metric
+        # When DA3 predicts extrinsics (extrinsics_for_da3=None), the depth is already in a scale that's close to metric
+        # Aligning to GT extrinsics causes incorrect scaling and rotation issues (too small, sloped ground, wrong alignment)
+        # Instead, we use DA3's predicted extrinsics and depth as-is for backprojection
+        # The backprojection will use metric cam2lidar_rts from the dataset, which should work correctly
+        # with DA3's learned depth scale (which is already close to metric, as observed when extrinsics=None)
+        
+        # Initialize GLB visualization variables (will be set if GLB export is enabled)
+        glb_points_np = None
+        glb_colors_np = None
+        
         # GLB Export (for debugging) - add processed images and export
         if self.export_glb and prediction is not None:
             # Create a copy of prediction for GLB export to avoid modifying the original
@@ -1042,19 +1184,27 @@ class ReconstructionBackbone(nn.Module):
             
             
             # Use original RGB images (not normalized) for GLB export
-            # Resize original images to match processed resolution
+            # Resize original images to match depth map resolution (same as _backproject_depth_to_points does)
             # multi_batch_ori_imgs is (B, N, 3, H_orig, W_orig) in RGB format
-            # imgs_processed is (B, N, 3, H_proc, W_proc) normalized
-            # We need (N, H_proc, W_proc, 3) uint8 RGB for GLB export
+            # prediction.depth is (N, H, W) or (B, N, H, W) at processed resolution
+            # We need (N, H, W, 3) uint8 RGB for GLB export, matching depth map size
             
             import torch.nn.functional as F
             
-            # Get processed image size from first processed image
-            _, _, H_proc, W_proc = imgs_processed.shape[1:]  # (N, 3, H, W) after batch dim
+            # Get depth map size (processed resolution)
+            if isinstance(prediction_glb.depth, torch.Tensor):
+                depth_shape = prediction_glb.depth.shape
+            else:
+                depth_shape = np.array(prediction_glb.depth).shape
             
-            # Resize original images to processed resolution
+            # Remove batch dimension if present: (B, N, H, W) -> (N, H, W)
+            if len(depth_shape) == 4:  # (B, N, H, W)
+                H_proc, W_proc = depth_shape[2], depth_shape[3]
+            else:  # (N, H, W)
+                H_proc, W_proc = depth_shape[1], depth_shape[2]
+            
+            # Resize original images to depth map resolution (same approach as _backproject_depth_to_points)
             # multi_batch_ori_imgs[0] is (N, 3, H_orig, W_orig)
-            # F.interpolate expects (B, C, H, W), so we reshape to (N, 3, H_orig, W_orig) which is already correct
             ori_imgs_resized = F.interpolate(
                 multi_batch_ori_imgs[0],  # (N, 3, H_orig, W_orig)
                 size=(H_proc, W_proc),
@@ -1121,10 +1271,25 @@ class ReconstructionBackbone(nn.Module):
             # Create export directory
             os.makedirs(self.glb_export_dir, exist_ok=True)
             
+            # Prepare GT extrinsics for GLB export (if available)
+            # Use GT extrinsics to fix wrong camera poses, but keep prediction.intrinsics for metric scale
+            gt_extrinsics_for_glb = None
+            if multi_batch_extrinsics_gt is not None:
+                if isinstance(multi_batch_extrinsics_gt, torch.Tensor):
+                    gt_extrinsics_np = multi_batch_extrinsics_gt.cpu().numpy()
+                else:
+                    gt_extrinsics_np = multi_batch_extrinsics_gt
+                # Remove batch dimension if present: (B, N, 4, 4) -> (N, 4, 4)
+                if gt_extrinsics_np.ndim == 4:  # (B, N, 4, 4)
+                    gt_extrinsics_for_glb = gt_extrinsics_np[0]  # (N, 4, 4)
+                else:
+                    gt_extrinsics_for_glb = gt_extrinsics_np  # (N, 4, 4)
+            
             # Export GLB and get points/colors directly
             glb_path, glb_points_np, glb_colors_np = export_to_glb(
                 prediction=prediction_glb,
                 export_dir=self.glb_export_dir,
+                gt_extrinsics=gt_extrinsics_for_glb,  # Use GT extrinsics if available
                 num_max_points=self.max_points,
                 conf_thresh_percentile=self.conf_thresh_percentile or 40.0,
                 show_cameras=True,
@@ -1154,9 +1319,64 @@ class ReconstructionBackbone(nn.Module):
         
         if prediction is not None:
             # Back-project depth maps to point clouds (batched)
-            multi_batch_depths = prediction.depth
-            multi_batch_intrinsics = prediction.intrinsics
+            # Convert depth to torch tensor if needed and ensure correct shape (B, N, H, W)
+            if isinstance(prediction.depth, np.ndarray):
+                depth_torch = torch.from_numpy(prediction.depth).to(device=device, dtype=torch.float32)
+            elif isinstance(prediction.depth, torch.Tensor):
+                depth_torch = prediction.depth.to(device=device, dtype=torch.float32)
+            else:
+                depth_torch = prediction.depth
+            
+            # Add batch dimension if needed: (N, H, W) -> (1, N, H, W)
+            if depth_torch.ndim == 3:  # (N, H, W)
+                depth_torch = depth_torch.unsqueeze(0)  # (1, N, H, W)
+            
+            multi_batch_depths = depth_torch
+            B, N, H, W = multi_batch_depths.shape  # Get actual batch size
+            
+            # Convert intrinsics to torch tensor if needed and ensure correct shape (B, N, 3, 3)
+            if isinstance(prediction.intrinsics, np.ndarray):
+                intrinsics_torch = torch.from_numpy(prediction.intrinsics).to(device=device, dtype=torch.float32)
+            elif isinstance(prediction.intrinsics, torch.Tensor):
+                intrinsics_torch = prediction.intrinsics.to(device=device, dtype=torch.float32)
+            else:
+                intrinsics_torch = prediction.intrinsics
+            
+            # Add batch dimension if needed: (N, 3, 3) -> (B, N, 3, 3)
+            if intrinsics_torch.ndim == 3:  # (N, 3, 3)
+                intrinsics_torch = intrinsics_torch.unsqueeze(0).expand(B, -1, -1, -1)  # (B, N, 3, 3)
+            elif intrinsics_torch.ndim == 4 and intrinsics_torch.shape[0] == 1:  # (1, N, 3, 3) but B > 1
+                intrinsics_torch = intrinsics_torch.expand(B, -1, -1, -1)  # (B, N, 3, 3)
+            
+            multi_batch_intrinsics = intrinsics_torch
             multi_batch_cam2lidar_rts = self._extract_cam2lidar_rts_from_meta(img_metas, device=device)
+
+            # Extract confidence maps and calculate threshold (same as GLB export)
+            multi_batch_confs = None
+            conf_thr = None
+            if prediction.conf is not None and self.conf_thresh_percentile is not None:
+                # Convert confidence to torch tensor if needed
+                if isinstance(prediction.conf, np.ndarray):
+                    conf_torch = torch.from_numpy(prediction.conf).to(device=device, dtype=torch.float32)
+                elif isinstance(prediction.conf, torch.Tensor):
+                    conf_torch = prediction.conf.to(device=device, dtype=torch.float32)
+                else:
+                    conf_torch = prediction.conf
+                
+                # Add batch dimension if needed: (N, H, W) -> (B, N, H, W)
+                if conf_torch.ndim == 3:  # (N, H, W)
+                    conf_torch = conf_torch.unsqueeze(0).expand(B, -1, -1, -1)  # (B, N, H, W)
+                elif conf_torch.ndim == 4 and conf_torch.shape[0] == 1:  # (1, N, H, W) but B > 1
+                    conf_torch = conf_torch.expand(B, -1, -1, -1)  # (B, N, H, W)
+                
+                multi_batch_confs = conf_torch
+                
+                # Calculate confidence threshold using percentile (same as GLB export)
+                conf_flat = conf_torch.reshape(-1).cpu().numpy()
+                lower = np.percentile(conf_flat, self.conf_thresh_percentile)
+                upper = np.percentile(conf_flat, self.ensure_thresh_percentile)
+                conf_thr = float(min(max(self.base_conf_thresh, lower), upper))
+                print(f"[DEBUG] Confidence threshold: {conf_thr:.4f} (percentile: {self.conf_thresh_percentile}%, ensure: {self.ensure_thresh_percentile}%, base: {self.base_conf_thresh})")
 
             # Back-project all batch items at once (returns lists of length B)
             all_points_batch, all_colors_batch = self._backproject_depth_to_points(
@@ -1164,6 +1384,8 @@ class ReconstructionBackbone(nn.Module):
                 multi_batch_intrinsics,
                 multi_batch_ori_imgs,
                 multi_batch_cam2lidar_rts,
+                multi_batch_confs,
+                conf_thr,
             )
             
             # Process each batch item separately through the post-processing pipeline
@@ -1194,37 +1416,132 @@ class ReconstructionBackbone(nn.Module):
                     merged = points_b  # (N, 3)
                 
                 pseudo_points_list.append(merged.float().to(device))
-                
-                
-
             
+            # Prepare GT points in batch format (list of tensors)
+            gt_points_list = None
+            if points is not None:
+                if isinstance(points, list):
+                    gt_points_list = [p.float().to(device) for p in points if p is not None]
+                elif isinstance(points, torch.Tensor):
+                    if points.dim() == 3:  # (B, N, 3)
+                        gt_points_list = [points[i].float().to(device) for i in range(B)]
+                    else:  # (N, 3) - single point cloud, expand to batch
+                        gt_points_list = [points.unsqueeze(0).expand(B, -1, -1).float().to(device)]
+
+            # Colorize GT points if available using lidar2img (only if refinement uses colors)
+            if gt_points_list is not None:
+                # Check if refinement module uses colors
+                use_color = getattr(self.refinement, 'use_color', False) if self.refinement is not None else False
+                if use_color:
+                    multi_batch_lidar2img = self._extract_lidar2img_from_meta(img_metas, device=device)
+                    gt_points_list = self._get_gt_color_points(
+                        gt_points_list=gt_points_list,
+                        multi_batch_ori_imgs=multi_batch_ori_imgs,
+                        multi_batch_lidar2img=multi_batch_lidar2img,
+                    )
+                # If not using colors, gt_points_list remains as XYZ only (B, N, 3)
+            
+            # Visualization for debugging (similar to forward_train)
+            for b_idx in range(B):
+                print(img_metas[b_idx]['filename'])
+                
+                # Extract GT bboxes from img_metas for visualization
+                gt_bboxes_3d_batch = None
+                if 'gt_bboxes_3d' in img_metas[b_idx]:
+                    gt_bboxes_3d_batch = img_metas[b_idx]['gt_bboxes_3d']
+                    # Handle DataContainer wrapper
+                    if isinstance(gt_bboxes_3d_batch, DC):
+                        gt_bboxes_3d_batch = gt_bboxes_3d_batch.data
+                    # Handle list/tuple wrapping (DataContainer.data might be a list)
+                    if isinstance(gt_bboxes_3d_batch, (list, tuple)) and len(gt_bboxes_3d_batch) > 0:
+                        # If it's a list, take the first element (batch item)
+                        gt_bboxes_3d_batch = gt_bboxes_3d_batch[0] if len(gt_bboxes_3d_batch) == 1 else gt_bboxes_3d_batch[b_idx]
+                    
+                    if gt_bboxes_3d_batch is not None:
+                        # Convert to LiDARInstance3DBoxes and convert to original gravity
+                        from mmdet3d.core.bbox.structures.box_3d_mode import Box3DMode
+                        
+                        # Get tensor from various formats
+                        if isinstance(gt_bboxes_3d_batch, LiDARInstance3DBoxes):
+                            bbox_tensor = gt_bboxes_3d_batch.tensor
+                        elif isinstance(gt_bboxes_3d_batch, torch.Tensor):
+                            bbox_tensor = gt_bboxes_3d_batch
+                        elif isinstance(gt_bboxes_3d_batch, np.ndarray):
+                            bbox_tensor = torch.from_numpy(gt_bboxes_3d_batch)
+                        elif hasattr(gt_bboxes_3d_batch, 'tensor'):
+                            bbox_tensor = gt_bboxes_3d_batch.tensor
+                        else:
+                            print(f"[WARNING] Unknown bbox format: {type(gt_bboxes_3d_batch)}, skipping visualization")
+                            gt_bboxes_3d_batch = None
+                            continue
+                        
+                        # Create LiDARInstance3DBoxes with origin (0.5, 0.5, 0.5) and convert to LIDAR
+                        gt_bboxes_3d_ori = LiDARInstance3DBoxes(
+                            bbox_tensor,
+                            box_dim=bbox_tensor.shape[-1],
+                            origin=(0.5, 0.5, -0.5)
+                        ).convert_to(Box3DMode.LIDAR)
+                        
+                        # Extract tensor and apply transformations
+                        gt_boxes_3d_ori = gt_bboxes_3d_ori.tensor.cpu().numpy()
+                        
+                        # Apply transformations for visualization
+                        # Flip yaw angle
+                        gt_boxes_3d_ori[:, 6] = -gt_boxes_3d_ori[:, 6] - np.pi / 2
+                        
+                        # Swap width and length for visualization
+                        gt_boxes_3d_ori[..., [3, 4]] = gt_boxes_3d_ori[..., [4, 3]]
+                        
+                        # Replace the original with transformed version
+                        gt_bboxes_3d_batch = gt_boxes_3d_ori
+                        
+                        bbox_count = len(gt_bboxes_3d_batch)
+                        print(f"[DEBUG] Found {bbox_count} GT bounding boxes for batch {b_idx} (converted to original gravity)")
+                
+                # Only visualize if GT points are available
+                if gt_points_list is not None and len(gt_points_list) > b_idx:
+                    gt_points_np = gt_points_list[b_idx].cpu().numpy()
+                    
+                    # Extract colors only if points have more than 3 columns
+                    if gt_points_np.shape[1] > 3:
+                        gt_colors = gt_points_np[:, 3:6]  # Extract RGB (assuming 6 columns: xyzrgb)
+                        # Ensure colors are in correct shape (N, 3)
+                        if gt_colors.shape[1] != 3:
+                            gt_colors = None
+                    else:
+                        gt_colors = None
+                    
+                    if gt_colors is not None:
+                        print(f"[DEBUG] GT point cloud: {len(gt_points_np)} points with colors shape {gt_colors.shape}")
+                    else:
+                        print(f"[DEBUG] GT point cloud: {len(gt_points_np)} points without colors (will use gray)")
+                    
+                    display_point_cloud(gt_points_np, colors=gt_colors, gt_bboxes_3d=gt_bboxes_3d_batch, window_name=f"GT Point Cloud ({len(gt_points_np):,} points)")
+                
+                # Always visualize pseudo points (they should always be available)
+                if len(pseudo_points_list) > b_idx:
+                    pseudo_points_np = pseudo_points_list[b_idx].cpu().numpy()
+                    pseudo_colors = pseudo_points_np[:, 3:] if pseudo_points_np.shape[1] > 3 else None
+                    display_point_cloud(pseudo_points_np, colors=pseudo_colors, gt_bboxes_3d=gt_bboxes_3d_batch, window_name=f"Pseudo Point Cloud ({len(pseudo_points_np):,} points)")
+                
+                # Display GLB point cloud if available (3rd visualization)
+                if glb_points_np is not None:
+                    if glb_colors_np is not None:
+                        print(f"[DEBUG] GLB point cloud: {len(glb_points_np)} points with colors shape {glb_colors_np.shape}, dtype={glb_colors_np.dtype}, range=[{glb_colors_np.min():.1f}, {glb_colors_np.max():.1f}]")
+                    else:
+                        print(f"[DEBUG] GLB point cloud: {len(glb_points_np)} points without colors (will use gray)")
+                    display_point_cloud(glb_points_np, colors=glb_colors_np, gt_bboxes_3d=gt_bboxes_3d_batch, window_name=f"GLB Point Cloud ({len(glb_points_np):,} points)")
 
             padded_pseudo, _ = self._padding_samples(pseudo_points_list, None)
             
             # Prepare GT points if available (for metrics computation)
             padded_gt = None
-            if points is not None:
-                # Handle GT points format (could be list or tensor)
-                if isinstance(points, list):
-                    gt_points_list = points
-                elif points.dim() == 3:  # (B, N, C)
-                    gt_points_list = [points[i] for i in range(points.shape[0])]
-                else:
-                    gt_points_list = [points]
-                
+            if gt_points_list is not None:
                 # Pad GT points separately (need to match pseudo padding)
                 # Get target_num_points from padded_pseudo
                 target_num_points = padded_pseudo.shape[1]  # (B, N, C) -> N
                 padded_gt_list = self._pad_point_clouds(gt_points_list, target_num_points)
                 padded_gt = torch.stack(padded_gt_list, dim=0)  # (B, N, C)
-                
-                
-            # If not using colors, gt_points_list remains as XYZ only (B, N, 3)
-            # comment or uncomment for visual debugging purposes
-            # for b_idx in range(B):
-            #     print(img_metas[b_idx]['filename'])
-            #     display_point_cloud(gt_points_list[b_idx].cpu().numpy(), colors=gt_points_list[b_idx].cpu().numpy()[:, 3:], gt_bboxes_3d=None)
-            #     display_point_cloud(pseudo_points_list[b_idx].cpu().numpy(), colors=pseudo_points_list[b_idx].cpu().numpy()[:, 3:], gt_bboxes_3d=None)
             
             # Refine entire batch at once (with GT if available for metrics)
             sparse_feat_dict, metrics = self.refinement(

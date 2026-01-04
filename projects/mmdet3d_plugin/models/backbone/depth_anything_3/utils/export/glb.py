@@ -52,6 +52,7 @@ def get_conf_thresh(
 def export_to_glb(
     prediction: Prediction,
     export_dir: str,
+    gt_extrinsics: np.ndarray | None = None,
     num_max_points: int = 1_000_000,
     conf_thresh: float = 1.05,
     filter_black_bg: bool = False,
@@ -62,7 +63,7 @@ def export_to_glb(
     show_cameras: bool = True,
     camera_size: float = 0.03,
     export_depth_vis: bool = True,
-) -> str:
+) -> tuple[str, np.ndarray, np.ndarray]:
     """Generate a 3D point cloud and camera wireframes and export them as a ``.glb`` file.
 
     The function builds a point cloud from the predicted depth maps, aligns it to the
@@ -74,6 +75,9 @@ def export_to_glb(
         prediction: Model prediction containing depth, confidence, intrinsics, extrinsics,
             and pre-processed images.
         export_dir: Output directory where the glTF assets will be written.
+        gt_extrinsics: Optional ground truth extrinsics (N, 4, 4) to use instead of prediction.extrinsics.
+            If provided, will be used for backprojection to fix wrong camera poses.
+            Note: prediction.intrinsics is always used (not GT) to preserve metric scale.
         num_max_points: Maximum number of points retained after downsampling.
         conf_thresh: Base confidence threshold used before percentile adjustments.
         filter_black_bg: Mark near-black background pixels for removal during confidence filtering.
@@ -130,14 +134,27 @@ def export_to_glb(
     )
 
     # 4) Back-project to world coordinates and get colors (world frame)
+    # Use GT extrinsics if provided (to fix wrong camera poses), otherwise use predicted extrinsics
+    # Always use prediction.intrinsics (not GT) to preserve the real metric scale
+    extrinsics_to_use = gt_extrinsics if gt_extrinsics is not None else prediction.extrinsics
     points, colors = _depths_to_world_points_with_colors(
         prediction.depth,
-        prediction.intrinsics,
-        prediction.extrinsics,  # w2c
+        prediction.intrinsics,  # Always use prediction.intrinsics to preserve metric scale
+        extrinsics_to_use,  # Use GT extrinsics if provided, otherwise predicted
         images_u8,
         prediction.conf,
         conf_thr,
     )
+    
+    # the point cloud in here look very clean, not too much noise
+    ## visualize the points and colors
+    # import open3d as o3d
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(points)
+    # pcd.colors = o3d.utility.Vector3dVector(colors / 255.0)
+    # axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
+    # geometries = [pcd, axis]
+    # o3d.visualization.draw_geometries(geometries)
 
     # 5) Based on first camera orientation + glTF axis system, center by point cloud,
     # construct alignment transform, and apply to point cloud
@@ -219,6 +236,7 @@ def _depths_to_world_points_with_colors(
     Simultaneously extract colors.
     """
     N, H, W = depth.shape
+    print('depth shape of glb _depths_to_world_points_with_colors: H and W: ', H, W)
     us, vs = np.meshgrid(np.arange(W), np.arange(H))
     ones = np.ones_like(us)
     pix = np.stack([us, vs, ones], axis=-1).reshape(-1, 3)  # (H*W,3)
