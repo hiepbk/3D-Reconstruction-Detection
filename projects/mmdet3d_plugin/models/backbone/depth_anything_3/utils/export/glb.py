@@ -141,6 +141,7 @@ def export_to_glb(
 
     # 5) Based on first camera orientation + glTF axis system, center by point cloud,
     # construct alignment transform, and apply to point cloud
+    # Extrinsics are always in DA3's normalized format (relative to first camera)
     A = _compute_alignment_transform_first_cam_glTF_center_by_points(
         prediction.extrinsics[0], points
     )  # (4,4)

@@ -83,7 +83,7 @@ train_pipeline = [
         keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'],
         meta_keys=(
             'filename', 'ori_shape', 'img_shape',
-            'lidar2img', 'cam2lidar_rts', 'cam_intrinsic',
+            'lidar2img', 'cam2lidar_rts', 'lidar2cam_rts', 'cam_intrinsic',
             'pad_shape', 'scale_factor',
             'flip', 'pcd_horizontal_flip', 'pcd_vertical_flip',
             'box_mode_3d', 'box_type_3d', 'img_norm_cfg',

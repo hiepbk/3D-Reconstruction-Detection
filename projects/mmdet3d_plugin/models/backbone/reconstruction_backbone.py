@@ -190,6 +190,48 @@ class ReconstructionBackbone(nn.Module):
         multi_batch_cam2lidar_rts = torch.stack(cam2lidar_rts_list, dim=0).to(device=device, dtype=torch.float32)
         return multi_batch_cam2lidar_rts
     
+    def _extract_lidar2cam_rts_from_meta(self, meta: Dict, device: torch.device) -> torch.Tensor:
+        """Extract lidar2cam_rts from metadata, convert to standard format, and normalize relative to first camera.
+        
+        Returns:
+            Tensor of shape (B, N, 4, 4) in DA3's normalized format (camera 0 = identity), or None if not available.
+        """
+        batch_list = []
+        for meta_batch in meta:
+            lidar2cam_rts = meta_batch.get('lidar2cam_rts', None)
+            if lidar2cam_rts is None:
+                return None
+            
+            # Convert to numpy array and ensure shape (N, 4, 4)
+            if isinstance(lidar2cam_rts, list):
+                lidar2cam_rts = np.array(lidar2cam_rts)
+            if lidar2cam_rts.ndim == 2:
+                lidar2cam_rts = lidar2cam_rts[None, :, :]
+            
+            # Convert from non-standard format [[R.T, 0], [t, 1]] to standard [[R, t], [0, 1]]
+            N = lidar2cam_rts.shape[0]
+            lidar2cam_std = np.zeros((N, 4, 4), dtype=lidar2cam_rts.dtype)
+            lidar2cam_std[:, :3, :3] = lidar2cam_rts[:, :3, :3].transpose(0, 2, 1)  # R = R.T.T
+            lidar2cam_std[:, :3, 3] = lidar2cam_rts[:, 3, :3]  # t from row 3 to column 3
+            lidar2cam_std[:, 3, 3] = 1.0
+            
+            batch_list.append(torch.tensor(lidar2cam_std, device=device, dtype=torch.float32))
+        
+        multi_batch = torch.stack(batch_list, dim=0)  # (B, N, 4, 4)
+        
+        # Normalize: make camera 0 identity, others relative to it (matching DA3 format)
+        B, N = multi_batch.shape[:2]
+        normalized = []
+        for b in range(B):
+            lidar2cam_0 = multi_batch[b, 0]  # (4, 4)
+            R_0, t_0 = lidar2cam_0[:3, :3], lidar2cam_0[:3, 3:4]
+            cam0_to_lidar = torch.eye(4, device=device, dtype=multi_batch.dtype)
+            cam0_to_lidar[:3, :3] = R_0.T
+            cam0_to_lidar[:3, 3:4] = -R_0.T @ t_0
+            normalized.append(multi_batch[b] @ cam0_to_lidar)  # (N, 4, 4)
+        
+        return torch.stack(normalized, dim=0)  # (B, N, 4, 4)
+    
     def _extract_intrinsics_from_meta(self, meta: Dict, device: torch.device) -> torch.Tensor:
         """Extract camera intrinsics from metadata.
         
@@ -227,36 +269,6 @@ class ReconstructionBackbone(nn.Module):
         multi_batch_intrinsics = torch.stack(intrinsics_list, dim=0).to(device=device, dtype=torch.float32)
         return multi_batch_intrinsics
     
-    def _cam2lidar_to_world2cam(self, cam2lidar: torch.Tensor) -> torch.Tensor:
-        """Convert cam2lidar transformation to world2cam (extrinsics for DA3).
-        
-        Args:
-            cam2lidar: Camera to LiDAR transformation (B, N, 4, 4)
-        
-        Returns:
-            world2cam: World to camera transformation (B, N, 4, 4)
-            Note: In DA3, "world" is typically the LiDAR frame, so this is lidar2cam
-        """
-        # cam2lidar: transforms points from camera to LiDAR frame
-        # world2cam (lidar2cam): transforms points from LiDAR to camera frame
-        # world2cam = inv(cam2lidar)
-        device = cam2lidar.device
-        B, N = cam2lidar.shape[:2]
-        
-        # Invert each transformation matrix
-        world2cam_list = []
-        for b in range(B):
-            batch_w2c = []
-            for n in range(N):
-                cam2lidar_4x4 = cam2lidar[b, n]  # (4, 4)
-                # Invert: lidar2cam = inv(cam2lidar)
-                world2cam_4x4 = torch.inverse(cam2lidar_4x4)
-                batch_w2c.append(world2cam_4x4)
-            world2cam_list.append(torch.stack(batch_w2c, dim=0))
-        
-        world2cam = torch.stack(world2cam_list, dim=0)  # (B, N, 4, 4)
-        return world2cam
-
     def _extract_lidar2img_from_meta(self, meta: Dict, device: torch.device) -> torch.Tensor:
         """Extract lidar2img matrices from metadata (must exist)."""
         if meta is None:
@@ -603,14 +615,14 @@ class ReconstructionBackbone(nn.Module):
         # Run DA3 forward once for the whole batch
         # Extract intrinsics and extrinsics from img_metas if available
         multi_batch_intrinsics_gt = self._extract_intrinsics_from_meta(img_metas, device=device)
-        multi_batch_cam2lidar_rts = self._extract_cam2lidar_rts_from_meta(img_metas, device=device)
-        multi_batch_extrinsics_gt = self._cam2lidar_to_world2cam(multi_batch_cam2lidar_rts) if multi_batch_cam2lidar_rts is not None else None
+        # Use lidar2cam_rts directly from dataset (no conversion needed)
+        multi_batch_extrinsics_gt = self._extract_lidar2cam_rts_from_meta(img_metas, device=device)
         
         # Prepare extrinsics and intrinsics for DA3 input processor
         # Since image is a torch.Tensor, input processor expects torch.Tensors for extrinsics/intrinsics too
         # Comment out extrinsics - let DA3 predict them
-        # extrinsics_for_da3 = multi_batch_extrinsics_gt if multi_batch_extrinsics_gt is not None else None
-        extrinsics_for_da3 = None  # Let DA3 predict extrinsics
+        extrinsics_for_da3 = multi_batch_extrinsics_gt if multi_batch_extrinsics_gt is not None else None
+        # extrinsics_for_da3 = None  # Let DA3 predict extrinsics
         intrinsics_for_da3 = multi_batch_intrinsics_gt if multi_batch_intrinsics_gt is not None else None
         
         imgs_processed, extrinsics_processed, intrinsics_processed = self.input_processor(
@@ -656,6 +668,7 @@ class ReconstructionBackbone(nn.Module):
             # Create a copy of prediction for GLB export to avoid modifying the original
             from copy import deepcopy
             prediction_glb = deepcopy(prediction)
+            
             
             # Use original RGB images (not normalized) for GLB export
             # Resize original images to match processed resolution
@@ -713,6 +726,9 @@ class ReconstructionBackbone(nn.Module):
                 intrinsics_np = intrinsics_np[0]  # (N, 3, 3)
             prediction_glb.intrinsics = intrinsics_np
                 
+            # Use normalized extrinsics (relative to first camera) for GLB export
+            # This matches DA3's format: camera 0 is identity, others are relative to it
+            # Whether we use GT or predicted extrinsics, they're in the same normalized format
             if isinstance(prediction_glb.extrinsics, torch.Tensor):
                 extrinsics_np = prediction_glb.extrinsics.cpu().numpy()
             else:
@@ -929,8 +945,8 @@ class ReconstructionBackbone(nn.Module):
         # Run DA3 forward once for the whole batch (always frozen in test mode)
         # Extract intrinsics and extrinsics from img_metas if available
         multi_batch_intrinsics_gt = self._extract_intrinsics_from_meta(img_metas, device=device)
-        multi_batch_cam2lidar_rts = self._extract_cam2lidar_rts_from_meta(img_metas, device=device)
-        multi_batch_extrinsics_gt = self._cam2lidar_to_world2cam(multi_batch_cam2lidar_rts) if multi_batch_cam2lidar_rts is not None else None
+        # Use lidar2cam_rts directly from dataset (no conversion needed)
+        multi_batch_extrinsics_gt = self._extract_lidar2cam_rts_from_meta(img_metas, device=device)
         
         # Prepare extrinsics and intrinsics for DA3 input processor
         # Since image is a torch.Tensor, input processor expects torch.Tensors for extrinsics/intrinsics too
@@ -966,6 +982,7 @@ class ReconstructionBackbone(nn.Module):
             # Create a copy of prediction for GLB export to avoid modifying the original
             from copy import deepcopy
             prediction_glb = deepcopy(prediction)
+            
             
             # Use original RGB images (not normalized) for GLB export
             # Resize original images to match processed resolution
@@ -1023,6 +1040,9 @@ class ReconstructionBackbone(nn.Module):
                 intrinsics_np = intrinsics_np[0]  # (N, 3, 3)
             prediction_glb.intrinsics = intrinsics_np
                 
+            # Use normalized extrinsics (relative to first camera) for GLB export
+            # This matches DA3's format: camera 0 is identity, others are relative to it
+            # Whether we use GT or predicted extrinsics, they're in the same normalized format
             if isinstance(prediction_glb.extrinsics, torch.Tensor):
                 extrinsics_np = prediction_glb.extrinsics.cpu().numpy()
             else:
