@@ -1522,7 +1522,7 @@ class ReconstructionBackbone(nn.Module):
                 if len(pseudo_points_list) > b_idx:
                     pseudo_points_np = pseudo_points_list[b_idx].cpu().numpy()
                     pseudo_colors = pseudo_points_np[:, 3:] if pseudo_points_np.shape[1] > 3 else None
-                    display_point_cloud(pseudo_points_np, colors=pseudo_colors, gt_bboxes_3d=gt_bboxes_3d_batch, window_name=f"Pseudo Point Cloud ({len(pseudo_points_np):,} points)")
+                    display_point_cloud(pseudo_points_np, colors=pseudo_colors, gt_bboxes_3d=None, window_name=f"Pseudo Point Cloud ({len(pseudo_points_np):,} points)")
                 
                 # Display GLB point cloud if available (3rd visualization)
                 if glb_points_np is not None:

@@ -163,7 +163,7 @@ rescon_pipeline = [
     # Density-aware ball query (optional)
     dict(
                 type='BallQueryDownsample',
-        enabled=False,
+        enabled=True,
         min_radius=0.0,
         max_radius=0.5,
         sample_num=16,
@@ -172,7 +172,7 @@ rescon_pipeline = [
     # Uniform cap with FPS (optional)
     dict(
                 type='FPSDownsample',
-        enabled=False,
+        enabled=True,
                 num_points=40000,  # 40k points for convergence to real LiDAR point clouds
     ),
             
@@ -232,8 +232,8 @@ model = dict(
         cache_dir="ckpts",
         rescon_pipeline=rescon_pipeline,
         glb_config=dict(
-            sky_depth_def=98.0,
-            conf_thresh_percentile=38.0,
+            sky_depth_def=95.0,
+            conf_thresh_percentile=30.0,
             filter_black_bg=False,
             filter_white_bg=False,
             max_depth=100.0,
@@ -241,11 +241,11 @@ model = dict(
         ref_view_strategy="saddle_balanced",
         use_ray_pose=True,
         max_points=1_000_000,
-        filter_sky=True,
+        filter_sky=False,
         max_depth=100.0,
-        conf_thresh_percentile=20.0,  # Lower = more points kept (was 30.0)
-        ensure_thresh_percentile=90.0,  # Upper bound for threshold
-        base_conf_thresh=0.9,  # Lower = more points kept (was 1.05)
+        conf_thresh_percentile=15.0,  # Lower = more points kept (was 30.0)
+        ensure_thresh_percentile=95.0,  # Upper bound for threshold
+        base_conf_thresh=1.05,  # Lower = more points kept (was 1.05)
         freeze_da3=True,  # Freeze DepthAnything3 model (recommended)
         export_glb=True,  # Enable GLB export for debugging (set to True to test)
         glb_export_dir="output",  # Directory for GLB export

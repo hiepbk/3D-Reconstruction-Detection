@@ -144,6 +144,7 @@ def export_to_glb(
         images_u8,
         prediction.conf,
         conf_thr,
+        prediction,  # Pass prediction to access ray map
     )
     
     # the point cloud in here look very clean, not too much noise
@@ -229,6 +230,7 @@ def _depths_to_world_points_with_colors(
     images_u8: np.ndarray,
     conf: np.ndarray | None,
     conf_thr: float,
+    prediction: Prediction | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     For each frame, transform (u,v,1) through K^{-1} to get rays,
@@ -257,7 +259,7 @@ def _depths_to_world_points_with_colors(
         K_inv = np.linalg.inv(K[i])  # (3,3)
         c2w = np.linalg.inv(_as_homogeneous44(ext_w2c[i]))  # (4,4)
 
-        rays = K_inv @ pix[vidx].T  # (3,M)
+        rays = K_inv @ pix[vidx].T  # (3,M) - rays in camera space
         Xc = rays * d_flat[vidx][None, :]  # (3,M)
         Xc_h = np.vstack([Xc, np.ones((1, Xc.shape[1]))])
         Xw = (c2w @ Xc_h)[:3].T.astype(np.float32)  # (M,3)
@@ -266,6 +268,49 @@ def _depths_to_world_points_with_colors(
 
         pts_all.append(Xw)
         col_all.append(cols)
+        
+        
+        # import open3d as o3d
+        # pcd = o3d.geometry.PointCloud()
+        # pcd.points = o3d.utility.Vector3dVector(Xw)
+        # pcd.colors = o3d.utility.Vector3dVector(cols / 255.0)
+        
+        # # Draw axes
+        # axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
+        
+        # # Draw camera frustum
+        # frustum = _create_camera_frustum_o3d(
+        #     K[i], ext_w2c[i], H, W, scale=1.0
+        # )
+        
+        # # Draw ray vectors from camera center to sample points to illustrate ray concept
+        # # Sample a few points to visualize rays
+        # num_sample_rays = min(10, Xw.shape[0])  # Sample up to 10 points
+        # if num_sample_rays > 0:
+        #     sample_indices = np.linspace(0, Xw.shape[0] - 1, num_sample_rays, dtype=int)
+        #     sample_points = Xw[sample_indices]
+        #     sample_rays_cam = rays[:, sample_indices]  # (3, num_sample)
+            
+        #     # Get camera center in world space
+        #     camera_center_world = (c2w @ np.array([0, 0, 0, 1.0]))[:3]
+            
+        #     # Transform rays to world space (normalize first, then transform direction)
+        #     ray_dirs_cam = sample_rays_cam / np.linalg.norm(sample_rays_cam, axis=0, keepdims=True)  # (3, num_sample)
+        #     ray_dirs_world = (c2w[:3, :3] @ ray_dirs_cam).T  # (num_sample, 3)
+            
+        #     # Create ray vectors visualization
+        #     ray_vectors = _create_ray_vectors_o3d(
+        #         camera_center_world,
+        #         sample_points,
+        #         ray_dirs_world
+        #     )
+            
+        #     geometries = [pcd, axis, frustum, ray_vectors]
+        # else:
+        #     geometries = [pcd, axis, frustum]
+        
+        # o3d.visualization.draw_geometries(geometries)
+        
 
     if len(pts_all) == 0:
         return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
@@ -451,3 +496,116 @@ def _hsv_to_rgb(h: float, s: float, v: float) -> tuple[float, float, float]:
     else:
         r, g, b = v, p, q
     return r, g, b
+
+
+def _create_camera_frustum_o3d(
+    K: np.ndarray, ext_w2c: np.ndarray, H: int, W: int, scale: float = 1.0
+):
+    """
+    Create an Open3D LineSet representing a camera frustum.
+    
+    Args:
+        K: Camera intrinsics (3, 3)
+        ext_w2c: Camera extrinsics (4, 4) or (3, 4) - world to camera transform
+        H: Image height
+        W: Image width
+        scale: Scale factor for frustum depth
+        
+    Returns:
+        Open3D LineSet geometry
+    """
+    import open3d as o3d
+    
+    # Convert extrinsics to homogeneous 4x4
+    ext_w2c_44 = _as_homogeneous44(ext_w2c)
+    c2w = np.linalg.inv(ext_w2c_44)
+    
+    # Image plane corners in pixel coordinates
+    corners_pix = np.array([
+        [0, 0],
+        [W - 1, 0],
+        [W - 1, H - 1],
+        [0, H - 1],
+    ], dtype=float)  # (4, 2)
+    
+    # Convert to homogeneous pixel coordinates
+    corners_pix_h = np.hstack([corners_pix, np.ones((4, 1))])  # (4, 3)
+    
+    # Transform to camera space using inverse intrinsics
+    K_inv = np.linalg.inv(K)
+    corners_cam = (K_inv @ corners_pix_h.T).T  # (4, 3)
+    
+    # Normalize to z=scale plane (frustum depth)
+    z_vals = corners_cam[:, 2:3]
+    z_vals[z_vals == 0] = 1.0
+    corners_cam = (corners_cam / z_vals) * scale  # (4, 3)
+    
+    # Transform to world coordinates
+    corners_world = []
+    camera_center_world = (c2w @ np.array([0, 0, 0, 1.0]))[:3]
+    
+    for corner_cam in corners_cam:
+        corner_h = np.array([corner_cam[0], corner_cam[1], corner_cam[2], 1.0])
+        corner_w = (c2w @ corner_h)[:3]
+        corners_world.append(corner_w)
+    corners_world = np.array(corners_world)  # (4, 3)
+    
+    # Create line set: 4 lines from center to corners + 4 lines for image plane edges
+    points = np.vstack([camera_center_world.reshape(1, 3), corners_world])  # (5, 3)
+    
+    # Lines: center to each corner (indices 0->1, 0->2, 0->3, 0->4)
+    # Then edges of image plane rectangle (1->2, 2->3, 3->4, 4->1)
+    lines = [
+        [0, 1], [0, 2], [0, 3], [0, 4],  # Center to corners
+        [1, 2], [2, 3], [3, 4], [4, 1],  # Image plane edges
+    ]
+    
+    line_set = o3d.geometry.LineSet()
+    line_set.points = o3d.utility.Vector3dVector(points)
+    line_set.lines = o3d.utility.Vector2iVector(lines)
+    
+    # Color the frustum (black)
+    colors = np.tile([0.0, 0.0, 0.0], (len(lines), 1))  # Black
+    line_set.colors = o3d.utility.Vector3dVector(colors)
+    
+    return line_set
+
+
+def _create_ray_vectors_o3d(
+    camera_center: np.ndarray,
+    target_points: np.ndarray,
+    ray_directions: np.ndarray | None = None,
+):
+    """
+    Create Open3D LineSet showing rays from camera center to target points.
+    This visualizes the concept that rays point from camera to 3D points.
+    
+    Args:
+        camera_center: Camera center in world coordinates (3,)
+        target_points: Target 3D points in world coordinates (N, 3)
+        ray_directions: Optional ray directions in world space (N, 3). If None, computed from camera_center to points.
+        
+    Returns:
+        Open3D LineSet showing rays
+    """
+    import open3d as o3d
+    
+    num_points = target_points.shape[0]
+    if num_points == 0:
+        return None
+    
+    # Create points array: camera center + target points
+    all_points = np.vstack([camera_center.reshape(1, 3), target_points])  # (N+1, 3)
+    
+    # Create lines: from camera center (index 0) to each target point (indices 1 to N+1)
+    lines = [[0, i+1] for i in range(num_points)]
+    
+    line_set = o3d.geometry.LineSet()
+    line_set.points = o3d.utility.Vector3dVector(all_points)
+    line_set.lines = o3d.utility.Vector2iVector(lines)
+    
+    # Color the rays (cyan for visibility)
+    colors = np.tile([0.0, 1.0, 1.0], (len(lines), 1))  # Cyan
+    line_set.colors = o3d.utility.Vector3dVector(colors)
+    
+    return line_set

@@ -142,13 +142,26 @@ class DepthAnything3Net(nn.Module):
                 output = self._process_ray_pose_estimation(output, H, W)
             else:
                 output = self._process_camera_estimation(feats, H, W, output)
+                # Preserve ray in aux if it exists but wasn't processed
+                if "ray" in output:
+                    if "aux" not in output:
+                        output.aux = {}
+                    output.aux["ray"] = output.ray.clone()
+                    del output.ray
+                if "ray_conf" in output:
+                    del output.ray_conf
             if infer_gs:
                 output = self._process_gs_head(feats, H, W, output, x, extrinsics, intrinsics)
         
         output = self._process_mono_sky_estimation(output)    
 
         # Extract auxiliary features if requested
-        output.aux = self._extract_auxiliary_features(aux_feats, export_feat_layers, H, W)
+        if not hasattr(output, "aux") or output.aux is None:
+            output.aux = {}
+        aux_feats_dict = self._extract_auxiliary_features(aux_feats, export_feat_layers, H, W)
+        # Merge with existing aux (e.g., ray)
+        for k, v in aux_feats_dict.items():
+            output.aux[k] = v
 
         return output
 
@@ -183,6 +196,11 @@ class DepthAnything3Net(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Process ray pose estimation if ray pose decoder is available."""
         if "ray" in output and "ray_conf" in output:
+            # Store ray in aux before deleting for visualization
+            if "aux" not in output:
+                output.aux = {}
+            output.aux["ray"] = output.ray.clone()
+            
             pred_extrinsic, pred_focal_lengths, pred_principal_points = get_extrinsic_from_camray(
                 output.ray,
                 output.ray_conf,
@@ -214,8 +232,11 @@ class DepthAnything3Net(nn.Module):
         """Process camera pose estimation if camera decoder is available."""
         if self.cam_dec is not None:
             pose_enc = self.cam_dec(feats[-1][1])
-            # Remove ray information as it's not needed for pose estimation
+            # Store ray in aux before deleting for visualization
             if "ray" in output:
+                if "aux" not in output:
+                    output.aux = {}
+                output.aux["ray"] = output.ray.clone()
                 del output.ray
             if "ray_conf" in output:
                 del output.ray_conf
