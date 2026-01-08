@@ -43,12 +43,17 @@ ckpts/
 *.safetensors
 *.bin
 
-# Videos
+# Videos (but allow assets folder for README)
 *.mp4
 *.avi
 *.mov
 *.mkv
 *.webm
+!assets/*.mp4
+!assets/*.avi
+!assets/*.mov
+!assets/*.mkv
+!assets/*.webm
 
 # Results and outputs
 result/
