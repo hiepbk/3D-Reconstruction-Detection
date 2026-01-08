@@ -130,12 +130,27 @@ class ResDet3D(MVXTwoStageDetector):
         )
     
         # Extract dense features for detection pipeline
-        # Training mode: use GT dense features (for oracle baseline)
-        # Test mode: use pseudo dense features (camera-only inference)
+        # Phase 1 (train teacher): use GT dense features (teacher learns from GT)
+        # Phase 2 (train student): use pseudo dense features (student learns from pseudo)
+        # Evaluation: route based on training phase (Phase 1 = evaluate teacher, Phase 2 = evaluate student)
+        training_phase = getattr(self.reconstruction_backbone, 'training_phase', 2)
+        
         if return_loss:
-            x = pts_con_feat_dict['rescon_features']['gt']['dense_features']
+            # Training mode: Phase 1 uses GT, Phase 2 uses pseudo
+            if training_phase == 1:
+                # Phase 1: Train teacher with GT features
+                x = pts_con_feat_dict['rescon_features']['gt']['dense_features']
+            else:
+                # Phase 2: Train student with pseudo features
+                x = pts_con_feat_dict['rescon_features']['pseudo']['dense_features']
         else:
-            x = pts_con_feat_dict['rescon_features']['pseudo']['dense_features']
+            # Evaluation/Test mode: route based on training phase
+            if training_phase == 1:
+                # Phase 1: Evaluate teacher performance (use GT features)
+                x = pts_con_feat_dict['rescon_features']['gt']['dense_features']
+            else:
+                # Phase 2: Evaluate student performance (use pseudo features)
+                x = pts_con_feat_dict['rescon_features']['pseudo']['dense_features']
             
         # Follow CenterPoint: dense_features → SECOND backbone → SECONDFPN neck
         if self.with_pts_backbone:

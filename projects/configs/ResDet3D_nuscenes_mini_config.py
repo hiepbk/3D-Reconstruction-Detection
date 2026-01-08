@@ -254,6 +254,12 @@ model = dict(
             use_color=True,  # Set to False to disable color processing (only use XYZ)
             debug_viz=True,
             debug_viz_dir='work_dirs/resdet3d_nuscenes_mini/debug_viz',
+            # Teacher checkpoint: None = train from scratch, or path to pretrained weights
+            teacher_checkpoint=None,  # Set to checkpoint path if you want to load pretrained teacher
+            # Training phase: 1 = Train teacher encoder (from scratch), 2 = Train student encoder (freeze teacher)
+            # Phase 1: Train teacher with GT points → evaluation uses GT features (teacher performance)
+            # Phase 2: Train student with pseudo points → evaluation uses pseudo features (student performance)
+            training_phase=1,  # Start with Phase 1 to train teacher, then switch to Phase 2
             # Voxelization layer: converts point clouds to voxels
             pts_voxel_layer=dict(
                 max_num_points=10,  # Maximum points per voxel
@@ -451,10 +457,10 @@ total_epochs = 8
 checkpoint_config = dict(interval=1)
 
 log_config = dict(
-    interval=100,
+    interval=10,  # Log every 10 iterations (for more frequent progress updates)
     hooks=[
-        dict(type='TextLoggerHook'),  # console logging of iter/loss
-        dict(type='TensorboardLoggerHook'),
+        dict(type='TextLoggerHook', by_epoch=False),  # console logging of iter/loss (by_epoch=False means log by iteration, not by epoch)
+        dict(type='TensorboardLoggerHook', by_epoch=False),
         # dict(type='WandbLoggerHook',
         #      init_kwargs=dict(
         #          project='ResDet3D',

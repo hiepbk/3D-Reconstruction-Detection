@@ -282,6 +282,8 @@ class SparseRefinement(nn.Module):
         use_color: bool = False,
         debug_viz: bool = False,
         debug_viz_dir: str = "debug_viz",
+        teacher_checkpoint: Optional[str] = None,  # Path to pretrained teacher checkpoint
+        training_phase: int = 2,  # 1 = Train teacher, 2 = Train student (default)
     ):
         """
         Feature-space domain adaptation for sparse voxel features.
@@ -310,6 +312,7 @@ class SparseRefinement(nn.Module):
         self.loss_bev_weight = loss_bev_weight
         self.debug_viz = debug_viz
         self.debug_viz_dir = debug_viz_dir
+        self.training_phase = training_phase  # 1 = Train teacher, 2 = Train student
 
         
         # Build voxelization layer
@@ -327,6 +330,24 @@ class SparseRefinement(nn.Module):
         self.middle_encoder_gt = builder.build_middle_encoder(pts_middle_encoder)
         # Pseudo branch (student)
         self.middle_encoder_pseudo = builder.build_middle_encoder(pts_middle_encoder)
+        
+        # Load pretrained teacher weights if provided
+        if teacher_checkpoint is not None:
+            self._load_teacher_checkpoint(teacher_checkpoint)
+        
+        # Set training phase behavior
+        if self.training_phase == 1:
+            # Phase 1: Train teacher encoder (unfreeze, allow gradients)
+            for param in self.middle_encoder_gt.parameters():
+                param.requires_grad = True
+            print("Phase 1: Teacher encoder is trainable (requires_grad=True)")
+        elif self.training_phase == 2:
+            # Phase 2: Freeze teacher encoder (no gradients)
+            for param in self.middle_encoder_gt.parameters():
+                param.requires_grad = False
+            print("Phase 2: Teacher encoder is frozen (requires_grad=False)")
+        else:
+            raise ValueError(f"Invalid training_phase: {self.training_phase}. Must be 1 or 2.")
         
         # Build losses (direct feature alignment, no transformer)
         self.loss_occupancy = build_loss(loss_occupancy)
@@ -346,8 +367,78 @@ class SparseRefinement(nn.Module):
         # Visualization caching flag
         self.enable_visual_debug = False
         self.debug_counter = 0
+    
+    def _load_teacher_checkpoint(self, checkpoint_path: str):
+        """
+        Load pretrained weights for teacher encoder (middle_encoder_gt).
         
+        Supports two checkpoint formats:
+        1. Extracted teacher checkpoint (from load_pretrained_teacher.py):
+           - Keys: middle_encoder_gt.*
+        2. Full CenterPoint checkpoint:
+           - Keys: pts_middle_encoder.* (will be mapped to middle_encoder_gt.*)
         
+        Args:
+            checkpoint_path: Path to checkpoint file
+        """
+        import os
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Teacher checkpoint not found: {checkpoint_path}")
+        
+        print(f"Loading teacher encoder weights from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Get state dict
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+        
+        # Map checkpoint keys to model keys
+        teacher_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('middle_encoder_gt.'):
+                # Already in correct format
+                teacher_state_dict[key] = value
+            elif key.startswith('pts_middle_encoder.'):
+                # Map from CenterPoint format
+                new_key = key.replace('pts_middle_encoder.', 'middle_encoder_gt.')
+                teacher_state_dict[new_key] = value
+            # Ignore other keys
+        
+        if len(teacher_state_dict) == 0:
+            print(f"⚠️  Warning: No teacher encoder weights found in checkpoint!")
+            print(f"Available keys (first 10):")
+            for i, key in enumerate(list(state_dict.keys())[:10]):
+                print(f"  - {key}")
+            return
+        
+        # Load weights into teacher encoder
+        missing_keys, unexpected_keys = self.middle_encoder_gt.load_state_dict(
+            teacher_state_dict, strict=False
+        )
+        
+        if missing_keys:
+            print(f"⚠️  Warning: Missing keys in teacher encoder:")
+            for key in missing_keys[:5]:  # Show first 5
+                print(f"  - {key}")
+            if len(missing_keys) > 5:
+                print(f"  ... and {len(missing_keys) - 5} more")
+        
+        if unexpected_keys:
+            print(f"⚠️  Warning: Unexpected keys (ignored):")
+            for key in unexpected_keys[:5]:  # Show first 5
+                print(f"  - {key}")
+            if len(unexpected_keys) > 5:
+                print(f"  ... and {len(unexpected_keys) - 5} more")
+        
+        loaded_count = len(teacher_state_dict) - len(missing_keys)
+        print(f"✓ Loaded {loaded_count}/{len(teacher_state_dict)} teacher encoder weights")
+        
+        # Freeze teacher encoder after loading pretrained weights
+        for param in self.middle_encoder_gt.parameters():
+            param.requires_grad = False
+        print("✓ Teacher encoder frozen (requires_grad=False)")
         
     # ===== OLD OCCUPANCY METHODS (COMMENTED OUT) =====
     # def _build_occupancy_voxelization(self, occupancy_voxel_layer: Dict) -> Voxelization:
@@ -415,48 +506,58 @@ class SparseRefinement(nn.Module):
         
         batch_size = gt_points.shape[0]
         
-        # GT branch: voxelize and encode through GT SparseEncoder (separate from pseudo)
-        # CRITICAL: Freeze GT encoder to prevent trivial solution
-        # Use torch.no_grad() to stop gradients, but keep features for loss computation
-        with torch.no_grad():
+        # Phase 1: Train teacher encoder (use gradients)
+        # Phase 2: Freeze teacher encoder (no gradients, use as target)
+        if self.training_phase == 1:
+            # Phase 1: Train teacher encoder - allow gradients
             gt_voxel_features, gt_num_points, gt_coors = self._voxel_encoder(gt_points)
             gt_dense_features, gt_sparse_features, gt_sparse_indices, gt_sparse_spatial_shape = self.middle_encoder_gt(
                 gt_voxel_features, gt_coors, batch_size
             )
-        
-        # Detach GT features to prevent gradient flow into GT branch
-        # But keep them as targets for pseudo branch to learn from
-        gt_sparse_features = gt_sparse_features.detach()
-        gt_sparse_indices = gt_sparse_indices.detach()
-        
-        # Compute losses directly from sparse features
-        losses = {}
-        
-        # Loss 1: Voxel Occupancy Alignment (MOST IMPORTANT)
-        loss_occupancy = self.loss_occupancy(
-            pseudo_indices=pseudo_sparse_indices,
-            gt_indices=gt_sparse_indices,
-            spatial_shape=pseudo_sparse_spatial_shape,
-        )
-        losses['loss_occupancy'] = loss_occupancy * self.loss_occupancy_weight
-        
-        # Loss 2: Sparse Feature Alignment (only at overlapping voxels)
-        loss_feature = self.loss_feature(
-            pseudo_features=pseudo_sparse_features,
-            pseudo_indices=pseudo_sparse_indices,
-            gt_features=gt_sparse_features,
-            gt_indices=gt_sparse_indices,
-        )
-        losses['loss_feature'] = loss_feature * self.loss_feature_weight
-        
-        # Loss 3: Dense BEV Feature Alignment (auxiliary loss)
-        # Aligns dense BEV features [B, C*D, H, W] using cosine similarity with foreground masking
-        if self.loss_bev is not None:
-            loss_bev = self.loss_bev(
-                pseudo_bev=pseudo_dense_features,  # [B, C*D, H, W]
-                gt_bev=gt_dense_features,          # [B, C*D, H, W]
+            # In Phase 1, we don't compute alignment losses (teacher is learning)
+            # Detection loss will be computed in ResDet3D using GT branch features
+            losses = {}
+        else:
+            # Phase 2: Freeze teacher encoder - no gradients, use as target
+            with torch.no_grad():
+                gt_voxel_features, gt_num_points, gt_coors = self._voxel_encoder(gt_points)
+                gt_dense_features, gt_sparse_features, gt_sparse_indices, gt_sparse_spatial_shape = self.middle_encoder_gt(
+                    gt_voxel_features, gt_coors, batch_size
+                )
+            
+            # Detach GT features to prevent gradient flow into GT branch
+            # But keep them as targets for pseudo branch to learn from
+            gt_sparse_features = gt_sparse_features.detach()
+            gt_sparse_indices = gt_sparse_indices.detach()
+            
+            # Phase 2: Compute alignment losses
+            losses = {}
+            
+            # Loss 1: Voxel Occupancy Alignment (MOST IMPORTANT)
+            loss_occupancy = self.loss_occupancy(
+                pseudo_indices=pseudo_sparse_indices,
+                gt_indices=gt_sparse_indices,
+                spatial_shape=pseudo_sparse_spatial_shape,
             )
-            losses['loss_bev'] = loss_bev * self.loss_bev_weight
+            losses['loss_occupancy'] = loss_occupancy * self.loss_occupancy_weight
+            
+            # Loss 2: Sparse Feature Alignment (only at overlapping voxels)
+            loss_feature = self.loss_feature(
+                pseudo_features=pseudo_sparse_features,
+                pseudo_indices=pseudo_sparse_indices,
+                gt_features=gt_sparse_features,
+                gt_indices=gt_sparse_indices,
+            )
+            losses['loss_feature'] = loss_feature * self.loss_feature_weight
+            
+            # Loss 3: Dense BEV Feature Alignment (auxiliary loss)
+            # Aligns dense BEV features [B, C*D, H, W] using cosine similarity with foreground masking
+            if self.loss_bev is not None:
+                loss_bev = self.loss_bev(
+                    pseudo_bev=pseudo_dense_features,  # [B, C*D, H, W]
+                    gt_bev=gt_dense_features,          # [B, C*D, H, W]
+                )
+                losses['loss_bev'] = loss_bev * self.loss_bev_weight
         
         # Apply global weight multiplier
         for k in losses:
