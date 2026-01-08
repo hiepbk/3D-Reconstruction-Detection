@@ -36,6 +36,14 @@ Multi-view Images
   - Ball query downsampling (density-aware)
   - FPS downsampling (uniform sampling to 40K points)
 
+**Visualization Videos**:
+- **Dense Scene Reconstruction**: [`assets/dense_scene.mp4`](assets/dense_scene.mp4) - Full 3D scene reconstruction from multi-view images
+- **Pseudo Point Cloud Downsampling**: [`assets/downsampling_pseudo_point.mp4`](assets/downsampling_pseudo_point.mp4) - Post-processing pipeline demonstration
+- **Front View Ray Visualization**: [`assets/front_view_ray_vis.mp4`](assets/front_view_ray_vis.mp4) - Camera ray visualization for pose estimation
+- **GLB Export Visualization**: [`assets/glb_vis.mp4`](assets/glb_vis.mp4) - 3D point cloud exported to GLB format
+- **LiDAR Input Reference**: [`assets/Lidar_input.mp4`](assets/Lidar_input.mp4) - Ground truth LiDAR point cloud for comparison
+- **Whole Frame with Bounding Boxes**: [`assets/whole_frame_with_bbox.mp4`](assets/whole_frame_with_bbox.mp4) - Detection results with 3D bounding boxes
+
 ### Stage 2: Domain Adaptation (SparseRefinement)
 
 **Architecture Evolution**:
@@ -79,7 +87,12 @@ Approach 1: Voxel Occupancy Alignment
 │                    ▼ Dice Loss ▼                            │
 │              Occupancy Mask Alignment                        │
 └─────────────────────────────────────────────────────────────┘
+```
 
+**Visualization**: The input of Voxel occupancy pattern alignment between pseudo and GT point clouds
+![Voxel Occupancy Alignment](assets/voxel-occupancy.png)
+
+```
 Approach 2: ShapeFormer-Inspired Autoregression
 ┌─────────────────────────────────────────────────────────────┐
 │ Pseudo Points ──► Voxelization ──► VQ Codebook              │
@@ -94,6 +107,24 @@ Approach 2: ShapeFormer-Inspired Autoregression
 │              Reconstructed GT-like Pattern                  │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**Target Pattern**: The target of this submodule should return the pattern similar to LiDAR voxel structure
+![LiDAR Voxel Pattern](assets/lidar-voxel-pattern.png)
+
+---
+
+### Motivation for Current Approach
+
+The previous approaches (Voxel Occupancy Alignment and ShapeFormer-inspired Autoregression) successfully demonstrated different strategies for domain adaptation. However, to quickly validate whether Depth Anything 3 can generate high-quality pseudo point clouds that serve as effective input for 3D detection models, we adopted a simpler teacher-student framework.
+
+**Core Insight**: If pseudo point clouds and real LiDAR point clouds can produce the same 2D BEV (Bird's Eye View) features for the 3D detection head, then DA3 has successfully completed its mission. The key is feature-level alignment rather than exact point-level matching.
+
+**Teacher-Student Strategy**:
+- **Teacher (LiDAR)**: LiDAR point cloud → 2D BEV feature map
+- **Student (Pseudo)**: Pseudo point cloud → 2D BEV feature map
+- **Objective**: Align student's BEV features with teacher's BEV features
+
+This approach focuses on the end goal (detection-ready features) rather than intermediate pattern reconstruction, making it simpler to train and validate.
 
 **Current Pipeline**:
 ```
