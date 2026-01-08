@@ -286,18 +286,33 @@ class ResDet3D(MVXTwoStageDetector):
         
         Note: **kwargs may contain gt_bboxes_3d, gt_labels_3d from validation pipeline,
         but we ignore them during inference.
+        
+        Args:
+            points: Single point cloud tensor (N, 3) or list of point clouds
+            img_metas: Single dict (from forward_test which passes img_metas[0])
+            img: Single image tensor or None
         """
         # Filter out GT data that shouldn't be passed to extract_feat
         # in the test mode, it will return the feature metrics of reconstruction backbone
+        # img_metas is a single dict from forward_test, but extract_feat expects list
+        img_metas_list = [img_metas] if isinstance(img_metas, dict) else img_metas
         img_feats, pts_feats, feat_metrics = self.extract_feat(
             points=points,
             img=img,
-            img_metas=img_metas,
+            img_metas=img_metas_list,
             return_loss=False
         )
         
-        bbox_results = self.simple_test_pts(pts_feats, img_feats, img_metas, rescale=rescale)
-        return bbox_results
+        # simple_test_pts expects img_metas to be a list[dict] for get_bboxes
+        bbox_results = self.simple_test_pts(pts_feats, img_feats, img_metas_list, rescale=rescale)
+        
+        # Wrap results in 'pts_bbox' key to match MVXTwoStageDetector format
+        # Expected format: [{'pts_bbox': {...}}, {'pts_bbox': {...}}, ...]
+        bbox_list = [dict() for _ in range(len(img_metas_list))]
+        for result_dict, pts_bbox in zip(bbox_list, bbox_results):
+            result_dict['pts_bbox'] = pts_bbox
+        
+        return bbox_list
 
 
         

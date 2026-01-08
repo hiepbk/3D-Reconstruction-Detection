@@ -13,7 +13,7 @@ class_names = [
 ]
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
-evaluation = dict(interval=2,  # Evaluate every 2 epochs (instead of every epoch)
+evaluation = dict(interval=1,  # Evaluate every 2 epochs (instead of every epoch)
                   show=False,
                   out_dir=f'work_dirs/ResDet3D_nuscenes_mini/vis_results',
                   vis_time=None,
@@ -477,9 +477,11 @@ momentum_config = dict(
     target_ratio=(0.8947368421052632, 1),
     cyclic_times=1,
     step_ratio_up=0.4)
-total_epochs = 1
 
-checkpoint_config = dict(interval=2)  # Save checkpoint every 2 epochs (instead of every epoch)
+
+total_epochs = 8
+
+checkpoint_config = dict(interval=1)  # Save checkpoint every 2 epochs (instead of every epoch)
 
 log_config = dict(
     interval=10,  # Log every 10 iterations (for more frequent progress updates)

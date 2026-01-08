@@ -1036,15 +1036,20 @@ class ReconstructionBackbone(nn.Module):
 
             
             # Prepare GT points in batch format (list of tensors)
+            # Each element should be (N, 3), not (B, N, 3)
             gt_points_list = None
             if points is not None:
                 if isinstance(points, list):
                     gt_points_list = [p.float().to(device) for p in points if p is not None]
                 elif isinstance(points, torch.Tensor):
                     if points.dim() == 3:  # (B, N, 3)
-                        gt_points_list = [points[i].float().to(device) for i in range(B)]
-                    else:  # (N, 3) - single point cloud, expand to batch
-                        gt_points_list = [points.unsqueeze(0).expand(B, -1, -1).float().to(device)]
+                        gt_points_list = [points[i].float().to(device) for i in range(points.shape[0])]
+                    elif points.dim() == 2:  # (N, 3) - single point cloud, expand to batch
+                        # Expand to (B, N, 3) then split into list of (N, 3) tensors (one per batch item)
+                        points_expanded = points.unsqueeze(0).expand(B, -1, -1).float().to(device)
+                        gt_points_list = [points_expanded[i] for i in range(B)]
+                    else:
+                        raise ValueError(f"Unexpected points tensor dimension: {points.dim()}, shape: {points.shape}")
 
             # Colorize GT points if available using lidar2img (only if refinement uses colors)
             if gt_points_list is not None:
@@ -1185,7 +1190,7 @@ class ReconstructionBackbone(nn.Module):
         
         Args:
             img: Multi-view images (B, N, 3, H, W) or DataContainer
-            img_metas: Image metadata list (one dict per batch item)
+            img_metas: Image metadata list (one dict per batch item) or single dict (will be wrapped)
         
         Returns:
             pts_feat: Dict of refined point cloud features and indices
@@ -1196,6 +1201,26 @@ class ReconstructionBackbone(nn.Module):
         # Handle DataContainer for img_metas
         if isinstance(img_metas, DC):
             img_metas = img_metas.data
+        
+        # Handle case where img_metas is a single dict (from simple_test) or other formats
+        if not isinstance(img_metas, list):
+            if isinstance(img_metas, dict):
+                img_metas = [img_metas]
+            else:
+                # Unexpected format
+                raise TypeError(f"img_metas must be a list of dicts or a single dict, got {type(img_metas)}: {img_metas}")
+        
+        # Ensure all elements are dicts (not strings or other types)
+        # This validation happens BEFORE we pass img_metas to extraction functions
+        if len(img_metas) == 0:
+            raise ValueError("img_metas is empty")
+        
+        for i, meta_item in enumerate(img_metas):
+            if not isinstance(meta_item, dict):
+                raise TypeError(
+                    f"img_metas[{i}] must be a dict, got {type(meta_item)}: {meta_item}. "
+                    f"Full img_metas type: {type(img_metas)}, length: {len(img_metas)}"
+                )
         
         # Extract images from mmdet3d data format
         multi_batch_ori_imgs = self._extract_images_from_data(img)
@@ -1356,15 +1381,20 @@ class ReconstructionBackbone(nn.Module):
                 pseudo_points_list.append(merged.float().to(device))
             
             # Prepare GT points in batch format (list of tensors)
+            # Each element should be (N, 3), not (B, N, 3)
             gt_points_list = None
             if points is not None:
                 if isinstance(points, list):
                     gt_points_list = [p.float().to(device) for p in points if p is not None]
                 elif isinstance(points, torch.Tensor):
                     if points.dim() == 3:  # (B, N, 3)
-                        gt_points_list = [points[i].float().to(device) for i in range(B)]
-                    else:  # (N, 3) - single point cloud, expand to batch
-                        gt_points_list = [points.unsqueeze(0).expand(B, -1, -1).float().to(device)]
+                        gt_points_list = [points[i].float().to(device) for i in range(points.shape[0])]
+                    elif points.dim() == 2:  # (N, 3) - single point cloud, expand to batch
+                        # Expand to (B, N, 3) then split into list of (N, 3) tensors (one per batch item)
+                        points_expanded = points.unsqueeze(0).expand(B, -1, -1).float().to(device)
+                        gt_points_list = [points_expanded[i] for i in range(B)]
+                    else:
+                        raise ValueError(f"Unexpected points tensor dimension: {points.dim()}, shape: {points.shape}")
 
             # Colorize GT points if available using lidar2img (only if refinement uses colors)
             if gt_points_list is not None:
