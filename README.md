@@ -37,12 +37,42 @@ Multi-view Images
   - FPS downsampling (uniform sampling to 40K points)
 
 **Visualization Videos**:
-- **Dense Scene Reconstruction**: [`assets/dense_scene.mp4`](assets/dense_scene.mp4) - Full 3D scene reconstruction from multi-view images
-- **Pseudo Point Cloud Downsampling**: [`assets/downsampling_pseudo_point.mp4`](assets/downsampling_pseudo_point.mp4) - Post-processing pipeline demonstration
-- **Front View Ray Visualization**: [`assets/front_view_ray_vis.mp4`](assets/front_view_ray_vis.mp4) - Camera ray visualization for pose estimation
-- **GLB Export Visualization**: [`assets/glb_vis.mp4`](assets/glb_vis.mp4) - 3D point cloud exported to GLB format
-- **LiDAR Input Reference**: [`assets/Lidar_input.mp4`](assets/Lidar_input.mp4) - Ground truth LiDAR point cloud for comparison
-- **Whole Frame with Bounding Boxes**: [`assets/whole_frame_with_bbox.mp4`](assets/whole_frame_with_bbox.mp4) - Detection results with 3D bounding boxes
+
+<video width="800" controls>
+  <source src="assets/dense_scene.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+**Dense Scene Reconstruction** - Full 3D scene reconstruction from multi-view images
+
+<video width="800" controls>
+  <source src="assets/downsampling_pseudo_point.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+**Pseudo Point Cloud Downsampling** - Post-processing pipeline demonstration
+
+<video width="800" controls>
+  <source src="assets/front_view_ray_vis.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+**Front View Ray Visualization** - Camera ray visualization for pose estimation
+
+<video width="800" controls>
+  <source src="assets/glb_vis.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+**GLB Export Visualization** - 3D point cloud exported to GLB format
+
+<video width="800" controls>
+  <source src="assets/Lidar_input.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+**LiDAR Input Reference** - Ground truth LiDAR point cloud for comparison
+
+<video width="800" controls>
+  <source src="assets/whole_frame_with_bbox.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+**Whole Frame with Bounding Boxes** - Detection results with 3D bounding boxes
 
 ### Stage 2: Domain Adaptation (SparseRefinement)
 
