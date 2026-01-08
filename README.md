@@ -1,4 +1,161 @@
-# 📦 3D Reconstruction Detection - Installation Guide
+# 📦 3D Reconstruction Detection - ResDet3D
+
+**ResDet3D** is a 3D object detection system that uses multi-view images to generate pseudo point clouds via Depth Anything 3 (DA3), then applies teacher-student feature alignment for domain adaptation.
+
+## 🏗️ System Architecture
+
+### Overview
+
+The system follows a **two-stage approach**:
+
+1. **3D Reconstruction Stage**: Generate pseudo point clouds from multi-view images using frozen Depth Anything 3
+2. **Domain Adaptation Stage**: Align pseudo point cloud features with LiDAR features using teacher-student learning
+
+### Stage 1: 3D Reconstruction (ReconstructionBackbone)
+
+**Input**: Multi-view images (6 cameras)
+
+**Process**:
+```
+Multi-view Images 
+  → Frozen Depth Anything 3 (DA3)
+    ├─ DinoV2 Backbone (Transformer) → Feature extraction
+    └─ DualDPT Head (Convolutional) → Depth + Ray maps
+  → Depth maps + Camera poses
+  → Back-projection to 3D point clouds
+  → Post-processing (Filter, BallQuery, FPS)
+  → Pseudo point clouds
+```
+
+**Key Components**:
+- **DA3 Model**: Frozen pre-trained model (`depth-anything/DA3NESTED-GIANT-LARGE`)
+  - Generates depth maps and camera poses (via ray-based pose estimation)
+  - Outputs: depth, depth_conf, ray maps (6 channels), extrinsics, intrinsics
+- **Post-processing Pipeline**:
+  - Range filtering
+  - Ball query downsampling (density-aware)
+  - FPS downsampling (uniform sampling to 40K points)
+
+### Stage 2: Domain Adaptation (SparseRefinement)
+
+**Architecture Evolution**:
+
+The system has successfully implemented and tested several approaches for domain adaptation before settling on the current pipeline:
+
+1. **VoxelOccupancyEncoder Approaches** (✅ Successfully Implemented):
+   - **HardVoxelOccupancyVFE**: Binary occupancy encoding for voxel structure alignment
+   - **SoftVoxelOccupancyVFE**: Probabilistic occupancy encoding with learnable thresholds
+   - **Purpose**: Directly align voxel occupancy patterns between pseudo and GT point clouds
+   - **Key Insight**: Matching which voxels are occupied is crucial for sparsity pattern alignment
+   - **Implementation**: Dice loss for occupancy mask alignment, ensuring same sparsity structure
+
+2. **ShapeFormer-Inspired Autoregression Mode** (✅ Successfully Implemented):
+   - **SparsePatternAdaptationFormer**: Transformer-based autoregressive point cloud reconstruction
+   - **Architecture**:
+     - Vector Quantization (VQ): Quantize sparse features to codebook indices
+     - Coordinate Transformer: Autoregressively predict next voxel coordinate
+     - Value Transformer: Predict codebook index for that coordinate
+   - **Training**: Teacher forcing with sequence [S_P, END, S_C, END]
+   - **Inference**: Autoregressive generation from pseudo points (S_P) only
+   - **Key Features**:
+     - Block-causal attention with sliding window (efficient O(T) generation)
+     - KV cache for incremental generation
+     - Adaptive sequence length based on GT reference
+   - **Purpose**: Learn to reconstruct GT-like point cloud patterns from pseudo points using sequence modeling
+
+3. **Current Approach**: Simple 2D BEV feature alignment first, then 3D detection
+   - Focuses on feature-level alignment before complex pattern reconstruction
+   - Simpler and more stable training dynamics
+
+**Previous Approaches (Successfully Implemented)**:
+
+```
+Approach 1: Voxel Occupancy Alignment
+┌─────────────────────────────────────────────────────────────┐
+│ Pseudo Points ──► Voxelization ──► VoxelOccupancyEncoder    │
+│                                                              │
+│ GT Points ──► Voxelization ──► VoxelOccupancyEncoder         │
+│                                                              │
+│                    ▼ Dice Loss ▼                            │
+│              Occupancy Mask Alignment                        │
+└─────────────────────────────────────────────────────────────┘
+
+Approach 2: ShapeFormer-Inspired Autoregression
+┌─────────────────────────────────────────────────────────────┐
+│ Pseudo Points ──► Voxelization ──► VQ Codebook              │
+│                                                              │
+│                    ▼ Autoregressive Generation ▼            │
+│                                                              │
+│  Coordinate Transformer ──► Next Voxel Coord                │
+│         │                                                    │
+│         └─► Value Transformer ──► Feature Code               │
+│                                                              │
+│                    ▼ Sequence Loss ▼                        │
+│              Reconstructed GT-like Pattern                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Current Pipeline**:
+```
+Pseudo Points ──► Voxelization ──► SparseEncoderV2 ──► Sparse Features
+                                                          │
+                                                          ├─► Dense BEV Features
+                                                          │
+GT Points (LiDAR) ──► Voxelization ──► SparseEncoderV2 ──► Sparse Features
+                                                          │
+                                                          └─► Dense BEV Features
+                                                              │
+                                                              ▼
+                                                    Feature Alignment Loss
+                                                              │
+                                                              ▼
+                                    SECOND Backbone ──► CenterHead ──► 3D BBoxes
+```
+
+**Teacher-Student Framework**:
+- **Teacher Branch**: Uses LiDAR ground-truth points directly
+  - Voxelization → SparseEncoderV2 → Dense BEV features
+  - Provides supervision signal for feature alignment
+- **Student Branch**: Uses pseudo point clouds from DA3
+  - Same architecture as teacher (separate parameters)
+  - Learns to match teacher's features via alignment losses
+
+**Loss Functions** (Current Approach):
+1. **SparseFeatureAlignmentLoss** (Primary):
+   - Aligns sparse voxel features at overlapping voxels
+   - Cosine similarity loss with feature normalization
+   - Hard mining (top 50% hardest voxels)
+   
+2. **VoxelOccupancyAlignmentLoss** (Structure):
+   - Dice loss for occupancy mask alignment
+   - Ensures same sparsity pattern between pseudo and GT
+   - **Note**: This loss was originally developed for the VoxelOccupancyEncoder approach
+
+3. **DenseBEVFeatureLoss** (Auxiliary):
+   - Aligns dense BEV features [B, C*D, H, W]
+   - Foreground masking to avoid background dominance
+   - Weak auxiliary loss (weight: 0.1)
+
+**Previous Loss Functions** (From Earlier Approaches):
+- **Occupancy Dice Loss**: Used in VoxelOccupancyEncoder for binary/probabilistic occupancy matching
+- **Sequence Reconstruction Loss**: Used in SparsePatternAdaptationFormer for autoregressive coordinate-value prediction
+
+**Detection Pipeline**:
+- Pseudo branch features → **SECOND backbone** → **SECONDFPN neck** → **CenterHead**
+- 3D bbox supervision on pseudo branch
+- Shared detection head between teacher and student
+
+### Key Design Choices
+
+1. **DA3 is frozen**: No gradient updates to preserve pre-trained depth estimation quality
+2. **Separate backbones**: Teacher and student have independent SparseEncoderV2 parameters
+3. **Shared detection head**: Both branches use the same SECOND + CenterHead
+4. **Feature alignment first**: Test simple 2D BEV alignment before complex 3D adaptation
+5. **Multi-scale supervision**: Occupancy (structure) + Features (semantics) + BEV (dense)
+
+---
+
+# 📦 Installation Guide
 
 This guide will walk you through setting up the Depth Anything 3 environment step by step.
 
