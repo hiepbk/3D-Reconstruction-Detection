@@ -278,12 +278,16 @@ class ResDet3D(MVXTwoStageDetector):
         return bbox_results
 
     
-    def simple_test(self, points, img_metas, img=None, rescale=False):
+    def simple_test(self, points, img_metas, img=None, rescale=False, **kwargs):
         """Test function without augmentation.
         
         Override to handle case where we don't have detection head/neck yet.
         Just pass through the point cloud for now.
+        
+        Note: **kwargs may contain gt_bboxes_3d, gt_labels_3d from validation pipeline,
+        but we ignore them during inference.
         """
+        # Filter out GT data that shouldn't be passed to extract_feat
         # in the test mode, it will return the feature metrics of reconstruction backbone
         img_feats, pts_feats, feat_metrics = self.extract_feat(
             points=points,

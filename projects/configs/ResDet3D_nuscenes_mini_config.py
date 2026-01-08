@@ -13,7 +13,7 @@ class_names = [
 ]
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
-evaluation = dict(interval=1,
+evaluation = dict(interval=2,  # Evaluate every 2 epochs (instead of every epoch)
                   show=False,
                   out_dir=f'work_dirs/ResDet3D_nuscenes_mini/vis_results',
                   vis_time=None,
@@ -76,10 +76,9 @@ train_pipeline = [
     # dict(type='ScaleImageMultiViewImage', scales=img_scale),
     # dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     # dict(type='PadMultiViewImage', size_divisor=32),
-    dict(type='DefaultFormatBundle3D', class_names=class_names),
+    dict(type='DefaultFormatBundle3D', class_names=class_names, with_gt=True, with_label=True),
     dict(
         type='Collect3D',
-
         keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'],
         meta_keys=(
             'filename', 'ori_shape', 'img_shape',
@@ -87,11 +86,36 @@ train_pipeline = [
             'pad_shape', 'scale_factor',
             'flip', 'pcd_horizontal_flip', 'pcd_vertical_flip',
             'box_mode_3d', 'box_type_3d', 'img_norm_cfg',
-            # Note: gt_bboxes_3d and gt_labels_3d are in 'keys' (not meta_keys) 
-            # so they're properly formatted as DataContainers and accessible via data['gt_bboxes_3d']
         ),
     )
 ]
+
+# Validation pipeline: similar to train but without augmentation
+val_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=load_dim,
+        use_dim=use_dim,
+    ),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='ObjectNameFilter', classes=class_names),
+    dict(type='DefaultFormatBundle3D', class_names=class_names, with_gt=True, with_label=True),
+    dict(
+        type='Collect3D',
+        keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'],
+        meta_keys=(
+            'filename', 'ori_shape', 'img_shape',
+            'lidar2img', 'cam2lidar_rts', 'lidar2cam_rts', 'cam_intrinsic',
+            'pad_shape', 'scale_factor',
+            'flip', 'pcd_horizontal_flip', 'pcd_vertical_flip',
+            'box_mode_3d', 'box_type_3d', 'img_norm_cfg',
+        ),
+    )
+]
+
 test_pipeline = [
     dict(
         type='LoadPointsFromFile',
@@ -207,7 +231,7 @@ data = dict(
         data_root=data_root,
         ann_file=data_root + 'nuscenes_mini_infos_val.pkl',
         load_interval=1,
-        pipeline=test_pipeline,
+        pipeline=val_pipeline,
         classes=class_names,
         modality=input_modality,
         test_mode=False,
@@ -453,9 +477,9 @@ momentum_config = dict(
     target_ratio=(0.8947368421052632, 1),
     cyclic_times=1,
     step_ratio_up=0.4)
-total_epochs = 8
+total_epochs = 1
 
-checkpoint_config = dict(interval=1)
+checkpoint_config = dict(interval=2)  # Save checkpoint every 2 epochs (instead of every epoch)
 
 log_config = dict(
     interval=10,  # Log every 10 iterations (for more frequent progress updates)
