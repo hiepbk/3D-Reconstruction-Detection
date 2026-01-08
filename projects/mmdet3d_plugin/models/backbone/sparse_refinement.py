@@ -509,11 +509,13 @@ class SparseRefinement(nn.Module):
         # Phase 1: Train teacher encoder (use gradients)
         # Phase 2: Freeze teacher encoder (no gradients, use as target)
         if self.training_phase == 1:
-            # Phase 1: Train teacher encoder - allow gradients
-            gt_voxel_features, gt_num_points, gt_coors = self._voxel_encoder(gt_points)
-            gt_dense_features, gt_sparse_features, gt_sparse_indices, gt_sparse_spatial_shape = self.middle_encoder_gt(
-                gt_voxel_features, gt_coors, batch_size
-            )
+            # Phase 1: Reuse GT features already computed in forward() (no redundant processing)
+            # In forward(), we processed GT points and set pseudo_* = gt_* features
+            # These features already have gradients flowing through teacher encoder
+            gt_dense_features = pseudo_dense_features
+            gt_sparse_features = pseudo_sparse_features
+            gt_sparse_indices = pseudo_sparse_indices
+            gt_sparse_spatial_shape = pseudo_sparse_spatial_shape
             # In Phase 1, we don't compute alignment losses (teacher is learning)
             # Detection loss will be computed in ResDet3D using GT branch features
             losses = {}
@@ -693,11 +695,30 @@ class SparseRefinement(nn.Module):
                 gt_points = gt_points.unsqueeze(0)
             gt_points_xyz = gt_points if self.use_color else gt_points[:, :, :3]
 
-        # Pseudo branch: voxelize and encode through Pseudo SparseEncoder (separate from GT)
-        pseudo_voxel_features, pseudo_num_points, pseudo_coors = self._voxel_encoder(pseudo_points_xyz)
-        pseudo_dense_features, pseudo_sparse_features, pseudo_sparse_indices, pseudo_sparse_spatial_shape = self.middle_encoder_pseudo(
-            pseudo_voxel_features, pseudo_coors, batch_size
-        )
+        # Phase 1 optimization: Skip pseudo branch entirely (save memory/time)
+        if self.training_phase == 1:
+            # Phase 1: Only process GT points through teacher encoder
+            if gt_points_xyz is None:
+                raise ValueError("GT points are required for Phase 1 training")
+            
+            # Process GT points only
+            gt_voxel_features, gt_num_points, gt_coors = self._voxel_encoder(gt_points_xyz)
+            gt_dense_features, gt_sparse_features, gt_sparse_indices, gt_sparse_spatial_shape = self.middle_encoder_gt(
+                gt_voxel_features, gt_coors, batch_size
+            )
+            
+            # Create dummy pseudo features (same as GT) for return format consistency
+            pseudo_dense_features = gt_dense_features
+            pseudo_sparse_features = gt_sparse_features
+            pseudo_sparse_indices = gt_sparse_indices
+            pseudo_sparse_spatial_shape = gt_sparse_spatial_shape
+        else:
+            # Phase 2: Process both pseudo and GT branches
+            # Pseudo branch: voxelize and encode through Pseudo SparseEncoder (separate from GT)
+            pseudo_voxel_features, pseudo_num_points, pseudo_coors = self._voxel_encoder(pseudo_points_xyz)
+            pseudo_dense_features, pseudo_sparse_features, pseudo_sparse_indices, pseudo_sparse_spatial_shape = self.middle_encoder_pseudo(
+                pseudo_voxel_features, pseudo_coors, batch_size
+            )
 
         if return_loss:
             sparse_feat_dict, losses = self.forward_train(

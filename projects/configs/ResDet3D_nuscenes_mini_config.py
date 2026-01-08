@@ -87,7 +87,8 @@ train_pipeline = [
             'pad_shape', 'scale_factor',
             'flip', 'pcd_horizontal_flip', 'pcd_vertical_flip',
             'box_mode_3d', 'box_type_3d', 'img_norm_cfg',
-            'gt_bboxes_3d', 'gt_labels_3d',  # Add GT bboxes and labels to meta for visualization
+            # Note: gt_bboxes_3d and gt_labels_3d are in 'keys' (not meta_keys) 
+            # so they're properly formatted as DataContainers and accessible via data['gt_bboxes_3d']
         ),
     )
 ]
@@ -136,8 +137,8 @@ test_pipeline = [
                     'pad_shape', 'scale_factor',
                     'flip', 'pcd_horizontal_flip', 'pcd_vertical_flip',
                     'box_mode_3d', 'box_type_3d', 'img_norm_cfg',
-                    'gt_bboxes_3d', 'gt_labels_3d',  # Add GT bboxes and labels to meta for visualization
-                
+                    # Note: gt_bboxes_3d and gt_labels_3d are in 'keys' (not meta_keys)
+                    # so they're properly formatted as DataContainers and accessible via data['gt_bboxes_3d']
                 ),
             )
         ])
@@ -461,11 +462,11 @@ log_config = dict(
     hooks=[
         dict(type='TextLoggerHook', by_epoch=False),  # console logging of iter/loss (by_epoch=False means log by iteration, not by epoch)
         dict(type='TensorboardLoggerHook', by_epoch=False),
-        # dict(type='WandbLoggerHook',
-        #      init_kwargs=dict(
-        #          project='ResDet3D',
-        #          name=f'ResDet3D_nuscenes_mini',
-        #      ))
+        dict(type='WandbLoggerHook',
+             init_kwargs=dict(
+                 project='ResDet3D',
+                 name=f'teacher_ResDet3D_nuscenes_mini',
+             ))
     ])
 
 custom_hooks = []

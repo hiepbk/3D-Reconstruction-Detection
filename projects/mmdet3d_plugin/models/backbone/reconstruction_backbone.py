@@ -815,11 +815,50 @@ class ReconstructionBackbone(nn.Module):
         if isinstance(img_metas, DC):
             img_metas = img_metas.data
         
+        pts_feat = dict()
+        losses = None
+        
+        # Phase 1 optimization: Skip DA3 entirely, use GT points directly
+        training_phase = getattr(self.refinement, 'training_phase', 2) if self.refinement is not None else 2
+        if training_phase == 1:
+            # Phase 1: Direct GT points → teacher encoder (skip DA3, save memory/time)
+            if points is None:
+                raise ValueError("GT points are required for Phase 1 training")
+            
+            # Prepare GT points in batch format (list of tensors)
+            if isinstance(points, torch.Tensor):
+                if points.dim() == 2:
+                    # Single point cloud, wrap in list
+                    gt_points_list = [points]
+                else:
+                    # Batched: (B, N, 3) -> list of (N, 3)
+                    gt_points_list = [points[b] for b in range(points.shape[0])]
+            elif isinstance(points, list):
+                gt_points_list = points
+            else:
+                raise ValueError(f"Unexpected points type: {type(points)}")
+            
+            # Pad GT points for batch processing
+            padded_gt, _ = self._padding_samples(gt_points_list, None)
+            
+            # Process GT points through refinement (teacher encoder only in Phase 1)
+            # Pass dummy pseudo points (same as GT) - refinement will only use GT branch in Phase 1
+            sparse_feat_dict, refinement_losses = self.refinement(
+                pseudo_points=padded_gt,  # Dummy (not used in Phase 1)
+                gt_points=padded_gt,      # GT points for teacher encoder
+                return_loss=True,
+            )
+            
+            # Store sparse features dict for detection pipeline
+            pts_feat['rescon_features'] = sparse_feat_dict
+            losses = refinement_losses
+            
+            return pts_feat, losses
+        
+        # Phase 2: Normal flow with DA3 (generate pseudo points from images)
         # Extract images from mmdet3d data format
         multi_batch_ori_imgs = self._extract_images_from_data(img)
         B, N, C, H, W = multi_batch_ori_imgs.shape
-        pts_feat = dict()
-        losses = None
 
         # Run DA3 forward once for the whole batch
         # Extract intrinsics and extrinsics from img_metas if available
@@ -1023,7 +1062,9 @@ class ReconstructionBackbone(nn.Module):
             for b_idx in range(B):
                 # print(img_metas[b_idx]['filename'])
                 
-                # Extract GT bboxes from img_metas for visualization
+                # Extract GT bboxes from img_metas for visualization (if available)
+                # Note: gt_bboxes_3d should be in main data dict, not img_metas
+                # This code is for backward compatibility if it's still in img_metas
                 gt_bboxes_3d_batch = None
                 if 'gt_bboxes_3d' in img_metas[b_idx]:
                     gt_bboxes_3d_batch = img_metas[b_idx]['gt_bboxes_3d']
@@ -1342,7 +1383,9 @@ class ReconstructionBackbone(nn.Module):
             for b_idx in range(B):
                 # print(img_metas[b_idx]['filename'])
                 
-                # Extract GT bboxes from img_metas for visualization
+                # Extract GT bboxes from img_metas for visualization (if available)
+                # Note: gt_bboxes_3d should be in main data dict, not img_metas
+                # This code is for backward compatibility if it's still in img_metas
                 gt_bboxes_3d_batch = None
                 if 'gt_bboxes_3d' in img_metas[b_idx]:
                     gt_bboxes_3d_batch = img_metas[b_idx]['gt_bboxes_3d']

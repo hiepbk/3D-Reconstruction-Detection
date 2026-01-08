@@ -49,6 +49,7 @@ ckpts/
 *.mov
 *.mkv
 *.webm
+*.log
 !assets/*.mp4
 !assets/*.avi
 !assets/*.mov
@@ -61,6 +62,7 @@ results/
 outputs/
 work_dirs/
 runs/
+wandb/
 
 # Data directories
 data/
