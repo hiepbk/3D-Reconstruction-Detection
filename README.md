@@ -396,6 +396,10 @@ find mmdetection3d/mmdet3d/ops -name "*.so" -type f -delete
 ```bash
 python -m tools.create_data nuscenes --version v1.0-mini --root-path ./data/nuscenes_mini --out-dir ./data/nuscenes_mini --extra-tag nuscenes_mini
 
+
+python -m tools.create_data nuscenes --root-path ./data/nuscenes --out-dir ./data/nuscenes --extra-tag nuscenes
+
+
 ```
 
 
