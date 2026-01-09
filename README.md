@@ -489,6 +489,12 @@ bash tools/dist_train_mmdet3d.sh \
     4 \
     --work-dir work_dirs/teacher_resdet3d_nuscenes_mini
 
+
+bash tools/dist_train_mmdet3d.sh \
+    projects/configs/ResDet3D_nuscenes_config.py \
+    4 \
+    --work-dir work_dirs/teacher_resdet3d_nuscenes
+
 # Multi-GPU training with additional arguments
 bash tools/dist_train_mmdet3d.sh \
     projects/configs/ResDet3D_nuscenes_mini_config.py \

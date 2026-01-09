@@ -83,21 +83,26 @@ class ReconstructionBackbone(nn.Module):
         """
         super(ReconstructionBackbone, self).__init__()
         
-        # Measure baseline memory before loading DA3
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            baseline_memory = torch.cuda.memory_allocated() / 1024**2
+        # Check training phase from refinement config (if available)
+        training_phase = refinement.get('training_phase', 2) if refinement is not None else 2
         
-        # Create wrapped DepthAnything3 model
-        self.da3_model = DepthAnything3.from_pretrained(pretrained, cache_dir=cache_dir)
-        self.da3_model.eval()
+        # Only initialize DA3 if not Phase 1 (to save memory)
+        if training_phase == 1:
+            self.da3_model = None
+            print(f"[ReconstructionBackbone] Phase 1: Skipping DA3 initialization to save memory")
+        else:
+            # Phase 2: Initialize DA3 normally
+            self.da3_model = DepthAnything3.from_pretrained(pretrained, cache_dir=cache_dir)
+            self.da3_model.eval()
+            self.da3_model = self.da3_model.float()  # Ensure float32 to avoid dtype mismatches
+            
+            self.freeze_da3 = freeze_da3
+            if self.freeze_da3:
+                for param in self.da3_model.parameters():
+                    param.requires_grad = False
+            print(f"[ReconstructionBackbone] Phase 2: DA3 model initialized and {'frozen' if self.freeze_da3 else 'trainable'}")
         
-        # Freeze DA3 model if requested (recommended for training)
         self.freeze_da3 = freeze_da3
-        if self.freeze_da3:
-            for param in self.da3_model.parameters():
-                param.requires_grad = False
         
         # Build pipelines from config (don't store config dicts to avoid pickle issues)
         if rescon_pipeline is not None:
@@ -880,7 +885,14 @@ class ReconstructionBackbone(nn.Module):
             process_res=504,
             process_res_method="upper_bound_resize",
         )
+        # Ensure images are in float32 (DA3's autocast will handle mixed precision internally)
         imgs_for_da3 = imgs_processed.to(device, non_blocking=True).float()
+        
+        # Convert extrinsics and intrinsics to float32 if they exist
+        if extrinsics_processed is not None:
+            extrinsics_processed = extrinsics_processed.to(device=device, dtype=torch.float32)
+        if intrinsics_processed is not None:
+            intrinsics_processed = intrinsics_processed.to(device=device, dtype=torch.float32)
         
         # Use inference_mode (more memory efficient than no_grad) if DA3 is frozen
         if self.freeze_da3:
@@ -1222,6 +1234,46 @@ class ReconstructionBackbone(nn.Module):
                     f"Full img_metas type: {type(img_metas)}, length: {len(img_metas)}"
                 )
         
+        device = next(self.parameters()).device
+        
+        # Phase 1 optimization: Skip DA3 entirely, use GT points directly (same as forward_train)
+        training_phase = getattr(self.refinement, 'training_phase', 2) if self.refinement is not None else 2
+        if training_phase == 1:
+            # Phase 1: Direct GT points → teacher encoder (skip DA3, save memory/time)
+            if points is None:
+                raise ValueError("GT points are required for Phase 1 evaluation")
+            
+            # Prepare GT points in batch format (list of tensors)
+            if isinstance(points, torch.Tensor):
+                if points.dim() == 2:
+                    # Single point cloud, wrap in list
+                    gt_points_list = [points]
+                else:
+                    # Batched: (B, N, 3) -> list of (N, 3)
+                    gt_points_list = [points[b] for b in range(points.shape[0])]
+            elif isinstance(points, list):
+                gt_points_list = points
+            else:
+                raise ValueError(f"Unexpected points type: {type(points)}")
+            
+            # Pad GT points for batch processing
+            padded_gt, _ = self._padding_samples(gt_points_list, None)
+            
+            # Process GT points through refinement (teacher encoder only in Phase 1)
+            # Pass dummy pseudo points (same as GT) - refinement will only use GT branch in Phase 1
+            sparse_feat_dict, metrics = self.refinement(
+                pseudo_points=padded_gt,  # Dummy (not used in Phase 1)
+                gt_points=padded_gt,      # GT points for teacher encoder
+                return_loss=False,  # No loss computation in test
+            )
+            
+            # Store sparse features dict for detection pipeline
+            pts_feat = dict()
+            pts_feat['rescon_features'] = sparse_feat_dict
+            
+            return pts_feat, metrics
+        
+        # Phase 2: Normal flow with DA3 (generate pseudo points from images)
         # Extract images from mmdet3d data format
         multi_batch_ori_imgs = self._extract_images_from_data(img)
         B, N, C, H, W = multi_batch_ori_imgs.shape
@@ -1249,7 +1301,14 @@ class ReconstructionBackbone(nn.Module):
             process_res=504,
             process_res_method="upper_bound_resize",
         )
+        # Ensure images are in float32 (DA3's autocast will handle mixed precision internally)
         imgs_for_da3 = imgs_processed.to(device, non_blocking=True).float()
+        
+        # Convert extrinsics and intrinsics to float32 if they exist
+        if extrinsics_processed is not None:
+            extrinsics_processed = extrinsics_processed.to(device=device, dtype=torch.float32)
+        if intrinsics_processed is not None:
+            intrinsics_processed = intrinsics_processed.to(device=device, dtype=torch.float32)
         
         # Always use no_grad in test mode
         with torch.no_grad():

@@ -18,6 +18,9 @@ from .datasets.pipelines import (
 # Import losses to register EMDLoss, SmoothnessLoss, ColorLoss
 from .models.losses import EMDLoss, SmoothnessLoss, ColorLoss
 
+# Import hooks to register ValVisualizationHook
+from .core.hook import ValVisualizationHook
+
 __all__ = [
     'ResDet3D',
     'ReconstructionBackbone',
@@ -28,5 +31,6 @@ __all__ = [
     'EMDLoss',
     'SmoothnessLoss',
     'ColorLoss',
+    'ValVisualizationHook',
 ]
 

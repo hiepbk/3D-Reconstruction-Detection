@@ -21,7 +21,7 @@ voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
 evaluation = dict(interval=1,  # Evaluate every 2 epochs (instead of every epoch)
                   show=False,
-                  out_dir=f'work_dirs/ResDet3D_nuscenes_mini/vis_results',
+                  out_dir=f'work_dirs/ResDet3D_nuscenes/vis_results',
                   vis_time=None,
                   score_3d_threshold=0.5,
                   )
@@ -32,7 +32,7 @@ use_dim = [0, 1, 2] # use x,y,z only, set use_color to False because the origina
 use_color = False
 
 dataset_type = 'NuScenesDataset'
-data_root = 'data/nuscenes_mini/'
+data_root = 'data/nuscenes/'
 input_modality = dict(
     use_lidar=True,
     use_camera=True,
@@ -224,7 +224,7 @@ data = dict(
         dataset=dict(
             type=dataset_type,
             data_root=data_root,
-            ann_file=data_root + 'nuscenes_mini_infos_train.pkl',
+            ann_file=data_root + 'nuscenes_infos_train.pkl',
             load_interval=1,
             pipeline=train_pipeline,
             classes=class_names,
@@ -235,7 +235,7 @@ data = dict(
     val=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'nuscenes_mini_infos_val.pkl',
+        ann_file=data_root + 'nuscenes_infos_val.pkl',
         load_interval=1,
         pipeline=val_pipeline,
         classes=class_names,
@@ -245,7 +245,7 @@ data = dict(
     test=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'nuscenes_mini_infos_val.pkl',
+        ann_file=data_root + 'nuscenes_infos_val.pkl',
         load_interval=1,
         pipeline=test_pipeline,
         classes=class_names,
@@ -284,7 +284,7 @@ model = dict(
             type='SparseRefinement',
             use_color=True,  # Set to False to disable color processing (only use XYZ)
             debug_viz=True,
-            debug_viz_dir='work_dirs/resdet3d_nuscenes_mini/debug_viz',
+            debug_viz_dir='work_dirs/resdet3d_nuscenes/debug_viz',
             # Teacher checkpoint: None = train from scratch, or path to pretrained weights
             teacher_checkpoint=None,  # Set to checkpoint path if you want to load pretrained teacher
             # Training phase: 1 = Train teacher encoder (from scratch), 2 = Train student encoder (freeze teacher)
@@ -485,19 +485,19 @@ momentum_config = dict(
     step_ratio_up=0.4)
 
 
-total_epochs = 100
+total_epochs = 8
 
-checkpoint_config = dict(interval=5)  # Save checkpoint every 2 epochs (instead of every epoch)
+checkpoint_config = dict(interval=1)  # Save checkpoint every 2 epochs (instead of every epoch)
 
 log_config = dict(
-    interval=10,  # Log every 10 iterations (for more frequent progress updates)
+    interval=50,  # Log every 10 iterations (for more frequent progress updates)
     hooks=[
         dict(type='TextLoggerHook', by_epoch=False),  # console logging of iter/loss (by_epoch=False means log by iteration, not by epoch)
         dict(type='TensorboardLoggerHook', by_epoch=False),
         dict(type='WandbLoggerHook',
              init_kwargs=dict(
                  project='ResDet3D',
-                 name=f'teacher_ResDet3D_nuscenes_mini',
+                 name=f'teacher_ResDet3D_nuscenes',
              ))
     ])
 
