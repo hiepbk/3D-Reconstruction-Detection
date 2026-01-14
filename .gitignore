@@ -93,3 +93,6 @@ data/
 # Local third-party research repos (not tracked)
 /projects/mmdet3d_plugin/models/backbone/ShapeFormer/
 
+# Ignore the tools/misc_for_sk_gas_project folder
+/tools/misc_for_sk_gas_project/
+
