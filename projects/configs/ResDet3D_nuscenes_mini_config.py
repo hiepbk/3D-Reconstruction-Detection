@@ -20,10 +20,11 @@ class_names = [
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
 evaluation = dict(interval=1,  # Evaluate every 2 epochs (instead of every epoch)
-                  show=False,
-                  out_dir=f'work_dirs/ResDet3D_nuscenes_mini/vis_results',
+                  show=True,   # When True, test script saves debug vis (bbox on image + BEV) to out_dir
+                  out_dir='work_dirs/resdet3d_nuscenes_mini/vis_results',
                   vis_time=None,
                   score_3d_threshold=0.5,
+                  max_vis_samples=100,
                   )
 
 
@@ -278,12 +279,12 @@ model = dict(
         ensure_thresh_percentile=95.0,  # Upper bound for threshold
         base_conf_thresh=1.05,  # Lower = more points kept (was 1.05)
         freeze_da3=True,  # Freeze DepthAnything3 model (recommended)
-        export_glb=True,  # Enable GLB export for debugging (set to True to test)
+        export_glb=False,  # Enable GLB export for debugging (set True to test; False avoids extra I/O)
         glb_export_dir="output",  # Directory for GLB export
         refinement=dict(
             type='SparseRefinement',
             use_color=True,  # Set to False to disable color processing (only use XYZ)
-            debug_viz=True,
+            debug_viz=False,  # Temporary: True can cause dict_keys pickle error with multi-GPU test
             debug_viz_dir='work_dirs/resdet3d_nuscenes_mini/debug_viz',
             # Teacher checkpoint: None = train from scratch, or path to pretrained weights
             teacher_checkpoint=None,  # Set to checkpoint path if you want to load pretrained teacher

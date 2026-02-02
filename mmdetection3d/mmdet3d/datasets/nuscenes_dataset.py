@@ -302,9 +302,10 @@ class NuScenesDataset(Custom3DDataset):
 
                 ))
 
-        if not self.test_mode:
-            annos = self.get_ann_info(index)
-            input_dict['ann_info'] = annos
+        # Add ann_info so test/val pipeline can load GT for evaluation (e.g. mAP).
+        # When test_mode=True we still use val split (nuscenes_infos_val.pkl) which has annotations.
+        annos = self.get_ann_info(index)
+        input_dict['ann_info'] = annos
 
         return input_dict
 
@@ -656,9 +657,95 @@ class NuScenesDataset(Custom3DDataset):
         ]
         return Compose(pipeline)
 
-    
+    def generate_vis_image_for_sample(self, sample_idx, result, pipeline, score_3d_threshold=0.1):
+        """Generate the same multi-view + BEV visualization image as show() for one sample.
+
+        Use this so hooks (e.g. ValVisualizationHook) draw 3D bbox exactly like show():
+        same lidar2img, box format (gravity center), draw_lidar_bbox3d_on_img, layout.
+
+        Args:
+            sample_idx (int): Dataset index for this sample.
+            result (dict): One detection result (with 'pts_bbox' or direct keys).
+            pipeline: Data pipeline from _get_pipeline().
+            score_3d_threshold (float): Min score for predicted boxes.
+
+        Returns:
+            np.ndarray: Composite image (multi-view + BEV), or None on error.
+        """
+        if 'pts_bbox' in result.keys():
+            result = result['pts_bbox']
+        i = sample_idx
+        inds = result['scores_3d'] > score_3d_threshold
+        gt_bboxes = self.get_ann_info(i)['gt_bboxes_3d'].tensor.numpy()
+        pred_bboxes = result['boxes_3d'][inds].tensor.numpy()
+
+        pred_bboxes_3d = pred_bboxes.copy()
+        pred_bboxes_3d[:, 2] += pred_bboxes_3d[:, 5] / 2  # center bottom -> gravity center
+        pred_labels_3d = result["labels_3d"][inds].tolist()
+        pred_cat_names = [self.CLASSES[label] for label in pred_labels_3d]
+        pred_scores_3d = result["scores_3d"][inds].tolist()
+        pred_color = [self.ID_COLOR_MAP[lid] if lid < len(self.ID_COLOR_MAP) else (255, 0, 0) for lid in pred_labels_3d]
+
+        gt_bboxes_3d = gt_bboxes.copy()
+        gt_bboxes_3d[:, 2] += gt_bboxes_3d[:, 5] / 2  # center bottom -> gravity center
+        gt_labels_3d = self.get_ann_info(i)["gt_labels_3d"]
+        gt_cat_names = [self.CLASSES[label] for label in gt_labels_3d]
+        gt_color = [(180, 180, 180) for _ in range(len(gt_bboxes_3d))]
+        gt_scores_3d = [1.0 for _ in range(len(gt_bboxes_3d))]
+
+        pred_dict = {
+            "bboxes_3d": pred_bboxes_3d,
+            "labels_3d": pred_labels_3d,
+            "cat_names": pred_cat_names,
+            "scores_3d": pred_scores_3d,
+            "colors": pred_color,
+        }
+        gt_dict = {
+            "bboxes_3d": gt_bboxes_3d,
+            "labels_3d": gt_labels_3d,
+            "cat_names": gt_cat_names,
+            "colors": gt_color,
+            "scores_3d": gt_scores_3d,
+        }
+
+        raw_imgs = self._extract_data(i, pipeline, 'img')
+        lidar2img = self.get_data_info(i)["lidar2img"]
+
+        imgs = []
+        for j, img_origin in enumerate(raw_imgs):
+            img = img_origin.permute(1, 2, 0).numpy().astype(np.uint8).copy()
+            img = draw_lidar_bbox3d_on_img(
+                img, pred_dict, gt_dict, lidar2img[j],
+                img_metas=None, thickness=3,
+            )
+            imgs.append(img)
+
+        bev = draw_lidar_bbox3d_on_bev(pred_dict, gt_dict, bev_size=imgs[0].shape[0] * 2)
+
+        camera_names = ["front", "front right", "front left", "rear", "rear left", "rear right"]
+        for j, name in enumerate(camera_names):
+            if j >= len(imgs):
+                break
+            imgs[j] = cv2.rectangle(imgs[j], (0, 0), (440, 80), color=(255, 255, 255), thickness=-1)
+            w, h = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 2, 2)[0]
+            text_x, text_y = int(220 - w / 2), int(40 + h / 2)
+            imgs[j] = cv2.putText(imgs[j], name, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 2, cv2.LINE_AA)
+
+        if len(imgs) >= 6:
+            image = np.concatenate(
+                [
+                    np.concatenate([imgs[2], imgs[0], imgs[1]], axis=1),
+                    np.concatenate([imgs[5], imgs[3], imgs[4]], axis=1),
+                ],
+                axis=0,
+            )
+        else:
+            image = np.concatenate(imgs, axis=1)
+        image = np.concatenate([image, bev], axis=1)
+        return image
+
     # Hiep add feature for multi-image view for this function
-    def show(self, results, out_dir, show=True, pipeline=None, snapshot=False, vis_time=None, score_3d_threshold=0.1):
+    def show(self, results, out_dir, show=True, pipeline=None, snapshot=False, vis_time=None, score_3d_threshold=0.1, max_vis_samples=None, save_3d_obj=False):
         """Results visualization.
 
         Args:
@@ -667,15 +754,24 @@ class NuScenesDataset(Custom3DDataset):
             show (bool): Visualize the results online.
             pipeline (list[dict], optional): raw data loading for showing.
                 Default: None.
+            max_vis_samples (int, optional): Max number of samples to visualize.
+                If set (e.g. 100), only the first N samples are saved for debug.
+                Default: None (save all).
+            save_3d_obj (bool): If True, save 3D point cloud and bbox as .obj files
+                (for Meshlab). If False, only save .jpg images (multi-view + BEV).
+                Default: False.
         """
         assert out_dir is not None, 'Expect out_dir, got none.'
         pipeline = self._get_pipeline(pipeline)
-        
-        
+        mmcv.mkdir_or_exist(out_dir)
+
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         videoWriter = None
-        
+        n_total = len(results) if max_vis_samples is None else min(len(results), max_vis_samples)
+
         for i, result in enumerate(results):
+            if max_vis_samples is not None and i >= max_vis_samples:
+                break
             if 'pts_bbox' in result.keys():
                 result = result['pts_bbox']
             data_info = self.data_infos[i]
@@ -692,130 +788,16 @@ class NuScenesDataset(Custom3DDataset):
             pred_bboxes = result['boxes_3d'][inds].tensor.numpy()
             show_pred_bboxes = Box3DMode.convert(pred_bboxes, Box3DMode.LIDAR,
                                                  Box3DMode.DEPTH)
-            
-            
-            # show or save 3D view
-            show_result(points, show_gt_bboxes, show_pred_bboxes, out_dir,
-                        file_name, show=False, snapshot=snapshot, vis_time=vis_time)
-            
-            ## multi image view 
-            
-            imgs = []
-            
-            pred_dict = {}
-            gt_dict = {}
-            
-            raw_imgs = self._extract_data(i, pipeline, 'img')
-            lidar2img = self.get_data_info(i)["lidar2img"]
-            # choose boxes with score > score_3d_threshold
-            pred_bboxes_3d = pred_bboxes.copy()
-            # this box is center bottom, convert to gravity center
-            pred_bboxes_3d[:, 2] += pred_bboxes_3d[:, 5] / 2
-            
-            
-            # choose labels with score > score_3d_threshold
-            pred_labels_3d = result["labels_3d"][inds].tolist()
-            
-            # convert labels to classes
-            pred_cat_names = [self.CLASSES[label] for label in pred_labels_3d]
-            
-            # choose scores with score > score_3d_threshold
-            pred_scores_3d = result["scores_3d"][inds].tolist()
-            # pred_color = [(0, 0, 255) for _ in range(len(pred_bboxes_3d))]
-            pred_color = []
-            for id in pred_labels_3d:
-                pred_color.append(self.ID_COLOR_MAP[id])
-            
-            # choose gt boxes
-            gt_bboxes_3d = gt_bboxes.copy()
-            # this box is center bottom, convert to gravity center
-            gt_bboxes_3d[:, 2] += gt_bboxes_3d[:, 5] / 2
-            
-            gt_labels_3d = self.get_ann_info(i)["gt_labels_3d"]
-            gt_cat_names = [self.CLASSES[label] for label in gt_labels_3d]
-            # gt_color is list of all green based on number of gt bboxes
-            gt_color = [(180, 180, 180) for _ in range(len(gt_bboxes_3d))]
-            # gt_scores_3d is list of all 1 based on number of gt bboxes
-            gt_scores_3d = [1 for _ in range(len(gt_bboxes_3d))]
-            
-            pred_dict = {
-                "bboxes_3d": pred_bboxes_3d,
-                "labels_3d": pred_labels_3d,
-                "cat_names": pred_cat_names,
-                "scores_3d": pred_scores_3d,
-                "colors": pred_color,
-            }
-            
-            gt_dict = {
-                "bboxes_3d": gt_bboxes_3d,
-                "labels_3d": gt_labels_3d,
-                "cat_names": gt_cat_names,
-                "colors": gt_color,
-                "scores_3d": gt_scores_3d,
-            }
-            
 
-            # ===== draw boxes_3d to images =====
-            for j, img_origin in enumerate(raw_imgs):
-                img = img_origin.permute(1, 2, 0).numpy().astype(np.uint8).copy()
-                img = draw_lidar_bbox3d_on_img(
-                    img,
-                    pred_dict,
-                    gt_dict,
-                    lidar2img[j],
-                    img_metas=None,
-                    thickness=3,
-                )
-                imgs.append(img)
+            # Optionally save 3D view as .obj (points, gt, pred) for Meshlab
+            if save_3d_obj:
+                show_result(points, show_gt_bboxes, show_pred_bboxes, out_dir,
+                            file_name, show=False, snapshot=snapshot, vis_time=vis_time)
 
-            # ===== draw boxes_3d to BEV =====
-            bev = draw_lidar_bbox3d_on_bev(
-                pred_dict,
-                gt_dict,
-                bev_size=img.shape[0] * 2,
-            )
-
-            # ===== put text and concat =====
-            for j, name in enumerate(
-                [
-                    "front",
-                    "front right",
-                    "front left",
-                    "rear",
-                    "rear left",
-                    "rear right",
-                ]
-            ):
-                imgs[j] = cv2.rectangle(
-                    imgs[j],
-                    (0, 0),
-                    (440, 80),
-                    color=(255, 255, 255),
-                    thickness=-1,
-                )
-                w, h = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 2, 2)[0]
-                text_x = int(220 - w / 2)
-                text_y = int(40 + h / 2)
-
-                imgs[j] = cv2.putText(
-                    imgs[j],
-                    name,
-                    (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    2,
-                    (0, 0, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-            image = np.concatenate(
-                [
-                    np.concatenate([imgs[2], imgs[0], imgs[1]], axis=1),
-                    np.concatenate([imgs[5], imgs[3], imgs[4]], axis=1),
-                ],
-                axis=0,
-            )
-            image = np.concatenate([image, bev], axis=1)
-            
+            # Multi-view + BEV image (same method as ValVisualizationHook)
+            image = self.generate_vis_image_for_sample(i, result, pipeline, score_3d_threshold)
+            if image is None:
+                continue
 
             # ===== save video =====
             if videoWriter is None:
@@ -826,8 +808,8 @@ class NuScenesDataset(Custom3DDataset):
                     image.shape[:2][::-1],
                 )
             cv2.imwrite(osp.join(out_dir, f"{file_name}.jpg"), image)
-            # print progress but the next line
-            print(f"save {file_name}.jpg to {out_dir}, {i}/{len(results)}", end="\r")
+            # print progress
+            print(f"save {file_name}.jpg to {out_dir}, {i + 1}/{n_total}", end="\r")
             videoWriter.write(image)
             
         videoWriter.release()

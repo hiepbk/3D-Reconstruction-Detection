@@ -21,6 +21,73 @@ from mmdet.apis import multi_gpu_test, set_random_seed
 from mmdet.datasets import replace_ImageToTensor
 
 
+def _patch_scatter_forward():
+    """Patch mmcv Scatter.forward so target_gpus (int device ids) are converted to device objects.
+    Fixes: AttributeError: 'int' object has no attribute 'type' in _get_stream(device)."""
+    try:
+        from mmcv.parallel import scatter_gather
+        from mmcv.parallel._functions import get_input_device, scatter, synchronize_stream
+        from torch.nn.parallel._functions import _get_stream
+        from typing import List, Union
+        from torch import Tensor
+
+        Scatter = scatter_gather.Scatter  # Patch the same Scatter that scatter_kwargs uses
+
+        @staticmethod
+        def patched_forward(target_gpus: List[int], input: Union[List, Tensor]) -> tuple:
+            try:
+                input_device = get_input_device(input)
+            except Exception:
+                input_device = -1
+            streams = None
+            if input_device == -1 and target_gpus != [-1]:
+                # Convert int device ids to device objects (PyTorch _get_stream expects device)
+                device_objects = [
+                    torch.device(f'cuda:{d}') if isinstance(d, int) else d
+                    for d in target_gpus
+                ]
+                streams = [_get_stream(device) for device in device_objects]
+
+            outputs = scatter(input, target_gpus, streams)
+            if streams is not None:
+                synchronize_stream(outputs, target_gpus, streams)
+
+            return tuple(outputs) if isinstance(outputs, list) else (outputs,)
+
+        Scatter.forward = patched_forward
+        # Also patch the class in _functions so all references use the patched forward
+        import mmcv.parallel._functions as _funcs
+        _funcs.Scatter.forward = patched_forward
+    except Exception as e:
+        warnings.warn(f"Could not patch Scatter.forward: {e}. Multi-GPU test may fail.")
+
+
+def _patch_mm_distributed_data_parallel():
+    """Patch MMDistributedDataParallel to handle missing _use_replicated_tensor_module attribute.
+    Fixes version compatibility between mmcv and PyTorch DDP."""
+    try:
+        from mmcv.parallel import MMDistributedDataParallel
+
+        original_run_ddp_forward = MMDistributedDataParallel._run_ddp_forward
+
+        def patched_run_ddp_forward(self, *inputs, **kwargs):
+            use_replicated = getattr(self, '_use_replicated_tensor_module', False)
+            if use_replicated:
+                module_to_run = getattr(self, '_replicated_tensor_module', self.module)
+            else:
+                module_to_run = self.module
+
+            if self.device_ids:
+                inputs, kwargs = self.to_kwargs(inputs, kwargs, self.device_ids[0])
+                return module_to_run(*inputs[0], **kwargs[0])
+            else:
+                return module_to_run(*inputs, **kwargs)
+
+        MMDistributedDataParallel._run_ddp_forward = patched_run_ddp_forward
+    except Exception as e:
+        warnings.warn(f"Could not patch MMDistributedDataParallel: {e}. Multi-GPU test may fail.")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='MMDet test (and eval) a model')
@@ -185,6 +252,10 @@ def main():
             for ds_cfg in cfg.data.test:
                 ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
 
+    # Patches for multi-GPU test (mmcv/PyTorch version compatibility)
+    _patch_scatter_forward()  # int device ids -> device objects for Scatter
+    _patch_mm_distributed_data_parallel()
+
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
         distributed = False
@@ -198,10 +269,12 @@ def main():
 
     # build the dataloader
     dataset = build_dataset(cfg.data.test)
+    # Use 0 workers for test to avoid "cannot pickle 'dict_keys'" when DataLoader spawns workers
+    workers_per_gpu_test = 0
     data_loader = build_dataloader(
         dataset,
         samples_per_gpu=samples_per_gpu,
-        workers_per_gpu=cfg.data.workers_per_gpu,
+        workers_per_gpu=workers_per_gpu_test,
         dist=distributed,
         shuffle=False)
 
@@ -260,13 +333,31 @@ def main():
             # hard-code way to remove EvalHook args
             for key in [
                     'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
-                    'rule'
+                    'rule', 'show', 'out_dir', 'max_vis_samples'
             ]:
                 eval_kwargs.pop(key, None)
             eval_kwargs.update(dict(metric=args.eval, jsonfile_prefix=args.jsonfile_prefix, **kwargs))
             print('eval_kwargs', eval_kwargs)
             print(dataset.evaluate(outputs, **eval_kwargs))
-            
+        # Show dir: from --show-dir or from config (evaluation.show + out_dir)
+        eval_cfg = cfg.get('evaluation', {})
+        show_dir = args.show_dir or (eval_cfg.get('show') and eval_cfg.get('out_dir'))
+        if show_dir:
+            score_3d_thr = eval_cfg.get('score_3d_threshold', 0.5)
+            max_vis = eval_cfg.get('max_vis_samples', 100)
+            if getattr(dataset, 'show', None) is not None:
+                dataset.show(
+                    outputs,
+                    show_dir,
+                    show=False,
+                    snapshot=True,
+                    score_3d_threshold=score_3d_thr,
+                    max_vis_samples=max_vis,
+                )
+                print(f'\nSaved up to {max_vis} visualization images to {show_dir}')
+            else:
+                print(f'Warning: dataset has no show() method, skipping visualization to {show_dir}')
+
 
 if __name__ == '__main__':
     main()
