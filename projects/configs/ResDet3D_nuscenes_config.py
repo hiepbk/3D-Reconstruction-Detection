@@ -19,12 +19,14 @@ class_names = [
 ]
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
-evaluation = dict(interval=1,  # Evaluate every 2 epochs (instead of every epoch)
-                  show=True,   # When True, test script saves debug vis (bbox on image + BEV) to out_dir
-                  out_dir='work_dirs/teacher_resdet3d_nuscenes/vis_results',
+# === Teacher (Phase 1) vs Student (Phase 2): set one out_dir ===
+evaluation = dict(interval=1,
+                  show=False,
+                  # out_dir='work_dirs/teacher_resdet3d_nuscenes/vis_results',  # Teacher
+                  out_dir='work_dirs/student_resdet3d_nuscenes/vis_results',   # Student
                   vis_time=None,
                   score_3d_threshold=0.5,
-                  max_vis_samples=100,  # Limit number of saved vis images when show=True
+                  max_vis_samples=100,
                   )
 
 
@@ -286,12 +288,11 @@ model = dict(
             use_color=True,  # Set to False to disable color processing (only use XYZ)
             debug_viz=False,  # Temporary: True can cause dict_keys pickle error with multi-GPU test
             debug_viz_dir='work_dirs/resdet3d_nuscenes/debug_viz',
-            # Teacher checkpoint: None = train from scratch, or path to pretrained weights
-            teacher_checkpoint=None,  # Set to checkpoint path if you want to load pretrained teacher
-            # Training phase: 1 = Train teacher encoder (from scratch), 2 = Train student encoder (freeze teacher)
-            # Phase 1: Train teacher with GT points → evaluation uses GT features (teacher performance)
-            # Phase 2: Train student with pseudo points → evaluation uses pseudo features (student performance)
-            training_phase=1,  # Start with Phase 1 to train teacher, then switch to Phase 2
+            # === Teacher (Phase 1) vs Student (Phase 2) ===
+            # teacher_checkpoint=None,   # Teacher: train from scratch
+            teacher_checkpoint='work_dirs/teacher_resdet3d_nuscenes/latest.pth',  # Student: load teacher encoder
+            # training_phase=1,  # Teacher: train teacher encoder
+            training_phase=2,   # Student: train student encoder (teacher frozen)
             # Voxelization layer: converts point clouds to voxels
             pts_voxel_layer=dict(
                 max_num_points=10,  # Maximum points per voxel
@@ -498,7 +499,8 @@ log_config = dict(
         dict(type='WandbLoggerHook',
              init_kwargs=dict(
                  project='ResDet3D',
-                 name=f'teacher_ResDet3D_nuscenes',
+                 # name=f'teacher_ResDet3D_nuscenes',  # Teacher
+                 name=f'student_ResDet3D_nuscenes',   # Student
              ))
     ])
 
@@ -517,8 +519,11 @@ custom_hooks = [
 
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = None
-load_from = None
+# === Teacher (Phase 1) vs Student (Phase 2) ===
+# work_dir = None
+# load_from = None   # Teacher Phase 1: no pretrained main model
+work_dir = 'work_dirs/student_resdet3d_nuscenes'
+load_from = None  # Main model = student in Phase 2; do NOT load teacher here. Teacher is loaded only via teacher_checkpoint in refinement.
 resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 4)
