@@ -550,6 +550,14 @@ python -m tools.train_mmdet3d \
 - Validation (if enabled)
 - Logging and tensorboard support
 
+
+
+**Diary** Some thing need to note
+
+- Currently, training the teacher model on the full NuScenes dataset seems fine; 3-4 days using four 3090 GPUs (24GB each) is sufficient
+- However, training the student model seems to take longer because it needs to load both the teacher and student models simultaneously.
+
+
 For detailed information about the two-branch feature distillation architecture, training procedure, and implementation details, please refer to `FEATURE_DOMAIN_ADAPTATION_DESIGN.md`.
 
 
