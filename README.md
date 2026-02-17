@@ -526,7 +526,6 @@ python -m tools.train_mmdet3d \
     --cfg-options optimizer.lr=0.001
 
 
-
     
 ```
 
